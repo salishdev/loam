@@ -59,6 +59,14 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         Some(room) => room_view(world, &room, player.id, &mut out)?,
     }
 
+    let quests = crate::quest::slice_lines(world)?;
+    if !quests.is_empty() {
+        writeln!(out, "Quests:").unwrap();
+        for q in quests {
+            writeln!(out, "{q}").unwrap();
+        }
+    }
+
     // The seed is logged as an input; it isn't part of play.
     let mut recent: Vec<_> = world
         .search_events(

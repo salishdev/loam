@@ -2,12 +2,14 @@
 //!
 //! A new save asks for a seed prompt (ended by a blank line), builds the
 //! world bible and opens the story; an existing save resumes where it was.
+//! `:quests` lists quests; `:quit` exits.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use loam::game::Game;
 use loam::llm::AnthropicClient;
+use loam::quest::Verdict;
 use loam::world::World;
 
 fn main() -> ExitCode {
@@ -66,6 +68,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         match input {
             "" => continue,
             ":quit" | ":q" => break,
+            ":quests" => {
+                print_quests(&game);
+                continue;
+            }
             _ => {}
         }
         println!();
@@ -75,10 +81,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("\n[director stopped early: {reason:?}]");
                 }
                 println!();
+                for j in &outcome.judgments {
+                    match j.verdict {
+                        Verdict::Complete => println!("\n[Quest complete: {}]", j.title),
+                        Verdict::Failed => println!("\n[Quest failed: {}]", j.title),
+                        Verdict::Ongoing => {}
+                    }
+                }
             }
             // A failed turn is reported; the save stays usable.
             Err(e) => eprintln!("\n[turn failed: {e}]"),
         }
     }
     Ok(())
+}
+
+fn print_quests(game: &Game) {
+    let quests = match game.quests() {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[quests unavailable: {e}]");
+            return;
+        }
+    };
+    if quests.is_empty() {
+        println!("No quests yet.");
+    }
+    for q in quests {
+        println!("#{} {} [{}]", q.id, q.title, q.status.as_str());
+        println!("  {}", q.goal.as_deref().unwrap_or(&q.hook));
+        for d in &q.developments {
+            println!("  - {d}");
+        }
+        if let Some(r) = &q.resolution {
+            println!("  => {r}");
+        }
+    }
 }

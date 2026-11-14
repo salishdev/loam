@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::inventory::{self, Inventory};
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
+use crate::quest;
 use crate::world::{
     ApplyError, CARRIER_PROP, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
 };
@@ -39,6 +40,7 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         ]
         .into_iter()
         .chain(inventory::tool_definitions())
+        .chain(quest::tool_definitions())
         .collect(),
     }
 }
@@ -61,6 +63,9 @@ pub fn dispatch(
         && let Some(output) = inventory.handle_tool(world, player, call)
     {
         return Ok(output);
+    }
+    if let Some(result) = quest::handle_tool(world, call) {
+        return result;
     }
     macro_rules! input {
         ($t:ty) => {
@@ -634,6 +639,16 @@ fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError
             return refuse(format!(
                 "op {i}: the bible is hidden and fixed; read it with read_bible"
             ));
+        }
+        for r in &refs {
+            if let EntityRef::Id(id) = r
+                && quest::is_quest(world, *id)?
+            {
+                return refuse(format!(
+                    "op {i}: #{id} is a quest; change quests only with spawn_quest, \
+                     reveal_goal and escalate_quest"
+                ));
+            }
         }
         if let Op::Destroy { entity } | Op::Rename { entity, .. } = op
             && is(entity, player)

@@ -541,7 +541,7 @@ fn is_engine_prop(key: &str) -> bool {
 
 fn engine_prop_reason(key: &str) -> String {
     format!(
-        "prop {key:?} is engine-owned (keys starting with '{ENGINE_PROP_PREFIX}'); use the inventory tools"
+        "prop {key:?} is engine-owned (keys starting with '{ENGINE_PROP_PREFIX}'); only the engine's tools change it"
     )
 }
 

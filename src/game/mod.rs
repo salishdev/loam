@@ -20,6 +20,7 @@ use crate::inventory::Inventory;
 use crate::llm::{
     Effort, LlmClient, LlmError, Message, Model, Request, StopReason, ToolOutput, run_tool_loop,
 };
+use crate::quest::{self, Judgment, Quest};
 use crate::world::{EntityId, EventKind, StoreError, World};
 
 /// Kind of the single entity holding the world bible.
@@ -49,7 +50,10 @@ up (query_entity, read_bible, search_events) rather than inventing facts that ma
 exist, and never change the world only in prose. When the player goes through an \
 unexplored exit, generate the room with create_room, furnished to fit the bible. If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
-changes only through the inventory tools (take, drop, give, equip, unequip, transfer). Write no text until your \
+changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
+You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
+clear to the player, reveal_goal with the entities it concerns; escalate_quest to raise the \
+stakes. A judge decides when a quest is done. Write no text until your \
 tool calls are done. Your final message is shown to the player verbatim: second person, \
 present tense, in the bible's tone, one to three short paragraphs.";
 
@@ -75,8 +79,10 @@ pub struct TurnOutcome {
     pub narration: String,
     /// Why the director stopped, when it wasn't a normal end of turn.
     pub stop_reason: Option<StopReason>,
-    /// Model calls the turn made.
+    /// Model calls the turn made (director only, not the judge).
     pub calls: usize,
+    /// The judge's rulings on quests this turn touched.
+    pub judgments: Vec<Judgment>,
 }
 
 /// A game session over a world store.
@@ -95,6 +101,11 @@ impl Game {
 
     pub fn world(&self) -> &World {
         &self.world
+    }
+
+    #[cfg(test)]
+    pub(crate) fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 
     pub fn into_world(self) -> World {
@@ -167,6 +178,7 @@ impl Game {
             self.world
                 .log_event(EventKind::Input, &json!({"text": input}))?;
         }
+        let turn_start = self.world.last_seq()?;
         let request = Request::new(
             Model::Sonnet,
             vec![Message::user(format!("{slice}\n{instruction}"))],
@@ -178,6 +190,7 @@ impl Game {
         let narration = outcome.final_response.text().trim().to_owned();
         self.world
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
+        let judgments = quest::judge_turn(&mut self.world, client, turn_start, input, &narration)?;
         let stop_reason = outcome
             .final_response
             .stop_reason
@@ -186,6 +199,7 @@ impl Game {
             narration,
             stop_reason,
             calls: outcome.calls,
+            judgments,
         })
     }
 
@@ -230,6 +244,11 @@ impl Game {
             return Err(e.into());
         }
         Ok(outcome?)
+    }
+
+    /// Every quest, in the order spawned.
+    pub fn quests(&self) -> Result<Vec<Quest>, GameError> {
+        Ok(quest::quests(&self.world)?)
     }
 
     /// A plain description of where the player is, for resuming a save.

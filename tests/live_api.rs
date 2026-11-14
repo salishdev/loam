@@ -71,3 +71,55 @@ fn haiku_tool_use_round_trip() {
 fn sonnet_tool_use_round_trip() {
     round_trip(Model::Sonnet);
 }
+
+/// The real Haiku judge rules a plainly met goal complete through its tool.
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn haiku_judges_a_met_goal_complete() {
+    use loam::quest::{self, Status, Verdict};
+    use loam::world::{Op, Patch, World};
+
+    let client = AnthropicClient::from_env().expect("set ANTHROPIC_API_KEY to run live tests");
+    let mut world = World::open_in_memory().unwrap();
+    let lamp = world
+        .apply_patch(&Patch::new(vec![Op::Create {
+            handle: None,
+            name: "brass lamp".into(),
+            kind: "item".into(),
+            location: None,
+            props: Default::default(),
+        }]))
+        .unwrap()
+        .created[0];
+    let q = quest::spawn(
+        &mut world,
+        "Light in the dark",
+        "The cellar is pitch black.",
+        &[],
+    )
+    .unwrap();
+    quest::reveal_goal(&mut world, q, "The brass lamp is lit.", &[lamp]).unwrap();
+    let start = world.last_seq().unwrap();
+    world
+        .apply_patch(&Patch::new(vec![Op::SetProp {
+            entity: lamp.into(),
+            key: "lit".into(),
+            value: json!(true),
+        }]))
+        .unwrap();
+    let judgments = quest::judge_turn(
+        &mut world,
+        &client,
+        start,
+        Some("light the lamp"),
+        "The wick catches and the brass lamp glows.",
+    )
+    .unwrap();
+    println!("{judgments:?}");
+    assert_eq!(judgments.len(), 1);
+    assert_eq!(judgments[0].verdict, Verdict::Complete);
+    assert_eq!(
+        quest::quest(&world, q).unwrap().unwrap().status,
+        Status::Complete
+    );
+}
