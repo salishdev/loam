@@ -719,3 +719,155 @@ fn bad_relation_conditions_are_refused() {
             .is_ok()
     );
 }
+
+/// The kick rule, with an effect that opens the gate in the far room by id.
+fn gate_rule(gate: EntityId) -> RuleDef {
+    let mut rule = kick_rule();
+    rule.effects.push(Op::SetProp {
+        entity: gate.into(),
+        key: "open".into(),
+        value: Value::Bool(true),
+    });
+    rule
+}
+
+fn pinned_objects(world: &World, rule: RuleId) -> Vec<(EntityId, Value)> {
+    world
+        .relations_from(rule, Some(PINS_REL))
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.object, Value::Object(r.props)))
+        .collect()
+}
+
+#[test]
+fn literal_effect_ids_are_pinned() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, gate_rule(f.gate), "").unwrap().unwrap();
+    assert_eq!(
+        pinned_objects(&f.world, rule.id),
+        vec![(f.gate, json!({"effect": true}))]
+    );
+    // The effect keeps its id, and the rule still covers every rotten door.
+    assert_eq!(
+        get(&f.world, rule.id).unwrap().unwrap().def,
+        gate_rule(f.gate)
+    );
+    apply(
+        &mut f.world,
+        &rule.def,
+        tag(&rule),
+        f.scope,
+        &bind_target(f.rotten),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        f.world.entity(f.gate).unwrap().unwrap().props["open"],
+        json!(true)
+    );
+
+    // Ids in check branches are pinned too; an id also pinned by an entity
+    // condition keeps its one role pin.
+    let mut def = pinned_rule(f.rotten);
+    def.effects.push(Op::Destroy {
+        entity: f.rotten.into(),
+    });
+    def.check = Some(RuleCheck {
+        stat: "might".into(),
+        difficulty: 10,
+        partial: None,
+        failure: Some(Branch {
+            effects: vec![Op::Move {
+                entity: f.nail.into(),
+                to: Some(EntityRef::Handle(ROOM_ROLE.into())),
+            }],
+            ..Default::default()
+        }),
+    });
+    let ops = pin_ops(EntityRef::Id(99), &def).unwrap();
+    let objects: Vec<(EntityRef, Value)> = ops
+        .into_iter()
+        .map(|op| match op {
+            Op::Relate { object, props, .. } => (object, Value::Object(props)),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        objects,
+        vec![
+            (f.rotten.into(), json!({"role": "target"})),
+            (f.nail.into(), json!({"effect": true})),
+        ]
+    );
+}
+
+#[test]
+fn amending_rewrites_effect_pins() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, gate_rule(f.gate), "").unwrap().unwrap();
+    let changes = Amendment {
+        effects: Some(gate_rule(f.sound).effects),
+        ..Default::default()
+    };
+    amend(&mut f.world, rule.id, changes, "").unwrap().unwrap();
+    assert_eq!(
+        pinned_objects(&f.world, rule.id),
+        vec![(f.sound, json!({"effect": true}))]
+    );
+    let changes = Amendment {
+        effects: Some(kick_rule().effects),
+        ..Default::default()
+    };
+    amend(&mut f.world, rule.id, changes, "").unwrap().unwrap();
+    assert!(pinned_objects(&f.world, rule.id).is_empty());
+}
+
+#[test]
+fn an_effect_naming_a_missing_entity_is_refused() {
+    let mut f = fixture();
+    let err = mint(&mut f.world, gate_rule(999), "").unwrap().unwrap_err();
+    assert!(
+        err.contains("an effect names #999, which does not exist"),
+        "{err}"
+    );
+    let (rule, _) = mint(&mut f.world, kick_rule(), "").unwrap().unwrap();
+    let changes = Amendment {
+        effects: Some(gate_rule(999).effects),
+        ..Default::default()
+    };
+    let err = amend(&mut f.world, rule.id, changes, "")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.contains("#999"), "{err}");
+}
+
+#[test]
+fn destroying_an_entity_an_effect_names_retires_the_rule() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, gate_rule(f.gate), "").unwrap().unwrap();
+    let before = f.world.last_seq().unwrap();
+    f.world
+        .apply_patch(&Patch::new(vec![Op::Destroy {
+            entity: f.gate.into(),
+        }]))
+        .unwrap();
+    let retired = get(&f.world, rule.id).unwrap().unwrap();
+    assert_eq!(retired.status, RuleStatus::Retired);
+    let events = f.world.events_since(before).unwrap();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![EventKind::Patch, EventKind::RuleChange]);
+    assert_eq!(events[0].payload["retired"], json!([rule.id]));
+    assert_eq!(events[1].payload["reason"], json!(UNPINNED_REASON));
+    assert_eq!(events[1].payload["entity"], json!(f.gate));
+
+    // It no longer matches, so it can't fail on the missing gate.
+    assert!(
+        active_world(&f.world)
+            .unwrap()
+            .iter()
+            .all(|r| r.id != rule.id)
+    );
+    let r = f.world.replay_in_memory().unwrap();
+    assert_eq!(r.state().unwrap(), f.world.state().unwrap());
+}

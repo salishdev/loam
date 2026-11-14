@@ -12,8 +12,10 @@
 //!
 //! A pin's entity id is not kept in the rule's JSON: it lives in an
 //! engine-owned [`PINS_REL`] relation (rule → entity, props `{role}`), and
-//! [`get`] and [`all`] put it back into the condition. Destroying a pinned
-//! entity cascades the relation away, and the world store then retires the
+//! [`get`] and [`all`] put it back into the condition. An entity an effect
+//! names by literal id is pinned the same way (props `{effect: true}`; the
+//! id stays in the effect). Destroying a pinned entity cascades the
+//! relation away, and the world store then retires the
 //! rule in the same transaction ([`retire_unpinned`]), so a pinned rule never
 //! silently becomes a general one.
 //!
@@ -27,7 +29,7 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -348,26 +350,59 @@ fn unpinned(rule: &Rule) -> Rule {
     rule
 }
 
-/// Ops relating `rule` to each entity it is pinned to.
-fn pin_ops(rule: EntityRef, def: &RuleDef) -> Result<Vec<Op>, String> {
-    Ok(pins(def)?
-        .into_iter()
-        .map(|(role, id)| Op::Relate {
-            subject: rule.clone(),
-            rel: PINS_REL.into(),
-            object: id.into(),
-            props: Map::from_iter([("role".to_owned(), json!(role))]),
+/// Every entity the rule's effects name by literal id (main effects and
+/// check branches), in id order.
+fn effect_ids(def: &RuleDef) -> BTreeSet<EntityId> {
+    let branches = def.check.iter().flat_map(|c| [&c.partial, &c.failure]);
+    std::iter::once(&def.effects)
+        .chain(branches.flatten().map(|b| &b.effects))
+        .flatten()
+        .flat_map(op_refs)
+        .filter_map(|r| match r {
+            EntityRef::Id(id) => Some(*id),
+            EntityRef::Handle(_) => None,
         })
-        .collect())
+        .collect()
 }
 
-/// Check that every entity the rule pins exists.
+/// Ops relating `rule` to each entity it is pinned to: by an `entity`
+/// condition (props `{role}`) or by a literal id in an effect (props
+/// `{effect: true}`), so destroying any of them retires the rule rather
+/// than leaving an effect that names a missing entity.
+fn pin_ops(rule: EntityRef, def: &RuleDef) -> Result<Vec<Op>, String> {
+    let pins = pins(def)?;
+    let pinned: HashSet<EntityId> = pins.values().copied().collect();
+    let relate = |id: EntityId, props: Map<String, Value>| Op::Relate {
+        subject: rule.clone(),
+        rel: PINS_REL.into(),
+        object: id.into(),
+        props,
+    };
+    let mut ops: Vec<Op> = pins
+        .into_iter()
+        .map(|(role, id)| relate(id, Map::from_iter([("role".to_owned(), json!(role))])))
+        .collect();
+    ops.extend(
+        effect_ids(def)
+            .into_iter()
+            .filter(|id| !pinned.contains(id))
+            .map(|id| relate(id, Map::from_iter([("effect".to_owned(), json!(true))]))),
+    );
+    Ok(ops)
+}
+
+/// Check that every entity the rule pins, or its effects name, exists.
 fn check_pinned(world: &World, def: &RuleDef) -> Result<Result<(), String>, StoreError> {
     for (role, id) in pins(def).unwrap_or_default() {
         if world.entity(id)?.is_none() {
             return Ok(Err(format!(
                 "{role} is pinned to #{id}, which does not exist"
             )));
+        }
+    }
+    for id in effect_ids(def) {
+        if world.entity(id)?.is_none() {
+            return Ok(Err(format!("an effect names #{id}, which does not exist")));
         }
     }
     Ok(Ok(()))

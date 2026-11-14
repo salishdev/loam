@@ -30,7 +30,8 @@ fn effects_schema() -> Value {
     json!({
         "type": "array",
         "description": "apply_patch ops, applied in order. Refer to a bound entity by its role name as a \
-                        string (e.g. \"target\", \"room\", \"player\"); an integer id is a fixed entity.",
+                        string (e.g. \"target\", \"room\", \"player\"); an integer id is a fixed entity and pins the rule to it: \
+                        destroying that entity retires the rule.",
         "items": {"type": "object", "properties": {"op": {"type": "string"}}, "required": ["op"]}
     })
 }
