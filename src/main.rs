@@ -1,12 +1,16 @@
-//! Terminal REPL: `loam [save.db]` (default `loam.db`).
+//! Terminal REPL: `loam [--seed <name|file>] [save.db]`.
 //!
-//! A new save asks for a seed prompt (ended by a blank line), builds the
-//! world bible and opens the story; an existing save resumes where it was.
+//! A new save takes its seed prompt from `--seed` (a file, or the name of one
+//! in `seeds/`, such as `drowned-mill`) or else asks for one (ended by a blank
+//! line), builds the world bible and opens the story; an existing save resumes
+//! where it was. The save defaults to `<seed name>.db` with `--seed`, else
+//! `loam.db`. `--list-seeds` lists the bundled seeds.
 //! A world tick runs between turns when due. Lines starting with `:` are
 //! commands (`:help` lists them); the inspector commands read only the
 //! store and its log, never the LLM.
 
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use loam::game::{Game, GameError, TickOutcome};
@@ -26,9 +30,37 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "loam.db".into());
+    let args = match parse_args(std::env::args().skip(1))? {
+        Command::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Command::ListSeeds => {
+            let names = list_seeds(&seed_dirs());
+            if names.is_empty() {
+                println!("No seeds found in {}.", seeds_dir_names());
+            }
+            for name in names {
+                println!("{name}");
+            }
+            return Ok(());
+        }
+        Command::Play(args) => args,
+    };
+    // Read the seed before anything else so a typo fails fast.
+    let seed_file = match &args.seed {
+        Some(arg) => {
+            let file = resolve_seed(arg, &seed_dirs())?;
+            Some((std::fs::read_to_string(&file)?, file))
+        }
+        None => None,
+    };
+    let path = args.save;
     let client = AnthropicClient::from_env()?;
     let mut game = Game::new(World::open(&path)?);
+    if seed_file.is_some() && game.has_bible()? {
+        eprintln!("[{path} already has a world; --seed ignored]");
+    }
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut stream = |t: &str| {
@@ -37,17 +69,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !game.has_bible()? {
-        println!(
-            "New world in {path}. Describe its plot, tone and setting; end with a blank line."
-        );
         let mut seed = String::new();
-        for line in lines.by_ref() {
-            let line = line?;
-            if line.trim().is_empty() && !seed.trim().is_empty() {
-                break;
+        if let Some((text, file)) = &seed_file {
+            println!("New world in {path}, seeded from {}.", file.display());
+            seed.push_str(text);
+        } else {
+            println!(
+                "New world in {path}. Describe its plot, tone and setting; end with a blank line."
+            );
+            for line in lines.by_ref() {
+                let line = line?;
+                if line.trim().is_empty() && !seed.trim().is_empty() {
+                    break;
+                }
+                seed.push_str(&line);
+                seed.push('\n');
             }
-            seed.push_str(&line);
-            seed.push('\n');
         }
         if seed.trim().is_empty() {
             return Err("no seed prompt given".into());
@@ -119,6 +156,117 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const USAGE: &str = "Usage: loam [--seed <name|file>] [save.db]
+       loam --list-seeds
+
+  --seed <name|file>  Seed a new save from a file, or from seeds/<name>.txt.
+                      The save defaults to <name>.db (otherwise loam.db).
+                      Ignored when the save already has a world.
+  --list-seeds        List the bundled seed prompts.";
+
+enum Command {
+    Help,
+    ListSeeds,
+    Play(PlayArgs),
+}
+
+#[derive(Debug, PartialEq)]
+struct PlayArgs {
+    save: String,
+    seed: Option<String>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
+    let mut seed = None;
+    let mut save = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--list-seeds" => return Ok(Command::ListSeeds),
+            "--seed" => {
+                seed = Some(args.next().ok_or("--seed needs a name or file")?);
+            }
+            _ if arg.starts_with("--seed=") => seed = Some(arg["--seed=".len()..].to_string()),
+            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
+            _ if save.is_none() => save = Some(arg),
+            _ => return Err(format!("unexpected argument {arg}\n\n{USAGE}")),
+        }
+    }
+    let save = save.unwrap_or_else(|| match &seed {
+        Some(s) => format!("{}.db", seed_name(s)),
+        None => "loam.db".into(),
+    });
+    Ok(Command::Play(PlayArgs { save, seed }))
+}
+
+/// `seeds/drowned-mill.txt` and `drowned-mill` both name `drowned-mill`.
+fn seed_name(arg: &str) -> String {
+    Path::new(arg)
+        .file_stem()
+        .map_or_else(|| arg.to_string(), |s| s.to_string_lossy().into_owned())
+}
+
+/// Where named seeds are looked up: `./seeds`, then the crate's own `seeds/`
+/// (so `cargo run` and the built binary both find them).
+fn seed_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("seeds")];
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
+    if !dirs.contains(&bundled) {
+        dirs.push(bundled);
+    }
+    dirs
+}
+
+fn seeds_dir_names() -> String {
+    seed_dirs()
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// A path to an existing file wins; otherwise `<dir>/<arg>.txt` or
+/// `<dir>/<arg>` in each seed directory, first match.
+fn resolve_seed(arg: &str, dirs: &[PathBuf]) -> Result<PathBuf, String> {
+    let direct = PathBuf::from(arg);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    for dir in dirs {
+        for candidate in [dir.join(format!("{arg}.txt")), dir.join(arg)] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let names = list_seeds(dirs);
+    Err(if names.is_empty() {
+        format!("no seed file or bundled seed named {arg}")
+    } else {
+        format!(
+            "no seed file or bundled seed named {arg}; bundled seeds: {}",
+            names.join(", ")
+        )
+    })
+}
+
+/// Names of the `.txt` seeds in the seed directories, sorted, deduplicated.
+fn list_seeds(dirs: &[PathBuf]) -> Vec<String> {
+    let mut names: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "txt") && p.is_file())
+        .map(|p| seed_name(&p.to_string_lossy()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :quests, :stats, \
 :fork <event> <path>, :tick, :quit";
 
@@ -166,5 +314,67 @@ fn report_tick(result: Result<TickOutcome, GameError>) {
     match result {
         Ok(t) => eprintln!("[world tick: {} change(s)]", t.changes.len()),
         Err(e) => eprintln!("[world tick failed: {e}]"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn play(args: &[&str]) -> PlayArgs {
+        match parse_args(args.iter().map(|s| s.to_string())) {
+            Ok(Command::Play(p)) => p,
+            Ok(_) => panic!("expected play args"),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn save_defaults_to_loam_db_without_a_seed() {
+        assert_eq!(
+            play(&[]),
+            PlayArgs {
+                save: "loam.db".into(),
+                seed: None
+            }
+        );
+    }
+
+    #[test]
+    fn save_defaults_to_seed_name() {
+        assert_eq!(play(&["--seed", "drowned-mill"]).save, "drowned-mill.db");
+        assert_eq!(
+            play(&["--seed=seeds/kettle-station.txt"]).save,
+            "kettle-station.db"
+        );
+    }
+
+    #[test]
+    fn explicit_save_wins_in_either_order() {
+        let a = play(&["--seed", "drowned-mill", "mine.db"]);
+        let b = play(&["mine.db", "--seed", "drowned-mill"]);
+        assert_eq!(a, b);
+        assert_eq!(a.save, "mine.db");
+        assert_eq!(a.seed.as_deref(), Some("drowned-mill"));
+    }
+
+    #[test]
+    fn bad_arguments_are_errors() {
+        assert!(parse_args(["--seed".to_string()]).is_err());
+        assert!(parse_args(["--bogus".to_string()]).is_err());
+        assert!(parse_args(["a.db".to_string(), "b.db".to_string()]).is_err());
+    }
+
+    #[test]
+    fn bundled_seeds_resolve_by_name_and_list() {
+        let dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds")];
+        let names = list_seeds(&dirs);
+        assert_eq!(names, ["drowned-mill", "kettle-station", "ledger-of-ash"]);
+        for name in &names {
+            let file = resolve_seed(name, &dirs).unwrap();
+            assert!(!std::fs::read_to_string(file).unwrap().trim().is_empty());
+        }
+        let err = resolve_seed("nope", &dirs).unwrap_err();
+        assert!(err.contains("drowned-mill"), "{err}");
     }
 }
