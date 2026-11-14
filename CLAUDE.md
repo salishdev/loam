@@ -60,12 +60,11 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo test                      # unit tests; LLM code runs against llm::ScriptedClient
+cargo clippy --all-targets -- -D warnings
+# Live Claude API tests (cost money, need ANTHROPIC_API_KEY):
+cargo test --test live_api -- --ignored --nocapture
 ```
 
 ## Architecture Overview
