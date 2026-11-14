@@ -197,12 +197,14 @@ fn replay_event(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
         // Recorded for `:why` and the director; they change no state.
         // Rejected patches were rolled back, and rolls and judgments are
         // outcomes already applied through the patches that follow them.
+        // Narration is prose shown to the player.
         EventKind::Input
         | EventKind::PatchRejected
         | EventKind::ToolCall
         | EventKind::RuleChange
         | EventKind::Roll
-        | EventKind::Judgment => {}
+        | EventKind::Judgment
+        | EventKind::Narration => {}
     }
 
     copy_event(tx, event)?;

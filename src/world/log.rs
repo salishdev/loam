@@ -19,10 +19,12 @@ pub enum EventKind {
     Roll,
     /// An LLM judgment (e.g. quest completion).
     Judgment,
+    /// Prose the narrator showed the player for a turn.
+    Narration,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 7] = [
+    pub const ALL: [EventKind; 8] = [
         EventKind::Input,
         EventKind::Patch,
         EventKind::PatchRejected,
@@ -30,6 +32,7 @@ impl EventKind {
         EventKind::RuleChange,
         EventKind::Roll,
         EventKind::Judgment,
+        EventKind::Narration,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +44,7 @@ impl EventKind {
             EventKind::RuleChange => "rule_change",
             EventKind::Roll => "roll",
             EventKind::Judgment => "judgment",
+            EventKind::Narration => "narration",
         }
     }
 

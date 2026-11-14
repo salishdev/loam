@@ -1,0 +1,198 @@
+//! The local slice: the little the director sees up front each turn.
+//!
+//! Current room and its exits, what is in it (one level down), what the
+//! player carries, the last few turns and the bible's section titles.
+//! Everything else is fetched through tools.
+
+use std::fmt::Write;
+
+use serde_json::Value;
+
+use crate::world::{Entity, EntityId, EventKind, StoreError, World};
+
+use super::tools::exits_of;
+use super::{bible_id, player_id};
+
+/// How many recent inputs and narrations the slice shows.
+const RECENT_EVENTS: usize = 6;
+/// Longest recent narration shown in full.
+const RECENT_CHARS: usize = 500;
+
+/// Render the local slice as compact text.
+pub fn local_slice(world: &World) -> Result<String, StoreError> {
+    let mut out = String::new();
+
+    let sections = match bible_id(world)?
+        .map(|id| world.entity(id))
+        .transpose()?
+        .flatten()
+    {
+        Some(bible) => bible.props.keys().cloned().collect::<Vec<_>>().join(", "),
+        None => "(none)".into(),
+    };
+    writeln!(out, "Bible sections (read_bible): {sections}").unwrap();
+
+    let player = match player_id(world)? {
+        Some(id) => world.entity(id)?,
+        None => None,
+    };
+    let Some(player) = player else {
+        writeln!(out, "No player yet.").unwrap();
+        return Ok(out);
+    };
+    writeln!(out, "Player: {}", line(&player)).unwrap();
+    let carried = world.contents(Some(player.id))?;
+    if carried.is_empty() {
+        writeln!(out, "Carrying: nothing").unwrap();
+    } else {
+        writeln!(out, "Carrying:").unwrap();
+        tree(world, &carried, 1, &mut out)?;
+    }
+
+    match player
+        .location
+        .map(|id| world.entity(id))
+        .transpose()?
+        .flatten()
+    {
+        None => writeln!(out, "Location: nowhere yet").unwrap(),
+        Some(room) => room_view(world, &room, player.id, &mut out)?,
+    }
+
+    // The seed is logged as an input; it isn't part of play.
+    let mut recent: Vec<_> = world
+        .search_events(
+            "",
+            &[EventKind::Input, EventKind::Narration],
+            RECENT_EVENTS + 1,
+        )?
+        .into_iter()
+        .filter(|e| e.payload.get("seed").is_none())
+        .take(RECENT_EVENTS)
+        .collect();
+    recent.reverse();
+    if !recent.is_empty() {
+        writeln!(out, "Recent:").unwrap();
+        for e in recent {
+            let text = e
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match e.kind {
+                EventKind::Input => writeln!(out, "> {text}").unwrap(),
+                _ => writeln!(out, "{}", clip(text, RECENT_CHARS)).unwrap(),
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn room_view(
+    world: &World,
+    room: &Entity,
+    player: EntityId,
+    out: &mut String,
+) -> Result<(), StoreError> {
+    let region = room
+        .props
+        .get("region")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    writeln!(
+        out,
+        "Location: #{} {} (region: {region})",
+        room.id, room.name
+    )
+    .unwrap();
+    let description = room
+        .props
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    writeln!(out, "Description: {description}").unwrap();
+    let other: serde_json::Map<String, Value> = room
+        .props
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "description" | "region" | "exits"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !other.is_empty() {
+        writeln!(out, "Room props: {}", Value::Object(other)).unwrap();
+    }
+    let exits = exits_of(room);
+    if exits.is_empty() {
+        writeln!(out, "Exits: none").unwrap();
+    } else {
+        let list: Vec<String> = exits
+            .iter()
+            .map(|(dir, e)| {
+                let label = e.get("label").and_then(Value::as_str).unwrap_or("");
+                match e.get("to").and_then(Value::as_i64) {
+                    Some(to) => format!("{dir} -> #{to} {label}"),
+                    None => format!("{dir} -> unexplored ({label})"),
+                }
+            })
+            .collect();
+        writeln!(out, "Exits: {}", list.join("; ")).unwrap();
+    }
+    let here: Vec<EntityId> = world
+        .contents(Some(room.id))?
+        .into_iter()
+        .filter(|id| *id != player)
+        .collect();
+    if here.is_empty() {
+        writeln!(out, "Here: nothing").unwrap();
+    } else {
+        writeln!(out, "Here:").unwrap();
+        tree(world, &here, 1, out)?;
+    }
+    Ok(())
+}
+
+/// List entities with props; their contents one level further down.
+fn tree(world: &World, ids: &[EntityId], depth: usize, out: &mut String) -> Result<(), StoreError> {
+    for id in ids {
+        let Some(e) = world.entity(*id)? else {
+            continue;
+        };
+        writeln!(out, "{}- {}", "  ".repeat(depth - 1), line(&e)).unwrap();
+        let inner = world.contents(Some(e.id))?;
+        if depth < 2 {
+            tree(world, &inner, depth + 1, out)?;
+        } else if !inner.is_empty() {
+            writeln!(
+                out,
+                "{}  (contains {} more; query_entity #{})",
+                "  ".repeat(depth - 1),
+                inner.len(),
+                e.id
+            )
+            .unwrap();
+        }
+    }
+    Ok(())
+}
+
+fn line(e: &Entity) -> String {
+    if e.props.is_empty() {
+        format!("#{} {} [{}]", e.id, e.name, e.kind)
+    } else {
+        format!(
+            "#{} {} [{}] {}",
+            e.id,
+            e.name,
+            e.kind,
+            Value::Object(e.props.clone())
+        )
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(max).collect();
+        format!("{cut}…")
+    }
+}

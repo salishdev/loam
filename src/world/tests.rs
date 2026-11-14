@@ -377,7 +377,7 @@ fn log_accepts_every_kind_in_order() {
         EventKind::ALL
     );
     assert!(events.iter().all(|e| e.at.ends_with('Z')));
-    assert_eq!(w.events_since(5).unwrap().len(), 2);
+    assert_eq!(w.events_since(5).unwrap().len(), EventKind::ALL.len() - 5);
 }
 
 #[test]

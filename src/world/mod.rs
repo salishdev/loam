@@ -217,17 +217,7 @@ impl World {
         let mut events = Vec::new();
         for row in rows {
             let (seq, kind, payload, at) = row?;
-            let kind = EventKind::parse(&kind).ok_or_else(|| {
-                StoreError::Corrupt(format!("event {seq}: unknown kind {kind:?}"))
-            })?;
-            let payload = serde_json::from_str(&payload)
-                .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad payload: {e}")))?;
-            events.push(Event {
-                seq,
-                kind,
-                payload,
-                at,
-            });
+            events.push(parse_event(seq, kind, payload, at)?);
         }
         Ok(events)
     }
@@ -272,6 +262,42 @@ impl World {
         }))
     }
 
+    /// Ids of every entity of `kind`, in id order.
+    pub fn entities_of_kind(&self, kind: &str) -> Result<Vec<EntityId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM entities WHERE kind = ?1 ORDER BY id")?;
+        let ids = stmt
+            .query_map([kind], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Up to `limit` events whose payload contains `text` (case-insensitive
+    /// for ASCII), newest first. `kinds` restricts the search when non-empty.
+    pub fn search_events(
+        &self,
+        text: &str,
+        kinds: &[EventKind],
+        limit: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, kind, payload, at FROM events
+             WHERE instr(lower(payload), lower(?1)) > 0 ORDER BY seq DESC",
+        )?;
+        let mut rows = stmt.query([text])?;
+        let mut found = Vec::new();
+        while found.len() < limit
+            && let Some(row) = rows.next()?
+        {
+            let event = parse_event(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)?;
+            if kinds.is_empty() || kinds.contains(&event.kind) {
+                found.push(event);
+            }
+        }
+        Ok(found)
+    }
+
     /// Ids of entities directly inside `container` (`None` = top level).
     pub fn contents(&self, container: Option<EntityId>) -> Result<Vec<EntityId>, StoreError> {
         let mut stmt = self
@@ -282,6 +308,19 @@ impl World {
             .collect::<Result<_, _>>()?;
         Ok(ids)
     }
+}
+
+fn parse_event(seq: i64, kind: String, payload: String, at: String) -> Result<Event, StoreError> {
+    let kind = EventKind::parse(&kind)
+        .ok_or_else(|| StoreError::Corrupt(format!("event {seq}: unknown kind {kind:?}")))?;
+    let payload = serde_json::from_str(&payload)
+        .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad payload: {e}")))?;
+    Ok(Event {
+        seq,
+        kind,
+        payload,
+        at,
+    })
 }
 
 fn insert_event(conn: &Connection, kind: EventKind, payload: &Value) -> rusqlite::Result<i64> {
