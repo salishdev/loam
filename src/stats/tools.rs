@@ -12,7 +12,8 @@ use crate::world::{StoreError, World};
 fn consequence_props() -> Value {
     json!({
         "outcome": {"type": "string", "description": "What happens, for the narrator. Make it a setback, never the end of the game."},
-        "effects": {"type": "array", "description": "apply_patch ops; \"player\" and \"room\" name the player and their room.",
+        "effects": {"type": "array", "description": "apply_patch ops; \"player\" and \"room\" name the player and their room. \
+                    Integer entity ids are refused: stat rules never change, so they can't name a fixed entity.",
                     "items": {"type": "object", "properties": {"op": {"type": "string"}}, "required": ["op"]}},
         "adjust": {"type": "array", "items": {"type": "object", "properties": {
             "stat": {"type": "string"}, "by": {"type": "integer"}}, "required": ["stat", "by"]}},

@@ -12,6 +12,10 @@
 //! - `advancement`: how the stat grows. Raising a stat must cite one; the
 //!   set of them is the sheet's advancement charter.
 //!
+//! Threshold effects reach entities only through the `player` and `room`
+//! handles: a literal entity id is refused, because stat rules are never
+//! amended or retired and so could not follow that entity's destruction.
+//!
 //! Stat rules are never amended or retired (see [`rules::amend`]). The sheet
 //! can grow mid-game ([`add_stat`], with the new stat's rules, and
 //! [`mint_advancement`]) but a stat is never renamed or removed: values live
@@ -720,6 +724,13 @@ fn plan(spec: &StatSpec, known: &dyn Fn(&str) -> bool) -> Result<Vec<(RuleDef, S
             ..empty_def()
         };
         rules::validate(&def).map_err(|e| format!("{n} threshold at {}: {e}", t.at))?;
+        if let Some(id) = rules::effect_ids(&def).first() {
+            return Err(format!(
+                "{n} threshold at {}: an effect names #{id}; use \"player\" or \"room\" \
+                 (stat rules never change, so a fixed id would outlive its entity)",
+                t.at
+            ));
+        }
         check_refs(&def, known).map_err(|e| format!("{n} threshold at {}: {e}", t.at))?;
         out.push((
             def,

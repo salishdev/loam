@@ -352,7 +352,7 @@ fn unpinned(rule: &Rule) -> Rule {
 
 /// Every entity the rule's effects name by literal id (main effects and
 /// check branches), in id order.
-fn effect_ids(def: &RuleDef) -> BTreeSet<EntityId> {
+pub(crate) fn effect_ids(def: &RuleDef) -> BTreeSet<EntityId> {
     let branches = def.check.iter().flat_map(|c| [&c.partial, &c.failure]);
     std::iter::once(&def.effects)
         .chain(branches.flatten().map(|b| &b.effects))

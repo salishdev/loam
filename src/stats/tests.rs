@@ -153,6 +153,42 @@ fn an_invalid_sheet_writes_nothing() {
 }
 
 #[test]
+fn threshold_effects_cant_name_an_entity_by_id() {
+    let mut f = bare();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "create", "name": "gate", "kind": "gate", "location": f.room}
+    ]))
+    .unwrap();
+    let gate = f
+        .world
+        .apply_engine_patch(&Patch::new(ops))
+        .unwrap()
+        .created[0];
+    let main = json!([{"at": 1, "when": "falls_to", "outcome": "x",
+        "effects": [{"op": "set_prop", "entity": gate, "key": "shut", "value": true}]}]);
+    let branch = json!([{"at": 1, "when": "falls_to", "outcome": "x",
+        "check": {"stat": "nerve", "difficulty": 10,
+                  "failure": {"outcome": "y",
+                              "effects": [{"op": "destroy", "entity": gate}]}}}]);
+    for thresholds in [main, branch] {
+        let mut sheet = sample_sheet();
+        sheet[0]["thresholds"] = thresholds;
+        let err = create_sheet(&mut f.world, &specs(sheet.clone()), SEED)
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains(&format!("names #{gate}")), "{err}");
+        assert!(rules::all(&f.world).unwrap().is_empty());
+        // Mid-game too: add_stat plans its rules the same way.
+        sheet[0]["name"] = json!("grit");
+        let err = add_stat(&mut f.world, &specs(sheet)[0], SEED, "found grit")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains(&format!("names #{gate}")), "{err}");
+        assert!(super::sheet(&f.world).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn a_threshold_fires_once_per_crossing() {
     let mut f = fixture();
     // 3 -> 1: no threshold crossed.
