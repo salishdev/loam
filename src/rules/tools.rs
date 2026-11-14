@@ -14,10 +14,14 @@ fn condition_schema() -> Value {
         "type": "array",
         "description": "All must hold. check: kind {role, is} | prop {role, prop, is?} (present, or equal to is) \
                         | not_prop {role, prop, is?} (absent, or not equal to is) | carried {role} \
-                        | entity {role, id} (pins the rule to one entity; destroying that entity retires the rule).",
+                        | entity {role, id} (pins the rule to one entity; destroying that entity retires the rule) \
+                        | related {role, rel, other} (a rel relation runs from role's entity to other role's) \
+                        | not_related {role, rel, other} (no such relation). Effects change relations with \
+                        relate/unrelate ops.",
         "items": {"type": "object", "properties": {
-            "check": {"type": "string", "enum": ["kind", "prop", "not_prop", "carried", "entity"]},
-            "role": {"type": "string"}, "prop": {"type": "string"}, "is": {}, "id": {"type": "integer"}
+            "check": {"type": "string", "enum": ["kind", "prop", "not_prop", "carried", "entity", "related", "not_related"]},
+            "role": {"type": "string"}, "prop": {"type": "string"}, "is": {}, "id": {"type": "integer"},
+            "rel": {"type": "string"}, "other": {"type": "string", "description": "A role name."}
         }, "required": ["check", "role"]}
     })
 }
@@ -86,7 +90,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             "mint_rule",
             "Record a ruling as a rule the engine applies by itself next time the player does the \
              same thing to a matching entity. Choose the generality with conditions: kind and props \
-             make it general, an entity condition pins it to one thing. Give apply_to (role -> \
+             make it general, an entity condition pins it to one thing, related/not_related make it \
+             hold only while a relation between two roles does (or doesn't). Give apply_to (role -> \
              entity id) to apply it now as this turn's ruling: then nothing is stored unless the \
              conditions hold and the effects apply.",
             json!({

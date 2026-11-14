@@ -6,7 +6,9 @@
 //! written as ordinary patch ops in which a string handle naming a role
 //! stands for the bound entity. The director picks the generality: a rule
 //! conditioned on `kind` and props covers every matching entity; one pinned
-//! with an `entity` condition covers only that one.
+//! with an `entity` condition covers only that one. `related` and
+//! `not_related` conditions hold while a named relation between two roles
+//! does (or doesn't), and `relate`/`unrelate` effects change them.
 //!
 //! A pin's entity id is not kept in the rule's JSON: it lives in an
 //! engine-owned [`PINS_REL`] relation (rule → entity, props `{role}`), and
@@ -104,6 +106,18 @@ pub enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<EntityId>,
     },
+    /// A relation named `rel` runs from the role's entity to `other`'s.
+    Related {
+        role: String,
+        rel: String,
+        other: String,
+    },
+    /// No relation named `rel` runs from the role's entity to `other`'s.
+    NotRelated {
+        role: String,
+        rel: String,
+        other: String,
+    },
 }
 
 impl Condition {
@@ -113,7 +127,17 @@ impl Condition {
             | Condition::Prop { role, .. }
             | Condition::NotProp { role, .. }
             | Condition::Carried { role }
-            | Condition::Entity { role, .. } => role,
+            | Condition::Entity { role, .. }
+            | Condition::Related { role, .. }
+            | Condition::NotRelated { role, .. } => role,
+        }
+    }
+
+    /// The other role a relation condition names.
+    pub fn other(&self) -> Option<&str> {
+        match self {
+            Condition::Related { other, .. } | Condition::NotRelated { other, .. } => Some(other),
+            _ => None,
         }
     }
 }
@@ -252,6 +276,19 @@ pub fn validate(def: &RuleDef) -> Result<(), String> {
             && prop.starts_with(ENGINE_PROP_PREFIX)
         {
             return Err(format!("prop {prop:?} is engine-owned"));
+        }
+        if let Condition::Related { rel, .. } | Condition::NotRelated { rel, .. } = c {
+            if rel.trim().is_empty() {
+                return Err("a relation condition needs a rel".into());
+            }
+            if rel.starts_with(ENGINE_PROP_PREFIX) {
+                return Err(format!("relation {rel:?} is engine-owned"));
+            }
+        }
+        if let Some(other) = c.other()
+            && !known(other)
+        {
+            return Err(format!("condition names undeclared role {other:?}"));
         }
     }
     pins(def)?;
@@ -578,6 +615,25 @@ pub fn unmet(
             }
             Condition::Entity { id: None, .. } => {
                 reasons.push(format!("{role}'s pinned entity no longer exists"));
+            }
+            Condition::Related { rel, other, .. } | Condition::NotRelated { rel, other, .. } => {
+                let Some(o) = entities.get(other.as_str()) else {
+                    reasons.push(format!("{other} is not bound"));
+                    continue;
+                };
+                let holds = world
+                    .relations_from(e.id, Some(rel))?
+                    .iter()
+                    .any(|r| r.object == o.id);
+                match (c, holds) {
+                    (Condition::Related { .. }, false) => {
+                        reasons.push(format!("no {rel} relation runs from {role} to {other}"))
+                    }
+                    (Condition::NotRelated { .. }, true) => {
+                        reasons.push(format!("a {rel} relation runs from {role} to {other}"))
+                    }
+                    _ => {}
+                }
             }
         }
     }

@@ -594,3 +594,128 @@ fn a_retired_rule_is_not_retired_again_when_its_pin_goes() {
     assert_eq!(r.version, 2);
     assert_eq!(f.world.count_events(EventKind::RuleChange).unwrap(), 2);
 }
+
+/// Wedging the crowbar into a door relates them; prying with it needs the
+/// wedge, and pulls the bar out.
+fn wedge_rules() -> (RuleDef, RuleDef) {
+    let roles = json!({"tool": "what is wedged", "target": "the door"});
+    let wedge = serde_json::from_value(json!({
+        "name": "Wedging a tool into a door",
+        "trigger": "wedge <tool> into <target>",
+        "roles": roles,
+        "conditions": [{"check": "not_related", "role": "tool", "rel": "wedges", "other": "target"}],
+        "effects": [{"op": "relate", "subject": "tool", "rel": "wedges", "object": "target",
+                     "props": {"depth": "shallow"}}],
+        "outcome": "The bar bites into the jamb."
+    }))
+    .unwrap();
+    let pry = serde_json::from_value(json!({
+        "name": "Prying a door open",
+        "trigger": "pry <target> with <tool>",
+        "roles": roles,
+        "conditions": [{"check": "related", "role": "tool", "rel": "wedges", "other": "target"}],
+        "effects": [
+            {"op": "unrelate", "subject": "tool", "rel": "wedges", "object": "target"},
+            {"op": "set_prop", "entity": "target", "key": "open", "value": true}
+        ],
+        "outcome": "The door groans open and the bar drops free."
+    }))
+    .unwrap();
+    (wedge, pry)
+}
+
+#[test]
+fn relation_conditions_follow_relate_and_unrelate_effects() {
+    let mut f = fixture();
+    let (wedge, pry) = wedge_rules();
+    let (wedge, _) = mint(&mut f.world, wedge, "").unwrap().unwrap();
+    let (pry, _) = mint(&mut f.world, pry, "").unwrap().unwrap();
+    let given = Bindings::from([
+        ("tool".to_owned(), f.crowbar),
+        ("target".to_owned(), f.sound),
+    ]);
+    let scope = f.scope;
+    let run =
+        |world: &mut World, rule: &Rule| apply(world, &rule.def, tag(rule), scope, &given).unwrap();
+
+    // Prying needs the wedge first.
+    let early = run(&mut f.world, &pry);
+    assert!(
+        matches!(&early, Err(Refusal::Unmet(r)) if r == &["no wedges relation runs from tool to target"]),
+        "{early:?}"
+    );
+    // Wedging relates the bound entities: role handles become ids.
+    let app = run(&mut f.world, &wedge).unwrap();
+    assert_eq!(
+        app.patch.ops,
+        vec![Op::Relate {
+            subject: f.crowbar.into(),
+            rel: "wedges".into(),
+            object: f.sound.into(),
+            props: Map::from_iter([("depth".to_owned(), json!("shallow"))]),
+        }]
+    );
+    // Wedging twice: the not_related condition fails.
+    let twice = run(&mut f.world, &wedge);
+    assert!(
+        matches!(&twice, Err(Refusal::Unmet(r)) if r == &["a wedges relation runs from tool to target"]),
+        "{twice:?}"
+    );
+    // Now prying fires, and its unrelate disables it again.
+    let app = run(&mut f.world, &pry).unwrap();
+    assert!(
+        matches!(&app.patch.ops[0], Op::Unrelate { subject, object, .. }
+        if *subject == EntityRef::Id(f.crowbar) && *object == EntityRef::Id(f.sound))
+    );
+    assert!(
+        f.world
+            .relations_from(f.crowbar, Some("wedges"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.world.entity(f.sound).unwrap().unwrap().props["open"],
+        json!(true)
+    );
+    assert!(matches!(run(&mut f.world, &pry), Err(Refusal::Unmet(_))));
+    // The relation is directional: the door doesn't wedge the bar.
+    run(&mut f.world, &wedge).unwrap();
+    let reversed = Bindings::from([
+        ("tool".to_owned(), f.sound),
+        ("target".to_owned(), f.crowbar),
+    ]);
+    let back = apply(&mut f.world, &pry.def, tag(&pry), f.scope, &reversed).unwrap();
+    assert!(matches!(back, Err(Refusal::Unmet(_))), "{back:?}");
+
+    let replayed = f.world.replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), f.world.state().unwrap());
+}
+
+#[test]
+fn bad_relation_conditions_are_refused() {
+    let (_, pry) = wedge_rules();
+    let with = |c: Value| {
+        let mut def = pry.clone();
+        def.conditions = vec![serde_json::from_value(c).unwrap()];
+        validate(&def)
+    };
+    assert!(
+        with(json!({"check": "related", "role": "tool", "rel": "wedges", "other": "lever"}))
+            .unwrap_err()
+            .contains("undeclared role \"lever\"")
+    );
+    assert!(
+        with(json!({"check": "not_related", "role": "tool", "rel": "_pins", "other": "target"}))
+            .unwrap_err()
+            .contains("engine-owned")
+    );
+    assert!(
+        with(json!({"check": "related", "role": "tool", "rel": " ", "other": "target"}))
+            .unwrap_err()
+            .contains("needs a rel")
+    );
+    assert!(
+        with(json!({"check": "related", "role": "room", "rel": "wedges", "other": "player"}))
+            .is_ok()
+    );
+}

@@ -1870,3 +1870,65 @@ fn ticks_and_npc_listings_skip_stub_rooms() {
     let (msg, is_error) = last_tool_result(&client);
     assert!(is_error && msg.contains("unexplored"), "{msg}");
 }
+
+#[test]
+fn a_related_rule_takes_the_fast_path_only_while_the_relation_holds() {
+    let (mut game, client, oak, _) = with_doors();
+    let room = player_room(&game);
+    let patch = |ops: Value| crate::world::Patch::new(serde_json::from_value(ops).unwrap());
+    let a = game
+        .world
+        .apply_patch(&patch(json!([
+            {"op": "create", "handle": "hound", "name": "hound", "kind": "beast", "location": room}
+        ])))
+        .unwrap();
+    let hound = a.handles["hound"];
+    let guards = patch(json!([{"op": "relate", "subject": hound, "rel": "guards", "object": oak}]));
+    game.world.apply_patch(&guards).unwrap();
+    let def = serde_json::from_value(json!({
+        "name": "Approaching a guarded door",
+        "trigger": "approach or touch <door>",
+        "roles": {"door": "the door", "guard": "what guards it"},
+        "conditions": [{"check": "related", "role": "guard", "rel": "guards", "other": "door"}],
+        "effects": [{"op": "set_prop", "entity": "guard", "key": "snarling", "value": true}],
+        "outcome": "The guard bares its teeth."
+    }))
+    .unwrap();
+    let (rule, _) = crate::rules::mint(&mut game.world, def, "")
+        .unwrap()
+        .unwrap();
+    let matched = || {
+        interpret(
+            json!([{"rule": rule.id, "bindings": {"door": oak, "guard": hound}}]),
+            true,
+        )
+    };
+
+    // While the hound guards the door, the engine applies the rule.
+    client.push(matched());
+    client.push(Response::canned_text("The hound snarls."));
+    let turn = game
+        .turn(&client, "touch the oak door", &mut |_| {})
+        .unwrap();
+    assert_eq!(turn.fast_path, Some(rule.id));
+    let props = game.world().entity(hound).unwrap().unwrap().props;
+    assert_eq!(props["snarling"], json!(true));
+
+    // Once it stops guarding, the director decides, told why.
+    game.world
+        .apply_patch(&patch(json!([
+            {"op": "unrelate", "subject": hound, "rel": "guards", "object": oak}
+        ])))
+        .unwrap();
+    client.push(matched());
+    client.push(Response::canned_text("The hound ignores you."));
+    let turn = game
+        .turn(&client, "touch the oak door", &mut |_| {})
+        .unwrap();
+    assert_eq!(turn.fast_path, None);
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(
+        director.contains("no guards relation runs from guard to door"),
+        "{director}"
+    );
+}

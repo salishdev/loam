@@ -623,6 +623,8 @@ fn condition(c: &Condition) -> String {
         Condition::Carried { role } => format!("player carries {role}"),
         Condition::Entity { role, id: Some(id) } => format!("{role} is #{id}"),
         Condition::Entity { role, id: None } => format!("{role} is #? (pinned entity gone)"),
+        Condition::Related { role, rel, other } => format!("{role} {rel} {other}"),
+        Condition::NotRelated { role, rel, other } => format!("{role} not {rel} {other}"),
     }
 }
 

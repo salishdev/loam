@@ -68,7 +68,7 @@ You are also the drama manager: when play suggests a quest, spawn_quest; once it
 clear to the player, reveal_goal with the entities it concerns; escalate_quest to raise the \
 stakes. A judge decides when a quest is done. The engine remembers rulings as rules and replays them without you: when you rule on an \
 action that could recur, mint_rule at the generality you judge right (conditions on kind \
-and props make it general) and give apply_to so the rule itself is this turn's ruling; \
+and props make it general; related conditions make it hold only while a relation does) and give apply_to so the rule itself is this turn's ruling; \
 one-off story events need no rule. When an action's outcome is uncertain, roll check \
 against the fitting stat and honour the result; a rule can embed the check. Stats change \
 only through adjust_stat with a reason; raise them by their advancement rules, and build \
