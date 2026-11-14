@@ -68,7 +68,7 @@ fn kick_turn(f: &mut Fixture) -> rules::Rule {
     f.world
         .log_event(EventKind::Input, &json!({"text": "kick the oak door"}))
         .unwrap();
-    let (rule, _) = rules::mint(&mut f.world, kick_rule(), RuleClass::World, "rotten wood")
+    let (rule, _) = rules::mint(&mut f.world, kick_rule(), "rotten wood")
         .unwrap()
         .unwrap();
     rules::apply(
