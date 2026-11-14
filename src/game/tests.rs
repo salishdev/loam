@@ -1006,3 +1006,296 @@ fn the_quest_judge_also_rules_on_fast_path_turns() {
     assert_eq!(t.judgments[0].quest, q);
     assert_eq!(client.remaining(), 0);
 }
+
+// ---- world tick --------------------------------------------------------------
+
+/// Chapel (player) and Bell Tower to its north, with a crow in the tower;
+/// optionally a Loft above the tower. Leaves the player back in the chapel.
+/// Returns (chapel, tower, crow, loft).
+fn two_rooms(with_loft: bool) -> (Game, ScriptedClient, i64, i64, i64, Option<i64>) {
+    let (mut game, client) = begun();
+    let chapel = player_room(&game);
+    client.push(Response::canned_tool_use(
+        "r2",
+        "create_room",
+        json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
+               "description": "A leaning tower.", "exits": {"up": "rotten stairs"},
+               "contents": [{"name": "crow", "kind": "npc", "props": {"mood": "wary"}}]}),
+    ));
+    client.push(Response::canned_text("The tower."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    let tower = player_room(&game);
+    let crow = game.world().entities_of_kind("npc").unwrap()[0];
+    let mut loft = None;
+    if with_loft {
+        client.push(Response::canned_tool_use(
+            "r3",
+            "create_room",
+            json!({"via_exit": "up", "back_exit": "down", "name": "Loft", "region": "Saltmarsh",
+                   "description": "Dusty.", "exits": {}, "contents": []}),
+        ));
+        client.push(Response::canned_text("The loft."));
+        game.turn(&client, "go up", &mut |_| {}).unwrap();
+        loft = Some(player_room(&game));
+        client.push(Response::canned_tool_use(
+            "m1",
+            "move_player",
+            json!({"exit": "down"}),
+        ));
+        client.push(Response::canned_text("Down."));
+        game.turn(&client, "go down", &mut |_| {}).unwrap();
+    }
+    client.push(Response::canned_tool_use(
+        "m2",
+        "move_player",
+        json!({"exit": "south"}),
+    ));
+    client.push(Response::canned_text("The chapel again."));
+    game.turn(&client, "go south", &mut |_| {}).unwrap();
+    assert_eq!(player_room(&game), chapel);
+    (game, client, chapel, tower, crow, loft)
+}
+
+fn quiet_tick(game: &mut Game, client: &ScriptedClient) -> TickOutcome {
+    client.push(Response::canned_text("Nothing stirs."));
+    game.tick(client).unwrap()
+}
+
+fn look(game: &mut Game, client: &ScriptedClient) {
+    client.push(Response::canned_text("You look around."));
+    game.turn(client, "look", &mut |_| {}).unwrap();
+}
+
+#[test]
+fn a_tick_is_due_every_few_turns_in_the_same_room() {
+    let (mut game, client) = begun();
+    assert!(!game.tick_due().unwrap(), "no turns played yet");
+    for _ in 1..TICK_EVERY {
+        look(&mut game, &client);
+        assert!(!game.tick_due().unwrap());
+    }
+    look(&mut game, &client);
+    assert!(game.tick_due().unwrap());
+
+    // maybe_tick runs it and the count starts again.
+    client.push(Response::canned_text("Nothing stirs."));
+    let tick = game.maybe_tick(&client).unwrap().expect("tick was due");
+    assert_eq!(tick.summary, "Nothing stirs.");
+    assert!(tick.changes.is_empty());
+    assert!(!game.tick_due().unwrap());
+    assert_eq!(game.maybe_tick(&client).unwrap(), None);
+    assert_eq!(client.remaining(), 0, "a tick that isn't due calls nothing");
+    let ticks = game
+        .world()
+        .search_events("", &[EventKind::Tick], 10)
+        .unwrap();
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].payload["turn"], json!(TICK_EVERY));
+}
+
+#[test]
+fn a_room_change_makes_a_tick_due_after_a_short_gap() {
+    let (mut game, client) = begun();
+    client.push(Response::canned_tool_use(
+        "r2",
+        "create_room",
+        json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
+               "description": "Tall.", "exits": {}, "contents": []}),
+    ));
+    client.push(Response::canned_text("The tower."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    const { assert!(ROOM_CHANGE_GAP > 1) };
+    assert!(!game.tick_due().unwrap(), "moved, but only one turn in");
+    look(&mut game, &client);
+    assert!(game.tick_due().unwrap(), "moved away from the opening room");
+
+    // After a tick in the tower, staying put isn't a room change.
+    quiet_tick(&mut game, &client);
+    for _ in 0..ROOM_CHANGE_GAP {
+        look(&mut game, &client);
+    }
+    assert!(!game.tick_due().unwrap());
+}
+
+#[test]
+fn a_tick_changes_the_world_off_screen_and_the_change_is_found_on_return() {
+    let (mut game, client, chapel, tower, crow, _) = two_rooms(false);
+    let altar = game.world().contents(Some(chapel)).unwrap()[0];
+    let player = player_id(game.world()).unwrap().unwrap();
+
+    // Off-limits: the player's room, what's in it, the player, new rooms.
+    let refused = [
+        json!({"op": "move", "entity": crow, "to": chapel}),
+        json!({"op": "set_prop", "entity": altar, "key": "cracked", "value": true}),
+        json!({"op": "set_prop", "entity": player, "key": "cursed", "value": true}),
+        json!({"op": "create", "name": "Crypt", "kind": "room"}),
+    ];
+    for (i, op) in refused.iter().enumerate() {
+        client.push(Response::canned_tool_use(
+            format!("x{i}"),
+            "apply_patch",
+            json!({"ops": [op], "note": "nope"}),
+        ));
+    }
+    client.push(Response::canned_tool_use(
+        "k1",
+        "apply_patch",
+        json!({"note": "The crow tore at the bell rope and left a feather.", "ops": [
+            {"op": "set_prop", "entity": crow, "key": "mood", "value": "agitated"},
+            {"op": "create", "name": "black feather", "kind": "item", "location": tower}
+        ]}),
+    ));
+    client.push(Response::canned_text("The crow grows restless."));
+    let before = client.requests().len();
+    let seq_before = game.world().last_seq().unwrap();
+    // Nothing is streamed: tick takes no on_text at all.
+    let tick = game.tick(&client).unwrap();
+
+    // Each refusal reached the director with a reason.
+    let requests = client.requests()[before..].to_vec();
+    for (i, req) in requests[1..=refused.len()].iter().enumerate() {
+        match req.messages.last().unwrap().content.first().unwrap() {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(*is_error, "op {i} should be refused");
+                assert!(
+                    content.contains("off-screen") || content.contains("create rooms"),
+                    "{content}"
+                );
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+    // The tick's own request: tick tools only, a slice naming the off-limits room.
+    let first = &requests[0];
+    let names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["read_bible", "query_entity", "search_events", "apply_patch"]
+    );
+    let slice = first_user_text(first);
+    assert!(
+        slice.contains(&format!(
+            "The player is in #{chapel} Drowned Chapel (off-limits"
+        )),
+        "{slice}"
+    );
+    assert!(
+        slice.contains(&format!("#{tower} Bell Tower (Saltmarsh)")),
+        "{slice}"
+    );
+    assert!(
+        slice.contains(&format!("#{crow} crow in #{tower}")),
+        "{slice}"
+    );
+    assert!(slice.contains("> go south"), "{slice}");
+
+    // Only the allowed patch applied, and it's in the log.
+    assert_eq!(tick.summary, "The crow grows restless.");
+    assert_eq!(
+        tick.changes,
+        vec![TickChange {
+            note: "The crow tore at the bell rope and left a feather.".into(),
+            rooms: vec![tower],
+        }]
+    );
+    let crow_now = game.world().entity(crow).unwrap().unwrap();
+    assert_eq!(crow_now.props["mood"], json!("agitated"));
+    assert_eq!(crow_now.location, Some(tower));
+    assert!(
+        game.world()
+            .entity(altar)
+            .unwrap()
+            .unwrap()
+            .props
+            .get("cracked")
+            .is_none()
+    );
+    let events = game.world().events().unwrap();
+    let tick_event = events.iter().rfind(|e| e.kind == EventKind::Tick).unwrap();
+    assert_eq!(tick_event.payload["room"], json!(chapel));
+    assert_eq!(
+        tick_event.payload["changes"],
+        json!([{"note": "The crow tore at the bell rope and left a feather.", "rooms": [tower]}])
+    );
+    // The change is an ordinary patch event, logged during the tick.
+    assert!(events.iter().any(|e| e.kind == EventKind::Patch
+        && e.seq > seq_before
+        && e.payload["patch"]["ops"][0]["entity"] == json!(crow)
+        && e.payload["patch"]["ops"][0]["value"] == json!("agitated")));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == EventKind::Narration && e.seq > seq_before),
+        "a tick narrates nothing to the player"
+    );
+    // The chapel's slice doesn't mention it; the tower's does.
+    assert!(!local_slice(game.world()).unwrap().contains("off-screen"));
+    client.push(Response::canned_tool_use(
+        "m3",
+        "move_player",
+        json!({"exit": "north"}),
+    ));
+    client.push(Response::canned_text("Feathers everywhere."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    let back = local_slice(game.world()).unwrap();
+    assert!(back.contains("mood\":\"agitated"), "{back}");
+    assert!(back.contains("black feather [item]"), "{back}");
+    assert!(
+        back.contains("Happened here off-screen (world ticks, newest first):\n- The crow tore at the bell rope and left a feather."),
+        "{back}"
+    );
+    // The director finds it through search_events too.
+    let found = game
+        .world()
+        .search_events("bell rope", &[EventKind::Tick], 5)
+        .unwrap();
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
+fn an_npc_leaving_a_room_is_noted_in_both_rooms() {
+    let (mut game, client, _, tower, crow, loft) = two_rooms(true);
+    let loft = loft.unwrap();
+    client.push(Response::canned_tool_use(
+        "k1",
+        "apply_patch",
+        json!({"note": "The crow flew up to the loft.", "ops": [{"op": "move", "entity": crow, "to": loft}]}),
+    ));
+    client.push(Response::canned_text("The crow moved."));
+    let tick = game.tick(&client).unwrap();
+    assert_eq!(tick.changes[0].rooms, vec![tower, loft]);
+    assert_eq!(
+        game.world().entity(crow).unwrap().unwrap().location,
+        Some(loft)
+    );
+}
+
+#[test]
+fn inventory_tools_are_not_offered_in_a_tick() {
+    let (mut game, client) = begun();
+    client.push(Response::canned_tool_use("k1", "take", json!({"item": 1})));
+    client.push(Response::canned_text("Nothing."));
+    game.tick(&client).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("no tool named"), "{msg}");
+}
+
+#[test]
+fn a_session_with_ticks_replays_to_the_same_state() {
+    let (mut game, client, _, tower, crow, _) = two_rooms(false);
+    client.push(Response::canned_tool_use(
+        "k1",
+        "apply_patch",
+        json!({"note": "A feather fell.", "ops": [
+            {"op": "set_prop", "entity": crow, "key": "mood", "value": "agitated"},
+            {"op": "create", "name": "black feather", "kind": "item", "location": tower}
+        ]}),
+    ));
+    client.push(Response::canned_text("Restless."));
+    game.tick(&client).unwrap();
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+    assert_eq!(replayed.events().unwrap(), game.world().events().unwrap());
+}

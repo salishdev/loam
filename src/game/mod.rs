@@ -7,17 +7,20 @@
 
 mod context;
 mod fast_path;
+mod tick;
 mod tools;
 
 #[cfg(test)]
 mod tests;
 
 pub use context::local_slice;
+pub use tick::{ROOM_CHANGE_GAP, TICK_EVERY, TickChange, TickOutcome};
 pub use tools::Phase;
 
 use serde_json::json;
 
 use crate::inventory::Inventory;
+use crate::llm::ToolUse;
 use crate::llm::{
     Effort, LlmClient, LlmError, Message, Model, Request, StopReason, ToolOutput, run_tool_loop,
 };
@@ -150,7 +153,14 @@ impl Game {
             .system(BIBLE_SYSTEM)
             .effort(Effort::Medium)
             .tools(tools::definitions(Phase::Bible));
-        self.run(client, request, Phase::Bible, MAX_BIBLE_CALLS, &mut |_| {})?;
+        self.run(
+            client,
+            request,
+            Phase::Bible,
+            MAX_BIBLE_CALLS,
+            &mut |_| {},
+            None,
+        )?;
         if !self.has_bible()? {
             return Err(GameError::NoBible);
         }
@@ -260,7 +270,7 @@ impl Game {
         .system(DIRECTOR_SYSTEM)
         .effort(Effort::Medium)
         .tools(tools::definitions(Phase::Play));
-        let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text)?;
+        let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text, None)?;
         let mut result = self.finish(client, &outcome.final_response, turn)?;
         result.calls = outcome.calls;
         Ok(result)
@@ -293,6 +303,8 @@ impl Game {
 
     /// Run a tool loop, logging every call. A storage failure inside a tool
     /// ends the loop's usefulness, so it is surfaced after the loop.
+    /// `observe`, if given, sees each call before it runs (with `None`) and
+    /// after (with its output).
     fn run(
         &mut self,
         client: &dyn LlmClient,
@@ -300,6 +312,7 @@ impl Game {
         phase: Phase,
         max_calls: usize,
         on_text: &mut dyn FnMut(&str),
+        mut observe: Option<Observer<'_>>,
     ) -> Result<crate::llm::ToolLoopOutcome, GameError> {
         let world = &mut self.world;
         let inventory = &self.inventory;
@@ -307,6 +320,9 @@ impl Game {
         let outcome = run_tool_loop(client, request, max_calls, on_text, &mut |call| {
             if fatal.is_some() {
                 return ToolOutput::Err("engine error; stop and narrate nothing".into());
+            }
+            if let Some(f) = observe.as_mut() {
+                f(world, call, None);
             }
             let output = match tools::dispatch(world, inventory, phase, call) {
                 Ok(o) => o,
@@ -325,6 +341,9 @@ impl Game {
             );
             if let Err(e) = logged {
                 fatal = Some(e);
+            }
+            if let Some(f) = observe.as_mut() {
+                f(world, call, Some(&output));
             }
             output
         });
@@ -364,6 +383,9 @@ impl Game {
         Ok(format!("{}\n{description}", room.name))
     }
 }
+
+/// Watches tool calls in [`Game::run`].
+type Observer<'a> = &'a mut dyn FnMut(&World, &ToolUse, Option<&ToolOutput>);
 
 /// The bible entity, if written.
 pub(crate) fn bible_id(world: &World) -> Result<Option<EntityId>, StoreError> {

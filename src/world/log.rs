@@ -21,10 +21,13 @@ pub enum EventKind {
     Judgment,
     /// Prose the narrator showed the player for a turn.
     Narration,
+    /// A world tick: off-screen arcs advanced between turns. Its patches
+    /// are logged as ordinary `patch` events; this records the summary.
+    Tick,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 8] = [
+    pub const ALL: [EventKind; 9] = [
         EventKind::Input,
         EventKind::Patch,
         EventKind::PatchRejected,
@@ -33,6 +36,7 @@ impl EventKind {
         EventKind::Roll,
         EventKind::Judgment,
         EventKind::Narration,
+        EventKind::Tick,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +49,7 @@ impl EventKind {
             EventKind::Roll => "roll",
             EventKind::Judgment => "judgment",
             EventKind::Narration => "narration",
+            EventKind::Tick => "tick",
         }
     }
 

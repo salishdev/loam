@@ -123,3 +123,54 @@ fn haiku_judges_a_met_goal_complete() {
         Status::Complete
     );
 }
+
+/// A short live game: seed, opening, one step out and back, then a world
+/// tick. Prints what the tick did; checks it left the player's room alone.
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn world_tick_advances_off_screen() {
+    use loam::game::Game;
+    use loam::world::{EventKind, World};
+
+    let client = AnthropicClient::from_env().expect("set ANTHROPIC_API_KEY to run live tests");
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.create_bible(
+        &client,
+        "A fishing village where the smugglers and the lighthouse keeper are at war. \
+         Wry, salty, small-scale.",
+    )
+    .unwrap();
+    let mut print = |t: &str| print!("{t}");
+    game.begin(&client, &mut print).unwrap();
+    for input in [
+        "go through the most interesting exit",
+        "go back the way I came",
+    ] {
+        println!("\n> {input}");
+        game.turn(&client, input, &mut print).unwrap();
+    }
+    let before = game.world().state().unwrap();
+    let tick = game.tick(&client).unwrap();
+    println!("\n\n[tick] {} ({} calls)", tick.summary, tick.calls);
+    for c in &tick.changes {
+        println!("  - {} rooms={:?}", c.note, c.rooms);
+    }
+    let after = game.world().state().unwrap();
+    assert!(!tick.summary.is_empty());
+    let ticks = game
+        .world()
+        .search_events("", &[EventKind::Tick], 5)
+        .unwrap();
+    assert_eq!(ticks.len(), 1);
+    let here = ticks[0].payload["room"].as_i64();
+    assert!(
+        tick.changes
+            .iter()
+            .all(|c| !c.rooms.iter().any(|r| Some(*r) == here)),
+        "a tick touched the player's room"
+    );
+    if tick.changes.is_empty() {
+        assert_eq!(before, after);
+    }
+    println!("\n{}", loam::game::local_slice(game.world()).unwrap());
+}

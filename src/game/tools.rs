@@ -27,6 +27,8 @@ pub enum Phase {
     Bible,
     /// Playing turns (including the opening).
     Play,
+    /// A world tick: read tools and off-screen patches only.
+    Tick,
 }
 
 pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
@@ -46,6 +48,12 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         .chain(rules::tools::tool_definitions())
         .chain(glossary::tools::tool_definitions())
         .collect(),
+        Phase::Tick => vec![
+            read_bible_def(),
+            query_entity_def(),
+            search_events_def(),
+            tick_apply_patch_def(),
+        ],
     }
 }
 
@@ -92,6 +100,13 @@ pub fn dispatch(
         "search_events" => search_events(world, input!(SearchEventsInput)),
         "create_room" => create_room(world, input!(CreateRoomInput)),
         "move_player" => move_player(world, input!(MovePlayerInput)),
+        "apply_patch" if phase == Phase::Tick => {
+            let patch = input!(Patch);
+            if let Some(reason) = on_screen_refusal(world, &patch)? {
+                return refuse(reason);
+            }
+            apply_patch(world, patch)
+        }
         "apply_patch" => apply_patch(world, input!(Patch)),
         // Inventory tools land here only when there is no player yet.
         _ => refuse("there is no player yet"),
@@ -614,7 +629,6 @@ fn move_player(world: &mut World, input: MovePlayerInput) -> Result<ToolOutput, 
 // ---- apply_patch -----------------------------------------------------------
 
 fn apply_patch_def() -> ToolDefinition {
-    let r = json!({"type": ["integer", "string"], "description": "entity id, or a handle created earlier in this patch"});
     ToolDefinition::new(
         "apply_patch",
         "Change the world: an atomic list of ops applied in order; if one fails nothing \
@@ -622,35 +636,52 @@ fn apply_patch_def() -> ToolDefinition {
          Ops: create {handle?, name, kind, location?, props?}, move {entity, to}, \
          set_prop {entity, key, value}, remove_prop {entity, key}, rename {entity, name}, \
          destroy {entity} (must be empty).",
-        json!({
-            "type": "object",
-            "properties": {"ops": {"type": "array", "minItems": 1, "items": {
-                "type": "object",
-                "properties": {
-                    "op": {"type": "string", "enum": ["create", "move", "set_prop", "remove_prop", "rename", "destroy"]},
-                    "entity": r, "to": r, "location": r,
-                    "handle": {"type": "string"}, "name": {"type": "string"}, "kind": {"type": "string"},
-                    "key": {"type": "string"}, "value": {}, "props": {"type": "object"}
-                },
-                "required": ["op"]
-            }}},
-            "required": ["ops"]
-        }),
+        patch_schema(),
     )
+}
+
+/// The tick's `apply_patch`: the same ops, off-screen only, with a note.
+fn tick_apply_patch_def() -> ToolDefinition {
+    let mut schema = patch_schema();
+    schema["properties"]["note"] = json!({
+        "type": "string",
+        "description": "What happened, in a sentence, for the log. The director reads it \
+                        when the player next comes here."
+    });
+    schema["required"] = json!(["ops", "note"]);
+    ToolDefinition::new(
+        "apply_patch",
+        "Advance an off-screen arc: an atomic list of ops applied in order; if one fails \
+         nothing applies and you get the reason. Ops: create {handle?, name, kind, location?, \
+         props?}, move {entity, to}, set_prop {entity, key, value}, remove_prop {entity, key}, \
+         rename {entity, name}, destroy {entity} (must be empty). The player, the player's \
+         room and everything in them are off-limits.",
+        schema,
+    )
+}
+
+fn patch_schema() -> Value {
+    let r = json!({"type": ["integer", "string"], "description": "entity id, or a handle created earlier in this patch"});
+    json!({
+        "type": "object",
+        "properties": {"ops": {"type": "array", "minItems": 1, "items": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["create", "move", "set_prop", "remove_prop", "rename", "destroy"]},
+                "entity": r, "to": r, "location": r,
+                "handle": {"type": "string"}, "name": {"type": "string"}, "kind": {"type": "string"},
+                "key": {"type": "string"}, "value": {}, "props": {"type": "object"}
+            },
+            "required": ["op"]
+        }}},
+        "required": ["ops"]
+    })
 }
 
 fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError> {
     let player = player_id(world)?;
     for (i, op) in patch.ops.iter().enumerate() {
-        // Every entity the op touches or places something into.
-        let refs: Vec<&EntityRef> = match op {
-            Op::Create { location, .. } => location.iter().collect(),
-            Op::Move { entity, to } => std::iter::once(entity).chain(to).collect(),
-            Op::SetProp { entity, .. }
-            | Op::RemoveProp { entity, .. }
-            | Op::Rename { entity, .. }
-            | Op::Destroy { entity } => vec![entity],
-        };
+        let refs = op_refs(op);
         for r in &refs {
             let EntityRef::Id(id) = r else { continue };
             let kind = world.entity(*id)?.map(|e| e.kind);
@@ -690,4 +721,64 @@ fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError
         }
         Err(reason) => refuse(reason),
     }
+}
+
+/// Every entity an op touches or places something into.
+pub(crate) fn op_refs(op: &Op) -> Vec<&EntityRef> {
+    match op {
+        Op::Create { location, .. } => location.iter().collect(),
+        Op::Move { entity, to } => std::iter::once(entity).chain(to).collect(),
+        Op::SetProp { entity, .. }
+        | Op::RemoveProp { entity, .. }
+        | Op::Rename { entity, .. }
+        | Op::Destroy { entity } => vec![entity],
+    }
+}
+
+/// Why a tick patch may not apply: it creates a room, or touches the
+/// player, the player's room or anything inside either. An entity created
+/// earlier in the same patch is checked through the op that placed it.
+fn on_screen_refusal(world: &World, patch: &Patch) -> Result<Option<String>, StoreError> {
+    let Some(player) = player_id(world)? else {
+        return Ok(None);
+    };
+    let room = world.entity(player)?.and_then(|p| p.location);
+    for (i, op) in patch.ops.iter().enumerate() {
+        if let Op::Create { kind, .. } = op
+            && kind == ROOM_KIND
+        {
+            return Ok(Some(format!(
+                "op {i}: a world tick doesn't create rooms; they are generated when the \
+                 player explores"
+            )));
+        }
+        for r in op_refs(op) {
+            if let EntityRef::Id(id) = r
+                && is_on_screen(world, *id, player, room)?
+            {
+                return Ok(Some(format!(
+                    "op {i}: #{id} is where the player can see it; a world tick changes \
+                     only what happens off-screen"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `id` is the player, the player's room, or inside either.
+pub(crate) fn is_on_screen(
+    world: &World,
+    id: EntityId,
+    player: EntityId,
+    room: Option<EntityId>,
+) -> Result<bool, StoreError> {
+    let mut at = Some(id);
+    while let Some(here) = at {
+        if here == player || Some(here) == room {
+            return Ok(true);
+        }
+        at = world.entity(here)?.and_then(|e| e.location);
+    }
+    Ok(false)
 }

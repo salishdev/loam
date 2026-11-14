@@ -1,7 +1,8 @@
 //! The local slice: the little the director sees up front each turn.
 //!
 //! Current room and its exits, what is in it (one level down), what the
-//! player carries, the last few turns and the bible's section titles.
+//! player carries, what world ticks did in the room, the last few turns
+//! and the bible's section titles.
 //! Everything else is fetched through tools.
 
 use std::fmt::Write;
@@ -11,11 +12,14 @@ use serde_json::Value;
 use crate::world::{Entity, EntityId, EventKind, StoreError, World};
 use crate::{glossary, rules};
 
+use super::tick::notes_for_room;
 use super::tools::exits_of;
 use super::{bible_id, player_id};
 
 /// How many recent inputs and narrations the slice shows.
 const RECENT_EVENTS: usize = 6;
+/// Most world-tick notes shown for the current room.
+const ROOM_NOTES: usize = 3;
 /// Longest recent narration shown in full.
 const RECENT_CHARS: usize = 500;
 
@@ -165,6 +169,13 @@ fn room_view(
     } else {
         writeln!(out, "Here:").unwrap();
         tree(world, &here, 1, out)?;
+    }
+    let notes = notes_for_room(world, room.id, ROOM_NOTES)?;
+    if !notes.is_empty() {
+        writeln!(out, "Happened here off-screen (world ticks, newest first):").unwrap();
+        for note in notes {
+            writeln!(out, "- {note}").unwrap();
+        }
     }
     Ok(())
 }

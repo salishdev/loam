@@ -2,12 +2,13 @@
 //!
 //! A new save asks for a seed prompt (ended by a blank line), builds the
 //! world bible and opens the story; an existing save resumes where it was.
-//! `:quests` lists quests; `:quit` exits.
+//! A world tick runs between turns when due. `:quests` lists quests;
+//! `:tick` forces a world tick; `:quit` exits.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use loam::game::Game;
+use loam::game::{Game, GameError, TickOutcome};
 use loam::llm::AnthropicClient;
 use loam::quest::Verdict;
 use loam::world::World;
@@ -72,6 +73,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 print_quests(&game);
                 continue;
             }
+            ":tick" => {
+                report_tick(game.tick(&client));
+                continue;
+            }
             _ => {}
         }
         println!();
@@ -90,6 +95,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Verdict::Failed => println!("\n[Quest failed: {}]", j.title),
                         Verdict::Ongoing => {}
                     }
+                }
+                // The world moves on off-screen; a failed tick is retried
+                // after the next turn.
+                if let Some(result) = game.maybe_tick(&client).transpose() {
+                    report_tick(result);
                 }
             }
             // A failed turn is reported; the save stays usable.
@@ -119,5 +129,13 @@ fn print_quests(game: &Game) {
         if let Some(r) = &q.resolution {
             println!("  => {r}");
         }
+    }
+}
+
+/// A terse builder's line on stderr; the player sees nothing of the tick.
+fn report_tick(result: Result<TickOutcome, GameError>) {
+    match result {
+        Ok(t) => eprintln!("[world tick: {} change(s)]", t.changes.len()),
+        Err(e) => eprintln!("[world tick failed: {e}]"),
     }
 }
