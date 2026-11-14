@@ -3,12 +3,14 @@
 
 mod log;
 mod patch;
+mod replay;
 
 #[cfg(test)]
 mod tests;
 
 pub use log::{Event, EventKind};
 pub use patch::{EntityId, EntityRef, Op, Patch};
+pub use replay::{ReplayError, WorldState};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -42,6 +44,11 @@ CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'event log is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 /// An entity: engine-owned core plus open props.
