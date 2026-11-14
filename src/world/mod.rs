@@ -99,6 +99,22 @@ pub struct Applied {
     pub handles: BTreeMap<String, EntityId>,
 }
 
+/// Prop keys starting with this are engine-owned: director patches can't
+/// set or remove them.
+pub const ENGINE_PROP_PREFIX: &str = "_";
+
+/// Engine-owned prop marking an entity whose contents are an inventory.
+pub const CARRIER_PROP: &str = "_carrier";
+
+/// Who is applying a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Authority {
+    /// The director (LLM): engine-owned state is off limits.
+    Director,
+    /// An engine module: no ownership guard, only integrity checks.
+    Engine,
+}
+
 /// The world store.
 pub struct World {
     conn: Connection,
@@ -124,15 +140,33 @@ impl World {
     /// Validate and apply a patch atomically, logging it as a `patch` event
     /// in the same transaction. A rejected patch changes nothing in the
     /// world and is logged as a `patch_rejected` event.
+    ///
+    /// This is the director's door: it refuses engine-owned changes (props
+    /// whose key starts with `_`, and moves into or out of a carrier's
+    /// inventory), which go through [`crate::inventory`] instead.
     pub fn apply_patch(&mut self, patch: &Patch) -> Result<Applied, ApplyError> {
+        self.apply_patch_as(patch, Authority::Director)
+    }
+
+    /// Apply a patch without the engine-owned guard. Used by engine modules
+    /// such as inventory; the `patch` event records `"by": "engine"` so
+    /// replay knows to apply it the same way.
+    pub(crate) fn apply_engine_patch(&mut self, patch: &Patch) -> Result<Applied, ApplyError> {
+        self.apply_patch_as(patch, Authority::Engine)
+    }
+
+    fn apply_patch_as(&mut self, patch: &Patch, by: Authority) -> Result<Applied, ApplyError> {
         let tx = self.conn.transaction()?;
-        match apply_ops(&tx, patch)? {
+        match apply_ops(&tx, patch, by)? {
             Ok((created, handles)) => {
-                let payload = json!({
+                let mut payload = json!({
                     "patch": patch,
                     "created": created,
                     "handles": handles,
                 });
+                if by == Authority::Engine {
+                    payload["by"] = json!("engine");
+                }
                 let event_seq = insert_event(&tx, EventKind::Patch, &payload)?;
                 tx.commit()?;
                 Ok(Applied {
@@ -143,11 +177,14 @@ impl World {
             }
             Err(rejection) => {
                 tx.rollback()?;
-                let payload = json!({
+                let mut payload = json!({
                     "patch": patch,
                     "op": rejection.op,
                     "reason": rejection.reason,
                 });
+                if by == Authority::Engine {
+                    payload["by"] = json!("engine");
+                }
                 insert_event(&self.conn, EventKind::PatchRejected, &payload)?;
                 Err(ApplyError::Rejected(rejection))
             }
@@ -259,7 +296,8 @@ type OpsOutcome = Result<(Vec<EntityId>, BTreeMap<String, EntityId>), Rejection>
 
 /// Apply ops in order inside `tx`. The outer `Result` is a storage failure;
 /// the inner one is a validation verdict. The caller rolls back on rejection.
-fn apply_ops(tx: &Transaction, patch: &Patch) -> rusqlite::Result<OpsOutcome> {
+fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result<OpsOutcome> {
+    let guarded = by == Authority::Director;
     let mut handles: BTreeMap<String, EntityId> = BTreeMap::new();
     let mut created = Vec::new();
     // Entities given a location by this patch, with the op that placed them.
@@ -293,6 +331,19 @@ fn apply_ops(tx: &Transaction, patch: &Patch) -> rusqlite::Result<OpsOutcome> {
                     Some(r) => Some(resolve!(r)),
                     None => None,
                 };
+                if guarded {
+                    if let Some(key) = props.keys().find(|k| is_engine_prop(k)) {
+                        return reject(engine_prop_reason(key));
+                    }
+                    if let Some(loc) = loc
+                        && let Some(c) = carrier_at_or_above(tx, loc)?
+                    {
+                        return reject(format!(
+                            "cannot create {name:?} inside #{c}'s inventory: \
+                             create it elsewhere, then use give or transfer"
+                        ));
+                    }
+                }
                 tx.execute(
                     "INSERT INTO entities (name, kind, location) VALUES (?1, ?2, ?3)",
                     params![name, kind, loc],
@@ -320,6 +371,22 @@ fn apply_ops(tx: &Transaction, patch: &Patch) -> rusqlite::Result<OpsOutcome> {
                         "{entity} would be in two places: op {prev} already placed it"
                     ));
                 }
+                if guarded {
+                    if let Some(c) = carrier_above(tx, id)? {
+                        return reject(format!(
+                            "{entity} is in #{c}'s inventory, which only the inventory \
+                             tools (drop, give, transfer) can change"
+                        ));
+                    }
+                    if let Some(dest) = dest
+                        && let Some(c) = carrier_at_or_above(tx, dest)?
+                    {
+                        return reject(format!(
+                            "moving {entity} would put it in #{c}'s inventory, which only \
+                             the inventory tools (take, give, transfer) can change"
+                        ));
+                    }
+                }
                 if let Some(dest) = dest
                     && let Some(reason) = cycle(tx, id, dest)?
                 {
@@ -336,10 +403,16 @@ fn apply_ops(tx: &Transaction, patch: &Patch) -> rusqlite::Result<OpsOutcome> {
             }
             Op::SetProp { entity, key, value } => {
                 let id = resolve!(entity);
+                if guarded && is_engine_prop(key) {
+                    return reject(engine_prop_reason(key));
+                }
                 set_prop(tx, id, key, value)?;
             }
             Op::RemoveProp { entity, key } => {
                 let id = resolve!(entity);
+                if guarded && is_engine_prop(key) {
+                    return reject(engine_prop_reason(key));
+                }
                 tx.execute(
                     "DELETE FROM props WHERE entity_id = ?1 AND key = ?2",
                     params![id, key],
@@ -415,6 +488,53 @@ fn cycle(tx: &Transaction, id: EntityId, dest: EntityId) -> rusqlite::Result<Opt
         }
         if !seen.insert(c) {
             break; // existing cycle; the store never creates one, but don't loop
+        }
+        cur = tx.query_row("SELECT location FROM entities WHERE id = ?1", [c], |r| {
+            r.get::<_, Option<EntityId>>(0)
+        })?;
+    }
+    Ok(None)
+}
+
+fn is_engine_prop(key: &str) -> bool {
+    key.starts_with(ENGINE_PROP_PREFIX)
+}
+
+fn engine_prop_reason(key: &str) -> String {
+    format!(
+        "prop {key:?} is engine-owned (keys starting with '{ENGINE_PROP_PREFIX}'); use the inventory tools"
+    )
+}
+
+/// The nearest carrier strictly containing `id`, if any.
+fn carrier_above(tx: &Transaction, id: EntityId) -> rusqlite::Result<Option<EntityId>> {
+    let loc = tx.query_row("SELECT location FROM entities WHERE id = ?1", [id], |r| {
+        r.get::<_, Option<EntityId>>(0)
+    })?;
+    match loc {
+        Some(loc) => carrier_at_or_above(tx, loc),
+        None => Ok(None),
+    }
+}
+
+/// `id` itself if it is a carrier, else the nearest carrier containing it.
+fn carrier_at_or_above(tx: &Transaction, id: EntityId) -> rusqlite::Result<Option<EntityId>> {
+    let mut seen = HashSet::new();
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        if !seen.insert(c) {
+            break;
+        }
+        let is_carrier = tx
+            .query_row(
+                "SELECT 1 FROM props WHERE entity_id = ?1 AND key = ?2 AND value = 'true'",
+                params![c, CARRIER_PROP],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if is_carrier {
+            return Ok(Some(c));
         }
         cur = tx.query_row("SELECT location FROM entities WHERE id = ?1", [c], |r| {
             r.get::<_, Option<EntityId>>(0)

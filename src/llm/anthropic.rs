@@ -41,9 +41,10 @@ impl AnthropicClient {
             .ok_or(LlmError::MissingApiKey)?;
         let mut client = Self::new(key)?;
         if let Ok(url) = std::env::var("ANTHROPIC_BASE_URL")
-            && !url.is_empty() {
-                client.base_url = url.trim_end_matches('/').to_string();
-            }
+            && !url.is_empty()
+        {
+            client.base_url = url.trim_end_matches('/').to_string();
+        }
         Ok(client)
     }
 
