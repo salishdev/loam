@@ -1,14 +1,14 @@
 //! The quest judge: one Haiku call per active quest a turn touched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Quest, Status, quests, resolve, touched_since};
+use super::{CONCERNS_REL, Quest, Status, quests, resolve, touched_since};
 use crate::llm::{LlmClient, Message, Model, Request, ToolDefinition};
-use crate::world::{EntityId, EventKind, StoreError, World};
+use crate::world::{Cascaded, EntityId, EventKind, StoreError, World};
 
 /// The tool the judge answers with.
 pub const JUDGE_TOOL: &str = "record_judgment";
@@ -93,8 +93,15 @@ pub fn judge_turn(
     if touched.is_empty() {
         return Ok(Vec::new());
     }
+    let mut lost = lost_concerns(world, turn_start)?;
     let due: Vec<Quest> = quests(world)?
         .into_iter()
+        .map(|mut q| {
+            // A concerned entity destroyed this turn took its relation with
+            // it; the judge still needs to see it gone.
+            q.concerns.extend(lost.remove(&q.id).unwrap_or_default());
+            q
+        })
         .filter(|q| q.status == Status::Active && q.concerns.iter().any(|c| touched.contains(c)))
         .collect();
     if due.is_empty() {
@@ -159,6 +166,34 @@ pub fn judge_turn(
         });
     }
     Ok(judgments)
+}
+
+/// Concerns that destroys after event `after` cascaded away, by quest.
+fn lost_concerns(
+    world: &World,
+    after: i64,
+) -> Result<BTreeMap<EntityId, Vec<EntityId>>, StoreError> {
+    let mut lost: BTreeMap<EntityId, Vec<EntityId>> = BTreeMap::new();
+    for e in world.events_since(after)? {
+        let Some(cascaded) = e
+            .payload
+            .get("cascaded")
+            .filter(|_| e.kind == EventKind::Patch)
+        else {
+            continue;
+        };
+        let cascaded: Vec<Cascaded> = serde_json::from_value(cascaded.clone()).map_err(|err| {
+            StoreError::Corrupt(format!("event {}: bad cascaded list: {err}", e.seq))
+        })?;
+        for c in cascaded {
+            if c.relation.rel == CONCERNS_REL {
+                lost.entry(c.relation.subject)
+                    .or_default()
+                    .push(c.relation.object);
+            }
+        }
+    }
+    Ok(lost)
 }
 
 /// The ops of every patch applied after `after`, one JSON line each.

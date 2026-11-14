@@ -424,3 +424,48 @@ fn missing_verdict_is_logged_and_changes_nothing() {
         logged[1]
     );
 }
+
+#[test]
+fn concerns_are_relations_and_destroying_one_leaves_a_valid_quest() {
+    let (mut w, _, well, bucket) = world();
+    let id = spawn(&mut w, "The dry well", "The miller begs.", &[well]).unwrap();
+    reveal_goal(&mut w, id, "Fill the bucket.", &[bucket]).unwrap();
+
+    // No entity id in the quest's JSON: concerns are relations.
+    let e = w.entity(id).unwrap().unwrap();
+    assert_eq!(e.props.keys().collect::<Vec<_>>(), vec!["_quest"]);
+    let rels = w.relations_from(id, Some(CONCERNS_REL)).unwrap();
+    assert_eq!(
+        rels.iter().map(|r| r.object).collect::<Vec<_>>(),
+        vec![well, bucket]
+    );
+
+    w.apply_patch(&Patch::new(vec![Op::Destroy {
+        entity: bucket.into(),
+    }]))
+    .unwrap();
+    let q = quest(&w, id).unwrap().unwrap();
+    assert_eq!(q.concerns, vec![well]);
+    assert_eq!(q.status, Status::Active);
+    // Still escalates and takes new concerns.
+    let q = escalate(&mut w, id, "The well cracks.", &[]).unwrap();
+    assert_eq!(q.developments.len(), 1);
+
+    // Replay reproduces it.
+    let r = w.replay_in_memory().unwrap();
+    assert_eq!(r.state().unwrap(), w.state().unwrap());
+}
+
+#[test]
+fn director_cannot_touch_concerns() {
+    let (mut w, _, well, _) = world();
+    let id = spawn(&mut w, "The dry well", "The miller begs.", &[well]).unwrap();
+    let err = w
+        .apply_patch(&Patch::new(vec![Op::Unrelate {
+            subject: id.into(),
+            rel: CONCERNS_REL.into(),
+            object: well.into(),
+        }]))
+        .unwrap_err();
+    assert!(err.to_string().contains("engine-owned"), "{err}");
+}

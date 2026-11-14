@@ -2,7 +2,11 @@
 
 use serde_json::{Map, Value};
 
-use super::{EntityId, EntityRef, Op, Patch, StoreError};
+use super::{ENGINE_PROP_PREFIX, EntityId, EntityRef, Op, Patch, StoreError};
+
+fn is_engine_owned(rel: &str) -> bool {
+    rel.starts_with(ENGINE_PROP_PREFIX)
+}
 
 /// What kind of thing an event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,7 +79,8 @@ impl Event {
     /// For a `patch` or `patch_rejected` event, each op with the entities it
     /// touched: created (and where), moved (and where to), given or stripped
     /// of props, renamed or destroyed, or either end of a relation made or
-    /// removed. Relations a destroy cascaded are in the payload's
+    /// removed (only the subject, for an engine-owned relation such as a
+    /// quest's concerns). Relations a destroy cascaded are in the payload's
     /// `cascaded` list, not here. A move's origin isn't logged, so it
     /// doesn't count. A rejected patch created nothing, so only ops naming
     /// existing ids count there. Other kinds of event touch nothing.
@@ -118,6 +123,21 @@ impl Event {
                     | Op::RemoveProp { entity, .. }
                     | Op::Rename { entity, .. }
                     | Op::Destroy { entity } => id_of(entity).into_iter().collect(),
+                    // An engine-owned relation (a quest's concerns, a
+                    // rule's pins) is the subject's bookkeeping: it doesn't
+                    // change the object.
+                    Op::Relate {
+                        subject,
+                        rel,
+                        object,
+                        ..
+                    }
+                    | Op::Unrelate {
+                        subject,
+                        rel,
+                        object,
+                        ..
+                    } if is_engine_owned(rel) => id_of(subject).into_iter().collect(),
                     Op::Relate {
                         subject, object, ..
                     }

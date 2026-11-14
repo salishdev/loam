@@ -54,15 +54,7 @@ fn encode<C: Component>(value: &C) -> Value {
 impl World {
     /// The component `C` on entity `id`, if it has one.
     pub fn get<C: Component>(&self, id: EntityId) -> Result<Option<C>, StoreError> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM props WHERE entity_id = ?1 AND key = ?2",
-                rusqlite::params![id, key::<C>()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        raw.map(|s| decode_str(id, &s)).transpose()
+        get_in(&self.conn, id)
     }
 
     /// Every entity carrying `C`, with its value, in id order.
@@ -99,6 +91,22 @@ impl Entity {
             .map(|v| decode(self.id, v))
             .transpose()
     }
+}
+
+/// The component `C` on entity `id`, read through `conn` (e.g. inside a
+/// patch's transaction).
+pub(crate) fn get_in<C: Component>(
+    conn: &rusqlite::Connection,
+    id: EntityId,
+) -> Result<Option<C>, StoreError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM props WHERE entity_id = ?1 AND key = ?2",
+            rusqlite::params![id, key::<C>()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.map(|s| decode_str(id, &s)).transpose()
 }
 
 /// An op setting component `C` on `entity`, for multi-op engine patches.

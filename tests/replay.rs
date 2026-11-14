@@ -374,3 +374,68 @@ fn fork_point_must_be_inside_the_log() {
         }
     }
 }
+
+/// A quest concerning two things and a rule pinned to one of them; then a
+/// destroy that cascades both the concern and the pin, retiring the rule.
+#[test]
+fn concerns_and_pins_replay_and_fork() {
+    use loam::rules::{self, Condition, RuleStatus};
+    let mut w = World::open_in_memory().unwrap();
+    let a = w
+        .apply_patch(&Patch::new(
+            serde_json::from_value(json!([
+                {"op": "create", "handle": "nave", "name": "Nave", "kind": "room"},
+                {"op": "create", "handle": "door", "name": "Rotten door", "kind": "door",
+                 "location": "nave"},
+                {"op": "create", "handle": "bell", "name": "Bell", "kind": "item",
+                 "location": "nave"}
+            ]))
+            .unwrap(),
+        ))
+        .unwrap();
+    let (door, bell) = (a.handles["door"], a.handles["bell"]);
+    let q = loam::quest::spawn(&mut w, "Ring the bell", "A monk asks.", &[bell]).unwrap();
+    loam::quest::reveal_goal(&mut w, q, "The bell rings beyond the door.", &[door]).unwrap();
+    let def = serde_json::from_value(json!({
+        "name": "Kick the door", "trigger": "kick <target>",
+        "roles": {"target": "the door"},
+        "conditions": [{"check": "entity", "role": "target", "id": door}],
+        "effects": [{"op": "set_prop", "entity": "target", "key": "broken", "value": true}]
+    }))
+    .unwrap();
+    let (rule, _) = rules::mint(&mut w, def, "").unwrap().unwrap();
+    let before = w.last_seq().unwrap();
+    let destroy = w
+        .apply_patch(&Patch::new(vec![Op::Destroy {
+            entity: door.into(),
+        }]))
+        .unwrap();
+
+    // The quest still loads, concerning only the bell; the rule is retired.
+    assert_eq!(loam::quest::quest(&w, q).unwrap().unwrap().concerns, [bell]);
+    let retired = rules::get(&w, rule.id).unwrap().unwrap();
+    assert_eq!(retired.status, RuleStatus::Retired);
+    assert!(retired.def.conditions.contains(&Condition::Entity {
+        role: "target".into(),
+        id: None
+    }));
+
+    // Replay and forks on either side of the destroy reproduce the store.
+    let replayed = w.replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), w.state().unwrap());
+    assert_eq!(replayed.events().unwrap(), w.events().unwrap());
+    let fork = w.fork_in_memory(before).unwrap();
+    assert!(rules::get(&fork, rule.id).unwrap().unwrap().is_active());
+    assert_eq!(
+        loam::quest::quest(&fork, q).unwrap().unwrap().concerns,
+        [door, bell]
+    );
+    // The retirement is part of the destroy's patch: forking at that event
+    // already holds it.
+    let at_destroy = w.fork_in_memory(destroy.event_seq).unwrap();
+    assert_eq!(at_destroy.state().unwrap(), w.state().unwrap());
+    assert_eq!(w.last_seq().unwrap(), destroy.event_seq + 1);
+    let change = &w.events().unwrap()[destroy.event_seq as usize];
+    assert_eq!(change.kind, EventKind::RuleChange);
+    assert_eq!(change.payload["reason"], json!("pinned entity destroyed"));
+}

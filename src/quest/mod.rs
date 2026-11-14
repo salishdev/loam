@@ -9,9 +9,13 @@
 //! one of them, and only those.
 //!
 //! A quest is a top-level world entity of kind [`QUEST_KIND`] whose state is
-//! held in the engine-owned `_quest` and `_concerns` components and changed
-//! only by engine patches, so the event log (and therefore replay and
-//! forking) covers quests like anything else. Every judgment is logged as a `judgment` event.
+//! held in the engine-owned `_quest` component, with the entities it
+//! concerns as engine-owned [`CONCERNS_REL`] relations (quest → entity), all
+//! changed only by engine patches, so the event log (and therefore replay
+//! and forking) covers quests like anything else. Destroying a concerned
+//! entity cascades its relation away and leaves the quest valid; the judge
+//! still sees that entity as destroyed on that turn. Every judgment is
+//! logged as a `judgment` event.
 
 mod judge;
 mod tools;
@@ -28,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
 use crate::world::{
-    self, ApplyError, Component, EntityId, EventKind, Op, Patch, StoreError, World,
+    self, ApplyError, Component, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
 };
 
 /// Kind of quest entities.
@@ -51,15 +55,8 @@ impl Component for State {
     const KEY: &'static str = "_quest";
 }
 
-/// The entities a quest concerns: the `_concerns` component (until it
-/// becomes a relation).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-struct Concerns(Vec<EntityId>);
-
-impl Component for Concerns {
-    const KEY: &'static str = "_concerns";
-}
+/// The engine-owned relation from a quest to each entity it concerns.
+pub const CONCERNS_REL: &str = "_concerns";
 
 /// Most entities one quest may concern.
 pub const MAX_CONCERNS: usize = 8;
@@ -103,7 +100,8 @@ pub struct Quest {
     pub status: Status,
     /// The recorded goal, once revealed. Fixed from then on.
     pub goal: Option<String>,
-    /// Entities the goal concerns; touching one triggers the judge.
+    /// Entities the goal concerns, in id order; touching one triggers the
+    /// judge.
     pub concerns: Vec<EntityId>,
     /// Escalations, oldest first.
     pub developments: Vec<String>,
@@ -112,14 +110,14 @@ pub struct Quest {
 }
 
 impl Quest {
-    fn new(id: EntityId, title: String, state: State, concerns: Concerns) -> Quest {
+    fn new(id: EntityId, title: String, state: State, concerns: Vec<EntityId>) -> Quest {
         Quest {
             id,
             title,
             hook: state.hook,
             status: state.status,
             goal: state.goal,
-            concerns: concerns.0,
+            concerns,
             developments: state.developments,
             resolution: state.resolution,
         }
@@ -181,7 +179,11 @@ fn load(world: &World, id: EntityId, state: State) -> Result<Quest, StoreError> 
         .entity(id)?
         .ok_or_else(|| StoreError::Corrupt(format!("quest #{id} vanished")))?
         .name;
-    let concerns = world.get::<Concerns>(id)?.unwrap_or_default();
+    let concerns = world
+        .relations_from(id, Some(CONCERNS_REL))?
+        .into_iter()
+        .map(|r| r.object)
+        .collect();
     Ok(Quest::new(id, title, state, concerns))
 }
 
@@ -239,17 +241,15 @@ pub fn spawn(
         developments: Vec::new(),
         resolution: None,
     };
-    let props = Map::from_iter([world::prop(&state), world::prop(&Concerns(concerns))]);
-    let applied = engine_patch(
-        world,
-        vec![Op::Create {
-            handle: None,
-            name: title.trim().to_owned(),
-            kind: QUEST_KIND.into(),
-            location: None,
-            props,
-        }],
-    )?;
+    let mut ops = vec![Op::Create {
+        handle: Some("quest".into()),
+        name: title.trim().to_owned(),
+        kind: QUEST_KIND.into(),
+        location: None,
+        props: Map::from_iter([world::prop(&state)]),
+    }];
+    ops.extend(relate_ops(EntityRef::Handle("quest".into()), &concerns));
+    let applied = engine_patch(world, ops)?;
     Ok(applied.created[0])
 }
 
@@ -261,20 +261,30 @@ fn existing(world: &World, id: EntityId) -> Result<Quest> {
     }
 }
 
-/// Merge `more` into a quest's concerns, keeping order and the cap.
-fn merged_concerns(world: &World, q: &Quest, more: &[EntityId]) -> Result<Vec<EntityId>> {
-    let mut all = q.concerns.clone();
-    for id in check_concerns(world, more)? {
-        if !all.contains(&id) {
-            all.push(id);
-        }
-    }
-    if all.len() > MAX_CONCERNS {
+/// The entities in `more` a quest doesn't concern yet, checked against the
+/// cap. Returns them with the total the quest would then concern.
+fn new_concerns(world: &World, q: &Quest, more: &[EntityId]) -> Result<(Vec<EntityId>, usize)> {
+    let added: Vec<EntityId> = check_concerns(world, more)?
+        .into_iter()
+        .filter(|id| !q.concerns.contains(id))
+        .collect();
+    let total = q.concerns.len() + added.len();
+    if total > MAX_CONCERNS {
         return refuse(format!(
             "a quest may concern at most {MAX_CONCERNS} entities"
         ));
     }
-    Ok(all)
+    Ok((added, total))
+}
+
+/// Ops relating `quest` to each of `concerns`.
+fn relate_ops(quest: EntityRef, concerns: &[EntityId]) -> impl Iterator<Item = Op> + '_ {
+    concerns.iter().map(move |&id| Op::Relate {
+        subject: quest.clone(),
+        rel: CONCERNS_REL.into(),
+        object: id.into(),
+        props: Map::new(),
+    })
 }
 
 /// Record a quest's goal once it has revealed itself, with the entities it
@@ -297,20 +307,16 @@ pub fn reveal_goal(
     if goal.trim().is_empty() {
         return refuse("goal must not be empty");
     }
-    let concerns = merged_concerns(world, &q, concerns)?;
-    if concerns.is_empty() {
+    let (added, total) = new_concerns(world, &q, concerns)?;
+    if total == 0 {
         return refuse("name at least one entity the goal concerns");
     }
     let mut state = q.state();
     state.goal = Some(goal.trim().to_owned());
     state.status = Status::Active;
-    engine_patch(
-        world,
-        vec![
-            world::set_op(id, &state),
-            world::set_op(id, &Concerns(concerns)),
-        ],
-    )?;
+    let mut ops = vec![world::set_op(id, &state)];
+    ops.extend(relate_ops(id.into(), &added));
+    engine_patch(world, ops)?;
     existing(world, id)
 }
 
@@ -329,16 +335,12 @@ pub fn escalate(
     if development.trim().is_empty() {
         return refuse("development must not be empty");
     }
-    let concerns = merged_concerns(world, &q, concerns)?;
+    let (added, _) = new_concerns(world, &q, concerns)?;
     let mut state = q.state();
     state.developments.push(development.trim().to_owned());
-    engine_patch(
-        world,
-        vec![
-            world::set_op(id, &state),
-            world::set_op(id, &Concerns(concerns)),
-        ],
-    )?;
+    let mut ops = vec![world::set_op(id, &state)];
+    ops.extend(relate_ops(id.into(), &added));
+    engine_patch(world, ops)?;
     existing(world, id)
 }
 

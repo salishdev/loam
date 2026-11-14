@@ -11,7 +11,7 @@ mod replay;
 mod tests;
 
 pub use component::Component;
-pub(crate) use component::{prop, remove_op, set_op};
+pub(crate) use component::{get_in, prop, remove_op, set_op};
 pub use log::{Event, EventKind};
 pub use patch::{EntityId, EntityRef, Op, Patch};
 pub use relation::{EXIT_REL, Relation};
@@ -107,7 +107,7 @@ pub enum StoreError {
 /// Version of the store layout, recorded in `meta` as `schema_version`.
 /// Stores with another version (or none, from before versioning) can't be
 /// opened: saves are not migrated.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Result of an applied patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +119,13 @@ pub struct Applied {
     /// Ids assigned to handles used in the patch.
     pub handles: BTreeMap<String, EntityId>,
 }
+
+/// The engine-owned relation pinning a rule to an entity (rule → entity).
+/// When a destroy cascades one away, the store retires the rule as part of
+/// the same patch (see [`crate::rules::retire_unpinned`]): the `patch`
+/// event lists it under `retired` and a `rule_change` event follows in the
+/// same transaction.
+pub const PINS_REL: &str = "_pins";
 
 /// Kind of rooms. The validator checks that both ends of an
 /// [`EXIT_REL`] relation have it.
@@ -245,7 +252,14 @@ impl World {
             for (k, v) in note.into_iter().flatten() {
                 if !matches!(
                     k.as_str(),
-                    "patch" | "created" | "handles" | "cascaded" | "by" | "op" | "reason"
+                    "patch"
+                        | "created"
+                        | "handles"
+                        | "cascaded"
+                        | "retired"
+                        | "by"
+                        | "op"
+                        | "reason"
                 ) {
                     payload[k] = v.clone();
                 }
@@ -266,8 +280,22 @@ impl World {
                 if !cascaded.is_empty() {
                     payload["cascaded"] = json!(cascaded);
                 }
+                let retired = retire_unpinned_rules(&tx, &cascaded).map_err(|e| match e {
+                    StoreError::Sqlite(e) => ApplyError::Storage(e),
+                    other => ApplyError::Rejected(Rejection {
+                        op: 0,
+                        reason: other.to_string(),
+                    }),
+                })?;
+                if !retired.is_empty() {
+                    payload["retired"] =
+                        json!(retired.iter().map(|(id, _)| id).collect::<Vec<_>>());
+                }
                 annotate(&mut payload);
                 let event_seq = insert_event(&tx, EventKind::Patch, &payload)?;
+                for (_, change) in &retired {
+                    insert_event(&tx, EventKind::RuleChange, change)?;
+                }
                 tx.commit()?;
                 Ok(Applied {
                     event_seq,
@@ -406,6 +434,37 @@ impl World {
             .collect::<Result<_, _>>()?;
         Ok(ids)
     }
+}
+
+/// Retire every active rule whose [`PINS_REL`] relation `cascaded` lists,
+/// inside `tx`. Returns the rules retired, in id order, with the
+/// `rule_change` payload to log for each. Both the live store and replay
+/// run this after a patch's ops, so the retirement is part of the patch
+/// (its event lists the ids as `retired`) and no fork point can split it
+/// from the destroy.
+fn retire_unpinned_rules(
+    tx: &Transaction,
+    cascaded: &[Cascaded],
+) -> Result<Vec<(EntityId, Value)>, StoreError> {
+    let unpinned: BTreeMap<EntityId, EntityId> = cascaded
+        .iter()
+        .filter(|c| c.relation.rel == PINS_REL)
+        .map(|c| (c.relation.subject, c.relation.object))
+        .collect();
+    let mut retired = Vec::new();
+    for (rule, destroyed) in unpinned {
+        let Some((op, change)) = crate::rules::retire_unpinned(tx, rule, destroyed)? else {
+            continue;
+        };
+        if let Err(r) = apply_ops(tx, &Patch::new(vec![op]), Authority::Engine)? {
+            return Err(StoreError::Corrupt(format!(
+                "retiring rule #{rule}: {}",
+                r.reason
+            )));
+        }
+        retired.push((rule, change));
+    }
+    Ok(retired)
 }
 
 /// Stamp a fresh store with [`SCHEMA_VERSION`], or refuse a store made by

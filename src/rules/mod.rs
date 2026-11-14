@@ -8,6 +8,13 @@
 //! conditioned on `kind` and props covers every matching entity; one pinned
 //! with an `entity` condition covers only that one.
 //!
+//! A pin's entity id is not kept in the rule's JSON: it lives in an
+//! engine-owned [`PINS_REL`] relation (rule → entity, props `{role}`), and
+//! [`get`] and [`all`] put it back into the condition. Destroying a pinned
+//! entity cascades the relation away, and the world store then retires the
+//! rule in the same transaction ([`retire_unpinned`]), so a pinned rule never
+//! silently becomes a general one.
+//!
 //! Each rule is an engine-owned entity of kind [`RULE_KIND`] holding its
 //! definition in the private `_rule` component, written by engine patches; every mint,
 //! amendment and retirement bumps its version and logs a `rule_change`
@@ -37,6 +44,11 @@ pub const RULE_KIND: &str = "rule";
 pub const PLAYER_ROLE: &str = "player";
 /// Role always bound to the player's current room.
 pub const ROOM_ROLE: &str = "room";
+/// The engine-owned relation from a rule to each entity it is pinned to,
+/// with props `{"role": <role name>}`.
+pub use crate::world::PINS_REL;
+/// Why the engine retires a rule whose pinned entity was destroyed.
+pub const UNPINNED_REASON: &str = "pinned entity destroyed";
 
 /// A rule is identified by its entity id.
 pub type RuleId = EntityId;
@@ -84,8 +96,14 @@ pub enum Condition {
     },
     /// The entity is carried by the player.
     Carried { role: String },
-    /// The role is this one entity: pins the rule to it.
-    Entity { role: String, id: EntityId },
+    /// The role is this one entity: pins the rule to it. The id is held in
+    /// a [`PINS_REL`] relation, not in the stored rule; it is `None` only
+    /// once the pinned entity is gone (and the rule retired).
+    Entity {
+        role: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<EntityId>,
+    },
 }
 
 impl Condition {
@@ -236,6 +254,7 @@ pub fn validate(def: &RuleDef) -> Result<(), String> {
             return Err(format!("prop {prop:?} is engine-owned"));
         }
     }
+    pins(def)?;
     validate_effects(&def.effects, &known, "effect")?;
     validate_deltas(&def.adjust)?;
     if let Some(check) = &def.check {
@@ -250,6 +269,71 @@ pub fn validate(def: &RuleDef) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The rule's pins, role → entity, from its `entity` conditions. Refuses an
+/// `entity` condition without an id, a role pinned to two entities and an
+/// entity pinned under two roles.
+fn pins(def: &RuleDef) -> Result<BTreeMap<&str, EntityId>, String> {
+    let mut pins: BTreeMap<&str, EntityId> = BTreeMap::new();
+    for c in &def.conditions {
+        let Condition::Entity { role, id } = c else {
+            continue;
+        };
+        let Some(id) = *id else {
+            return Err(format!("the entity condition on {role:?} needs an id"));
+        };
+        if let Some(prev) = pins.insert(role, id)
+            && prev != id
+        {
+            return Err(format!(
+                "{role:?} can't be pinned to both #{prev} and #{id}"
+            ));
+        }
+        if let Some((other, _)) = pins.iter().find(|(r, i)| **i == id && **r != role) {
+            return Err(format!(
+                "#{id} is pinned under both {other:?} and {role:?}; pin it under one role"
+            ));
+        }
+    }
+    Ok(pins)
+}
+
+/// The rule's definition as stored: pinned ids stripped (they live in
+/// relations).
+fn unpinned(rule: &Rule) -> Rule {
+    let mut rule = rule.clone();
+    for c in &mut rule.def.conditions {
+        if let Condition::Entity { id, .. } = c {
+            *id = None;
+        }
+    }
+    rule
+}
+
+/// Ops relating `rule` to each entity it is pinned to.
+fn pin_ops(rule: EntityRef, def: &RuleDef) -> Result<Vec<Op>, String> {
+    Ok(pins(def)?
+        .into_iter()
+        .map(|(role, id)| Op::Relate {
+            subject: rule.clone(),
+            rel: PINS_REL.into(),
+            object: id.into(),
+            props: Map::from_iter([("role".to_owned(), json!(role))]),
+        })
+        .collect())
+}
+
+/// Check that every entity the rule pins exists.
+fn check_pinned(world: &World, def: &RuleDef) -> Result<Result<(), String>, StoreError> {
+    for (role, id) in pins(def).unwrap_or_default() {
+        if world.entity(id)?.is_none() {
+            return Ok(Err(format!(
+                "{role} is pinned to #{id}, which does not exist"
+            )));
+        }
+    }
+    Ok(Ok(()))
 }
 
 fn validate_deltas(deltas: &[StatDelta]) -> Result<(), String> {
@@ -313,6 +397,9 @@ pub(crate) fn validate_world(
     world: &World,
     def: &RuleDef,
 ) -> Result<Result<(), String>, StoreError> {
+    if let Err(r) = check_pinned(world, def)? {
+        return Ok(Err(r));
+    }
     let sheet = stats::sheet(world)?;
     let mut deltas: Vec<&StatDelta> = def.adjust.iter().collect();
     if let Some(check) = &def.check {
@@ -484,10 +571,13 @@ pub fn unmet(
                     reasons.push(format!("{role} is not carried"));
                 }
             }
-            Condition::Entity { id, .. } => {
+            Condition::Entity { id: Some(id), .. } => {
                 if e.id != *id {
                     reasons.push(format!("{role} is #{}, not #{id}", e.id));
                 }
+            }
+            Condition::Entity { id: None, .. } => {
+                reasons.push(format!("{role}'s pinned entity no longer exists"));
             }
         }
     }
@@ -675,18 +765,59 @@ impl Stored {
     }
 }
 
+/// Put a stored rule's pinned ids back into its `entity` conditions.
+fn load(world: &World, id: RuleId, stored: Stored) -> Result<Rule, StoreError> {
+    let mut rule = stored.into_rule(id);
+    let pins = world.relations_from(id, Some(PINS_REL))?;
+    for c in &mut rule.def.conditions {
+        if let Condition::Entity { role, id } = c {
+            *id = pins
+                .iter()
+                .find(|r| r.props.get("role").and_then(Value::as_str) == Some(role.as_str()))
+                .map(|r| r.object);
+        }
+    }
+    Ok(rule)
+}
+
 /// Look up a rule.
 pub fn get(world: &World, id: RuleId) -> Result<Option<Rule>, StoreError> {
-    Ok(world.get::<Stored>(id)?.map(|s| s.into_rule(id)))
+    world
+        .get::<Stored>(id)?
+        .map(|s| load(world, id, s))
+        .transpose()
 }
 
 /// Every rule, in id order.
 pub fn all(world: &World) -> Result<Vec<Rule>, StoreError> {
-    Ok(world
+    world
         .query::<Stored>()?
         .into_iter()
-        .map(|(id, s)| s.into_rule(id))
-        .collect())
+        .map(|(id, s)| load(world, id, s))
+        .collect()
+}
+
+/// The retirement of rule `id`, whose pin to `destroyed` a destroy just
+/// cascaded away: the op storing it retired and the `rule_change` payload
+/// to log, or `None` if it isn't an active world rule. The world store
+/// calls this inside the destroy's transaction, reading through `conn`.
+pub(crate) fn retire_unpinned(
+    conn: &rusqlite::Connection,
+    id: RuleId,
+    destroyed: EntityId,
+) -> Result<Option<(Op, Value)>, StoreError> {
+    let Some(Stored(mut rule)) = world::get_in::<Stored>(conn, id)? else {
+        return Ok(None);
+    };
+    rule.id = id;
+    if !rule.is_active() || rule.class != RuleClass::World {
+        return Ok(None);
+    }
+    rule.version += 1;
+    rule.status = RuleStatus::Retired;
+    let mut payload = change_payload("retired", &rule, UNPINNED_REASON);
+    payload["entity"] = json!(destroyed);
+    Ok(Some((world::set_op(id, &Stored(unpinned(&rule))), payload)))
 }
 
 /// Active rules, in id order.
@@ -745,14 +876,16 @@ fn store_new(
         version: 1,
         status: RuleStatus::Active,
     };
-    let patch = Patch::new(vec![Op::Create {
-        handle: None,
+    let handle = EntityRef::Handle("rule".into());
+    let mut ops = vec![Op::Create {
+        handle: Some("rule".into()),
         name: rule.def.name.clone(),
         kind: RULE_KIND.into(),
         location: None,
-        props: Map::from_iter([world::prop(&Stored(rule.clone()))]),
-    }]);
-    rule.id = engine_patch(world, &patch)?.created[0];
+        props: Map::from_iter([world::prop(&Stored(unpinned(&rule)))]),
+    }];
+    ops.extend(pin_ops(handle, &rule.def).map_err(StoreError::Corrupt)?);
+    rule.id = engine_patch(world, &Patch::new(ops))?.created[0];
     log_change(world, "minted", &rule, reason)?;
     let new_terms = register_vocabulary(world, &rule.def)?;
     Ok((rule, new_terms))
@@ -815,7 +948,7 @@ pub fn amend(
         return Ok(Err(r));
     }
     rule.version += 1;
-    store(world, &rule)?;
+    store(world, &rule, true)?;
     log_change(world, "amended", &rule, reason)?;
     let new_terms = register_vocabulary(world, &rule.def)?;
     Ok(Ok((rule, new_terms)))
@@ -834,7 +967,7 @@ pub fn retire(
     };
     rule.version += 1;
     rule.status = RuleStatus::Retired;
-    store(world, &rule)?;
+    store(world, &rule, false)?;
     log_change(world, "retired", &rule, reason)?;
     Ok(Ok(rule))
 }
@@ -854,15 +987,27 @@ fn to_json(rule: &Rule) -> Value {
     serde_json::to_value(rule).expect("rule serializes")
 }
 
-fn store(world: &mut World, rule: &Rule) -> Result<(), StoreError> {
-    let patch = Patch::new(vec![
+/// Write a changed rule. With `repin`, its pin relations are rewritten
+/// from its `entity` conditions in the same patch.
+fn store(world: &mut World, rule: &Rule, repin: bool) -> Result<(), StoreError> {
+    let mut ops = vec![
         Op::Rename {
             entity: rule.id.into(),
             name: rule.def.name.clone(),
         },
-        world::set_op(rule.id, &Stored(rule.clone())),
-    ]);
-    engine_patch(world, &patch).map(|_| ())
+        world::set_op(rule.id, &Stored(unpinned(rule))),
+    ];
+    if repin {
+        for r in world.relations_from(rule.id, Some(PINS_REL))? {
+            ops.push(Op::Unrelate {
+                subject: rule.id.into(),
+                rel: PINS_REL.into(),
+                object: r.object.into(),
+            });
+        }
+        ops.extend(pin_ops(rule.id.into(), &rule.def).map_err(StoreError::Corrupt)?);
+    }
+    engine_patch(world, &Patch::new(ops)).map(|_| ())
 }
 
 fn engine_patch(world: &mut World, patch: &Patch) -> Result<Applied, StoreError> {
@@ -876,6 +1021,13 @@ fn engine_patch(world: &mut World, patch: &Patch) -> Result<Applied, StoreError>
 }
 
 fn log_change(world: &World, action: &str, rule: &Rule, reason: &str) -> Result<(), StoreError> {
+    world.log_event(EventKind::RuleChange, &change_payload(action, rule, reason))?;
+    Ok(())
+}
+
+/// A `rule_change` payload. The rule is shown with its pins, as the
+/// director wrote it.
+fn change_payload(action: &str, rule: &Rule, reason: &str) -> Value {
     let mut payload = json!({
         "action": action,
         "id": rule.id,
@@ -885,8 +1037,7 @@ fn log_change(world: &World, action: &str, rule: &Rule, reason: &str) -> Result<
     if !reason.trim().is_empty() {
         payload["reason"] = json!(reason);
     }
-    world.log_event(EventKind::RuleChange, &payload)?;
-    Ok(())
+    payload
 }
 
 /// Register the prop names and values a rule mentions.

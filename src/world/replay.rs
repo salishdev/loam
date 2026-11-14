@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     Authority, Cascaded, Entity, EntityId, EventKind, Outcome, Patch, Relation, StoreError, World,
-    apply_ops,
+    apply_ops, retire_unpinned_rules,
 };
 
 /// Why a log could not be replayed or forked.
@@ -267,6 +267,20 @@ fn replay_patch(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
     if got_cascaded != cascaded {
         return Err(diverged(format!(
             "patch cascaded {got_cascaded:?}, log recorded {cascaded:?}"
+        )));
+    }
+    let retired: Vec<EntityId> = match payload.get("retired") {
+        Some(r) => serde_json::from_value(r.clone())
+            .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad retired list: {e}")))?,
+        None => Vec::new(),
+    };
+    let got_retired: Vec<EntityId> = retire_unpinned_rules(tx, &got_cascaded)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if got_retired != retired {
+        return Err(diverged(format!(
+            "patch retired rules {got_retired:?}, log recorded {retired:?}"
         )));
     }
     Ok(())

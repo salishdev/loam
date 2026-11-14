@@ -621,7 +621,8 @@ fn condition(c: &Condition) -> String {
             None => format!("{role} lacks {prop}"),
         },
         Condition::Carried { role } => format!("player carries {role}"),
-        Condition::Entity { role, id } => format!("{role} is #{id}"),
+        Condition::Entity { role, id: Some(id) } => format!("{role} is #{id}"),
+        Condition::Entity { role, id: None } => format!("{role} is #? (pinned entity gone)"),
     }
 }
 

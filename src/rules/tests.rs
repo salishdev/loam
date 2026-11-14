@@ -373,3 +373,224 @@ fn stat_rules_never_change() {
     assert!(err.contains("stat rule"), "{err}");
     assert_eq!(get(&f.world, rule.id).unwrap().unwrap(), rule);
 }
+
+fn pinned_rule(rotten: EntityId) -> RuleDef {
+    let mut rule = kick_rule();
+    rule.conditions.push(Condition::Entity {
+        role: "target".into(),
+        id: Some(rotten),
+    });
+    rule
+}
+
+#[test]
+fn pins_live_in_relations_not_in_the_rule_json() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, pinned_rule(f.rotten), "")
+        .unwrap()
+        .unwrap();
+    let stored = f.world.entity(rule.id).unwrap().unwrap().props["_rule"].clone();
+    assert!(
+        stored["conditions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"check": "entity", "role": "target"})),
+        "{stored}"
+    );
+    assert!(!stored.to_string().contains(&format!("\"id\":{}", f.rotten)));
+    let pins = f.world.relations_from(rule.id, Some(PINS_REL)).unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].object, f.rotten);
+    assert_eq!(pins[0].props["role"], json!("target"));
+
+    // Loading puts the id back, so matching still pins.
+    let loaded = get(&f.world, rule.id).unwrap().unwrap();
+    assert_eq!(loaded, rule);
+    let b = bind(&f.world, &loaded.def, f.scope, &bind_target(f.sound))
+        .unwrap()
+        .unwrap();
+    assert!(
+        unmet(&f.world, &loaded.def, f.scope, &b)
+            .unwrap()
+            .contains(&format!("target is #{}, not #{}", f.sound, f.rotten))
+    );
+}
+
+#[test]
+fn amending_rewrites_pins() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, pinned_rule(f.rotten), "")
+        .unwrap()
+        .unwrap();
+    let mut conditions = kick_rule().conditions;
+    conditions.push(Condition::Entity {
+        role: "target".into(),
+        id: Some(f.sound),
+    });
+    let changes = Amendment {
+        conditions: Some(conditions),
+        ..Default::default()
+    };
+    amend(&mut f.world, rule.id, changes, "the other door")
+        .unwrap()
+        .unwrap();
+    let pins = f.world.relations_from(rule.id, Some(PINS_REL)).unwrap();
+    assert_eq!(
+        pins.iter().map(|r| r.object).collect::<Vec<_>>(),
+        vec![f.sound]
+    );
+
+    // Amending other fields keeps the pins.
+    let changes = Amendment {
+        outcome: Some("Crash.".into()),
+        ..Default::default()
+    };
+    let (rule, _) = amend(&mut f.world, rule.id, changes, "").unwrap().unwrap();
+    assert!(rule.def.conditions.contains(&Condition::Entity {
+        role: "target".into(),
+        id: Some(f.sound)
+    }));
+    assert_eq!(
+        f.world
+            .relations_from(rule.id, Some(PINS_REL))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Dropping the entity condition drops the pin.
+    let changes = Amendment {
+        conditions: Some(kick_rule().conditions),
+        ..Default::default()
+    };
+    amend(&mut f.world, rule.id, changes, "").unwrap().unwrap();
+    assert!(
+        f.world
+            .relations_from(rule.id, Some(PINS_REL))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn bad_pins_are_refused() {
+    let mut f = fixture();
+    let with = |extra: Vec<Condition>| {
+        let mut r = kick_rule();
+        r.conditions.extend(extra);
+        r
+    };
+    let pin = |role: &str, id| Condition::Entity {
+        role: role.into(),
+        id,
+    };
+    let no_id = with(vec![pin("target", None)]);
+    assert!(validate(&no_id).unwrap_err().contains("needs an id"));
+    let twice = with(vec![
+        pin("target", Some(f.rotten)),
+        pin("target", Some(f.sound)),
+    ]);
+    assert!(validate(&twice).unwrap_err().contains("both"));
+    let mut shared = with(vec![
+        pin("target", Some(f.rotten)),
+        pin("room", Some(f.rotten)),
+    ]);
+    shared.roles.insert("other".into(), String::new());
+    assert!(validate(&shared).unwrap_err().contains("under both"));
+    let missing = with(vec![pin("target", Some(999))]);
+    assert!(
+        mint(&mut f.world, missing, "")
+            .unwrap()
+            .unwrap_err()
+            .contains("does not exist")
+    );
+}
+
+#[test]
+fn destroying_a_pinned_entity_retires_the_rule_in_the_same_patch() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, pinned_rule(f.rotten), "")
+        .unwrap()
+        .unwrap();
+    let (general, _) = mint(&mut f.world, kick_rule(), "").unwrap().unwrap();
+    let before = f.world.last_seq().unwrap();
+    let applied = f
+        .world
+        .apply_patch(&Patch::new(vec![Op::Destroy {
+            entity: f.rotten.into(),
+        }]))
+        .unwrap();
+    assert_eq!(applied.event_seq, before + 1);
+
+    let retired = get(&f.world, rule.id).unwrap().unwrap();
+    assert_eq!(retired.status, RuleStatus::Retired);
+    assert_eq!(retired.version, 2);
+    assert!(retired.def.conditions.contains(&Condition::Entity {
+        role: "target".into(),
+        id: None
+    }));
+    assert!(get(&f.world, general.id).unwrap().unwrap().is_active());
+
+    // The destroy (listing the rule it retired) and the rule_change, in
+    // order and nothing else.
+    let events = f.world.events_since(before).unwrap();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, vec![EventKind::Patch, EventKind::RuleChange]);
+    assert_eq!(events[0].payload["retired"], json!([rule.id]));
+    let change = &events[1].payload;
+    assert_eq!(change["action"], json!("retired"));
+    assert_eq!(change["id"], json!(rule.id));
+    assert_eq!(change["reason"], json!(UNPINNED_REASON));
+    assert_eq!(change["entity"], json!(f.rotten));
+
+    // Retired rules no longer match.
+    assert!(
+        active_world(&f.world)
+            .unwrap()
+            .iter()
+            .all(|r| r.id != rule.id)
+    );
+
+    // Replay reproduces the retirement.
+    let r = f.world.replay_in_memory().unwrap();
+    assert_eq!(r.state().unwrap(), f.world.state().unwrap());
+    assert_eq!(
+        get(&r, rule.id).unwrap().unwrap().status,
+        RuleStatus::Retired
+    );
+}
+
+#[test]
+fn a_rejected_destroy_leaves_the_pinned_rule_active() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, pinned_rule(f.rotten), "")
+        .unwrap()
+        .unwrap();
+    // The second op fails, so the whole patch, retirement included, rolls back.
+    let err = f.world.apply_patch(&Patch::new(vec![
+        Op::Destroy {
+            entity: f.rotten.into(),
+        },
+        Op::Destroy { entity: 999.into() },
+    ]));
+    assert!(err.is_err());
+    assert!(get(&f.world, rule.id).unwrap().unwrap().is_active());
+    assert_eq!(f.world.count_events(EventKind::RuleChange).unwrap(), 1);
+}
+
+#[test]
+fn a_retired_rule_is_not_retired_again_when_its_pin_goes() {
+    let mut f = fixture();
+    let (rule, _) = mint(&mut f.world, pinned_rule(f.rotten), "")
+        .unwrap()
+        .unwrap();
+    retire(&mut f.world, rule.id, "done").unwrap().unwrap();
+    f.world
+        .apply_patch(&Patch::new(vec![Op::Destroy {
+            entity: f.rotten.into(),
+        }]))
+        .unwrap();
+    let r = get(&f.world, rule.id).unwrap().unwrap();
+    assert_eq!(r.version, 2);
+    assert_eq!(f.world.count_events(EventKind::RuleChange).unwrap(), 2);
+}

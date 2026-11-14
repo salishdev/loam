@@ -14,7 +14,7 @@ fn condition_schema() -> Value {
         "type": "array",
         "description": "All must hold. check: kind {role, is} | prop {role, prop, is?} (present, or equal to is) \
                         | not_prop {role, prop, is?} (absent, or not equal to is) | carried {role} \
-                        | entity {role, id} (pins the rule to one entity).",
+                        | entity {role, id} (pins the rule to one entity; destroying that entity retires the rule).",
         "items": {"type": "object", "properties": {
             "check": {"type": "string", "enum": ["kind", "prop", "not_prop", "carried", "entity"]},
             "role": {"type": "string"}, "prop": {"type": "string"}, "is": {}, "id": {"type": "integer"}
