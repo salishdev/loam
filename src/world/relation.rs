@@ -16,7 +16,8 @@ use super::{EntityId, ROOM_KIND, StoreError, World};
 /// The relation joining two rooms: a passage from the subject room to the
 /// object room, with props `{dir, label}`. A two-way passage is two rows.
 /// The validator requires both ends to be rooms and a `dir` no other exit
-/// from the subject uses.
+/// from the subject uses. One exit leads from a room to another; relating
+/// the pair again may change its label but not its `dir`.
 pub const EXIT_REL: &str = "exit";
 
 /// One relation row.
@@ -105,8 +106,9 @@ fn select(
 }
 
 /// Why relating `subject -exit-> object` with `props` is invalid, if it is:
-/// both ends must be rooms, `dir` a non-empty string, and no other exit
-/// from `subject` may already use that `dir`.
+/// both ends must be rooms, `dir` a non-empty string, no other exit from
+/// `subject` may already use that `dir`, and an existing exit from `subject`
+/// to `object` may be relabelled but not given another `dir`.
 pub(super) fn bad_exit(
     conn: &Connection,
     subject: EntityId,
@@ -135,10 +137,21 @@ pub(super) fn bad_exit(
     };
     for other in select(
         conn,
-        &format!("{COLUMNS} WHERE subject = ?1 AND rel = ?2 AND object != ?3"),
-        params![subject, EXIT_REL, object],
+        &format!("{COLUMNS} WHERE subject = ?1 AND rel = ?2"),
+        params![subject, EXIT_REL],
     )? {
-        if other.props.get("dir").and_then(Value::as_str) == Some(dir) {
+        let other_dir = other.props.get("dir").and_then(Value::as_str);
+        if other.object == object {
+            // Relating the same pair again replaces the row, so a new dir
+            // would silently rename the existing exit.
+            if other_dir != Some(dir) {
+                return Ok(Some(format!(
+                    "#{subject} already has an exit {:?} to #{object}, and only one exit \
+                     leads from a room to another; to rename it, unrelate it first",
+                    other_dir.unwrap_or("")
+                )));
+            }
+        } else if other_dir == Some(dir) {
             return Ok(Some(format!(
                 "#{subject} already has an exit {dir:?} (to #{})",
                 other.object

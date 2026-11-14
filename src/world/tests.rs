@@ -889,7 +889,36 @@ fn exits_join_two_rooms_with_distinct_dirs() {
         Err(ApplyError::Rejected(r)) => assert!(r.reason.contains("already"), "{r}"),
         other => panic!("expected rejection, got {other:?}"),
     }
-    // Relabelling (or re-dirring) the same exit is an upsert, not a clash.
+    // A second exit to the same room is refused rather than renaming the
+    // first; renaming takes an unrelate first.
+    let r = rejected(
+        &mut w,
+        vec![exit(cellar, hall, json!({"dir": "stairs", "label": "Hall"}))],
+    );
+    assert!(
+        r.reason.contains("already has an exit \"up\" to") && r.reason.contains("unrelate"),
+        "{r}"
+    );
+    assert_eq!(
+        w.relations_from(cellar, Some(EXIT_REL)).unwrap()[0].props["dir"],
+        json!("up")
+    );
+    w.apply_patch(&Patch::new(vec![
+        Op::Unrelate {
+            subject: cellar.into(),
+            rel: EXIT_REL.into(),
+            object: hall.into(),
+        },
+        exit(cellar, hall, json!({"dir": "stairs", "label": "Hall"})),
+        Op::Unrelate {
+            subject: cellar.into(),
+            rel: EXIT_REL.into(),
+            object: hall.into(),
+        },
+        exit(cellar, hall, json!({"dir": "up", "label": "Hall"})),
+    ]))
+    .unwrap();
+    // Relabelling the same exit is an upsert, not a clash.
     w.apply_patch(&Patch::new(vec![exit(
         cellar,
         hall,

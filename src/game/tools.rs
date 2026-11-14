@@ -704,7 +704,9 @@ fn apply_patch_def() -> ToolDefinition {
          unrelate {subject, rel, object} (must hold). Relation names are glossary terms; \
          names starting with _ are engine-owned. Exits are \"exit\" relations from room to \
          room with props {dir, label}: relating one opens a passage move_player can use, \
-         unrelating it closes it; a two-way passage is two exits.",
+         unrelating it closes it; a two-way passage is two exits. One exit leads from a \
+         room to another: relating it again may relabel it, but changing its dir takes an \
+         unrelate first.",
         patch_schema(),
     )
 }
