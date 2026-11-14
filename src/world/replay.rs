@@ -11,7 +11,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
-use super::{Entity, EntityId, EventKind, Patch, StoreError, World, apply_ops};
+use super::{Authority, Entity, EntityId, EventKind, Patch, StoreError, World, apply_ops};
 
 /// Why a log could not be replayed or forked.
 #[derive(Debug, thiserror::Error)]
@@ -224,7 +224,14 @@ fn replay_patch(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
 
     // The whole replay is one transaction, so a rejection here aborts it
     // when the caller drops `tx`.
-    let (got_created, got_handles) = apply_ops(tx, &patch)?
+    // Apply with the authority it was recorded under: engine patches
+    // (inventory) may touch state the director guard refuses.
+    let by = if payload.get("by").and_then(Value::as_str) == Some("engine") {
+        Authority::Engine
+    } else {
+        Authority::Director
+    };
+    let (got_created, got_handles) = apply_ops(tx, &patch, by)?
         .map_err(|r| diverged(format!("recorded patch is now rejected: {r}")))?;
     if got_created != created {
         return Err(diverged(format!(

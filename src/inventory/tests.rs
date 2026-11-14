@@ -592,3 +592,22 @@ fn other_tools_are_not_handled() {
         None
     );
 }
+
+#[test]
+fn inventory_session_replays_identically() {
+    let (mut w, f) = fixture();
+    let inv = Inventory::default();
+    let p = f.id("player");
+    inv.take(&mut w, p, f.id("helm")).unwrap();
+    inv.equip(&mut w, p, f.id("helm"), None).unwrap();
+    inv.give(&mut w, p, f.id("npc"), f.id("bag")).unwrap();
+    refused(inv.take(&mut w, p, f.id("statue")));
+    let replayed = w.replay_in_memory().unwrap();
+    for h in ["helm", "bag", "apple", "player", "npc"] {
+        assert_eq!(
+            replayed.entity(f.id(h)).unwrap(),
+            w.entity(f.id(h)).unwrap(),
+            "{h}"
+        );
+    }
+}
