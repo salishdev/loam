@@ -149,8 +149,9 @@ fn migrate(entities: &[Old]) -> Res<Patch> {
                     .and_then(Value::as_str);
                 if class != Some("stat") {
                     // World rules may pin entities by id; this save has none.
-                    return Err(format!("rule #{} isn't a stat rule; pins aren't migrated", e.id)
-                        .into());
+                    return Err(
+                        format!("rule #{} isn't a stat rule; pins aren't migrated", e.id).into(),
+                    );
                 }
             }
             "glossary" => props = Map::from_iter([("_terms".into(), terms(&props)?)]),
@@ -261,9 +262,8 @@ fn write_log(old: &Connection, staging: &str, patch: &Patch) -> Res<i64> {
             )?;
         }
     }
-    let old_last: i64 = old.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| {
-        r.get(0)
-    })?;
+    let old_last: i64 =
+        old.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
     let created: Vec<EntityId> = patch
         .ops
         .iter()

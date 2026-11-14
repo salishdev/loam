@@ -893,7 +893,11 @@ fn exits_join_two_rooms_with_distinct_dirs() {
     // first; renaming takes an unrelate first.
     let r = rejected(
         &mut w,
-        vec![exit(cellar, hall, json!({"dir": "stairs", "label": "Hall"}))],
+        vec![exit(
+            cellar,
+            hall,
+            json!({"dir": "stairs", "label": "Hall"}),
+        )],
     );
     assert!(
         r.reason.contains("already has an exit \"up\" to") && r.reason.contains("unrelate"),

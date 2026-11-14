@@ -99,7 +99,6 @@ jobs:
           name="loam-$GITHUB_REF_NAME-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/loam" README.md LICENSE "dist/$name/"
-          cp -R seeds "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 

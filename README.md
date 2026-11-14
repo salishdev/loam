@@ -9,8 +9,8 @@ stay consistent. Uses the Claude API (Haiku and Sonnet).
 
 Download the archive for your platform from
 [Releases](https://github.com/salishdev/loam/releases) (macOS on Apple silicon,
-Linux x86_64), unpack it and run `loam` from the unpacked folder so it finds the
-bundled `seeds/`. Or build from source with Rust:
+Linux x86_64), unpack it and put `loam` on your `PATH`. Or build from source
+with Rust:
 
 ```bash
 cargo install --git https://github.com/salishdev/loam
@@ -22,10 +22,12 @@ Set `ANTHROPIC_API_KEY` in the environment or in a `.env` file in the current
 directory. Playing calls the API and costs money.
 
 ```bash
-loam --list-seeds             # bundled seeds
-loam --seed drowned-mill      # new save drowned-mill.db from seeds/drowned-mill.txt
+loam                          # new loam.db: pick a built-in seed or write your own
+loam --list-seeds             # built-in seeds, plus any in ./seeds
+loam --seed drowned-mill      # new save drowned-mill.db from that seed
 loam --seed my-world.txt x.db # any seed file, explicit save
-loam x.db                     # resume (or type a seed if the save is new)
+loam --prompt "a lighthouse at the end of the world"  # your own prompt
+loam x.db                     # resume (or pick a seed if the save is new)
 ```
 
 In the game, `:help` lists the inspector commands (`:rules`, `:quests`,
