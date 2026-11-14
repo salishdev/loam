@@ -9,9 +9,9 @@
 //! one of them, and only those.
 //!
 //! A quest is a top-level world entity of kind [`QUEST_KIND`] whose state is
-//! held in engine-owned `_` props and changed only by engine patches, so the
-//! event log (and therefore replay and forking) covers quests like anything
-//! else. Every judgment is logged as a `judgment` event.
+//! held in the engine-owned `_quest` and `_concerns` components and changed
+//! only by engine patches, so the event log (and therefore replay and
+//! forking) covers quests like anything else. Every judgment is logged as a `judgment` event.
 
 mod judge;
 mod tools;
@@ -24,28 +24,49 @@ pub use tools::{handle_tool, tool_definitions};
 
 use std::collections::BTreeSet;
 
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Map;
 
 use crate::world::{
-    ApplyError, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
+    self, ApplyError, Component, EntityId, EventKind, Op, Patch, StoreError, World,
 };
 
 /// Kind of quest entities.
 pub const QUEST_KIND: &str = "quest";
 
-/// Engine-owned quest props.
-const STATUS: &str = "_status";
-const HOOK: &str = "_hook";
-const GOAL: &str = "_goal";
-const CONCERNS: &str = "_concerns";
-const DEVELOPMENTS: &str = "_developments";
-const RESOLUTION: &str = "_resolution";
+/// A quest's state: the `_quest` component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State {
+    status: Status,
+    hook: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal: Option<String>,
+    #[serde(default)]
+    developments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<String>,
+}
+
+impl Component for State {
+    const KEY: &'static str = "_quest";
+}
+
+/// The entities a quest concerns: the `_concerns` component (until it
+/// becomes a relation).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Concerns(Vec<EntityId>);
+
+impl Component for Concerns {
+    const KEY: &'static str = "_concerns";
+}
 
 /// Most entities one quest may concern.
 pub const MAX_CONCERNS: usize = 8;
 
 /// Where a quest stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Spawned; its goal hasn't revealed itself yet. Not judged.
     Open,
@@ -65,17 +86,6 @@ impl Status {
             Status::Complete => "complete",
             Status::Failed => "failed",
         }
-    }
-
-    fn parse(s: &str) -> Option<Status> {
-        [
-            Status::Open,
-            Status::Active,
-            Status::Complete,
-            Status::Failed,
-        ]
-        .into_iter()
-        .find(|st| st.as_str() == s)
     }
 
     pub fn is_resolved(self) -> bool {
@@ -102,39 +112,27 @@ pub struct Quest {
 }
 
 impl Quest {
-    fn from_entity(e: &Entity) -> Result<Quest, StoreError> {
-        let text = |key: &str| e.props.get(key).and_then(Value::as_str).map(str::to_owned);
-        let status = text(STATUS)
-            .as_deref()
-            .and_then(Status::parse)
-            .ok_or_else(|| StoreError::Corrupt(format!("quest #{} has no valid status", e.id)))?;
-        let concerns = e
-            .props
-            .get(CONCERNS)
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_i64).collect())
-            .unwrap_or_default();
-        let developments = e
-            .props
-            .get(DEVELOPMENTS)
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Quest {
-            id: e.id,
-            title: e.name.clone(),
-            hook: text(HOOK).unwrap_or_default(),
-            status,
-            goal: text(GOAL),
-            concerns,
-            developments,
-            resolution: text(RESOLUTION),
-        })
+    fn new(id: EntityId, title: String, state: State, concerns: Concerns) -> Quest {
+        Quest {
+            id,
+            title,
+            hook: state.hook,
+            status: state.status,
+            goal: state.goal,
+            concerns: concerns.0,
+            developments: state.developments,
+            resolution: state.resolution,
+        }
+    }
+
+    fn state(&self) -> State {
+        State {
+            status: self.status,
+            hook: self.hook.clone(),
+            goal: self.goal.clone(),
+            developments: self.developments.clone(),
+            resolution: self.resolution.clone(),
+        }
     }
 }
 
@@ -163,21 +161,28 @@ fn engine_patch(world: &mut World, ops: Vec<Op>) -> Result<crate::world::Applied
 
 /// Every quest, in the order spawned.
 pub fn quests(world: &World) -> Result<Vec<Quest>, StoreError> {
-    let mut out = Vec::new();
-    for id in world.entities_of_kind(QUEST_KIND)? {
-        if let Some(e) = world.entity(id)? {
-            out.push(Quest::from_entity(&e)?);
-        }
-    }
-    Ok(out)
+    world
+        .query::<State>()?
+        .into_iter()
+        .map(|(id, state)| load(world, id, state))
+        .collect()
 }
 
 /// One quest by id, if `id` is a quest.
 pub fn quest(world: &World, id: EntityId) -> Result<Option<Quest>, StoreError> {
-    match world.entity(id)? {
-        Some(e) if e.kind == QUEST_KIND => Ok(Some(Quest::from_entity(&e)?)),
-        _ => Ok(None),
-    }
+    world
+        .get::<State>(id)?
+        .map(|state| load(world, id, state))
+        .transpose()
+}
+
+fn load(world: &World, id: EntityId, state: State) -> Result<Quest, StoreError> {
+    let title = world
+        .entity(id)?
+        .ok_or_else(|| StoreError::Corrupt(format!("quest #{id} vanished")))?
+        .name;
+    let concerns = world.get::<Concerns>(id)?.unwrap_or_default();
+    Ok(Quest::new(id, title, state, concerns))
 }
 
 /// Whether `id` names a quest entity.
@@ -227,12 +232,14 @@ pub fn spawn(
             "a quest may concern at most {MAX_CONCERNS} entities"
         ));
     }
-    let props = Map::from_iter([
-        (STATUS.to_owned(), json!(Status::Open.as_str())),
-        (HOOK.to_owned(), json!(hook.trim())),
-        (CONCERNS.to_owned(), json!(concerns)),
-        (DEVELOPMENTS.to_owned(), json!([])),
-    ]);
+    let state = State {
+        status: Status::Open,
+        hook: hook.trim().to_owned(),
+        goal: None,
+        developments: Vec::new(),
+        resolution: None,
+    };
+    let props = Map::from_iter([world::prop(&state), world::prop(&Concerns(concerns))]);
     let applied = engine_patch(
         world,
         vec![Op::Create {
@@ -294,25 +301,14 @@ pub fn reveal_goal(
     if concerns.is_empty() {
         return refuse("name at least one entity the goal concerns");
     }
-    let qid: EntityRef = id.into();
+    let mut state = q.state();
+    state.goal = Some(goal.trim().to_owned());
+    state.status = Status::Active;
     engine_patch(
         world,
         vec![
-            Op::SetProp {
-                entity: qid.clone(),
-                key: GOAL.into(),
-                value: json!(goal.trim()),
-            },
-            Op::SetProp {
-                entity: qid.clone(),
-                key: CONCERNS.into(),
-                value: json!(concerns),
-            },
-            Op::SetProp {
-                entity: qid,
-                key: STATUS.into(),
-                value: json!(Status::Active.as_str()),
-            },
+            world::set_op(id, &state),
+            world::set_op(id, &Concerns(concerns)),
         ],
     )?;
     existing(world, id)
@@ -334,22 +330,13 @@ pub fn escalate(
         return refuse("development must not be empty");
     }
     let concerns = merged_concerns(world, &q, concerns)?;
-    let mut developments = q.developments.clone();
-    developments.push(development.trim().to_owned());
-    let qid: EntityRef = id.into();
+    let mut state = q.state();
+    state.developments.push(development.trim().to_owned());
     engine_patch(
         world,
         vec![
-            Op::SetProp {
-                entity: qid.clone(),
-                key: DEVELOPMENTS.into(),
-                value: json!(developments),
-            },
-            Op::SetProp {
-                entity: qid,
-                key: CONCERNS.into(),
-                value: json!(concerns),
-            },
+            world::set_op(id, &state),
+            world::set_op(id, &Concerns(concerns)),
         ],
     )?;
     existing(world, id)
@@ -357,22 +344,10 @@ pub fn escalate(
 
 /// Mark a quest resolved; only the judge does this.
 fn resolve(world: &mut World, id: EntityId, status: Status, reason: &str) -> Result<()> {
-    let qid: EntityRef = id.into();
-    engine_patch(
-        world,
-        vec![
-            Op::SetProp {
-                entity: qid.clone(),
-                key: STATUS.into(),
-                value: json!(status.as_str()),
-            },
-            Op::SetProp {
-                entity: qid,
-                key: RESOLUTION.into(),
-                value: json!(reason),
-            },
-        ],
-    )?;
+    let mut state = existing(world, id)?.state();
+    state.status = status;
+    state.resolution = Some(reason.to_owned());
+    engine_patch(world, vec![world::set_op(id, &state)])?;
     Ok(())
 }
 

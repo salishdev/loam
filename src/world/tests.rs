@@ -412,3 +412,173 @@ fn world_persists_across_reopen() {
     drop(w);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Mood {
+    level: i64,
+    #[serde(default)]
+    why: String,
+}
+
+impl Component for Mood {
+    const KEY: &'static str = "_mood";
+}
+
+#[test]
+fn components_round_trip_through_engine_patches() {
+    let (mut w, cellar, chest, key) = seeded();
+    assert_eq!(w.get::<Mood>(chest).unwrap(), None);
+    assert_eq!(w.query::<Mood>().unwrap(), vec![]);
+
+    let calm = Mood {
+        level: 1,
+        why: "quiet".into(),
+    };
+    let a = w.set(key, &calm).unwrap();
+    // Written as an ordinary engine-owned prop, logged as an engine patch.
+    assert_eq!(
+        w.entity(key).unwrap().unwrap().props["_mood"],
+        json!({"level": 1, "why": "quiet"})
+    );
+    let event = w.events().unwrap().pop().unwrap();
+    assert_eq!(event.seq, a.event_seq);
+    assert_eq!(event.payload["by"], json!("engine"));
+
+    let tense = Mood {
+        level: 3,
+        why: String::new(),
+    };
+    w.apply_engine_patch(&Patch::new(vec![set_op(cellar, &tense)]))
+        .unwrap();
+    assert_eq!(w.get::<Mood>(key).unwrap(), Some(calm.clone()));
+    assert_eq!(
+        w.entity(key).unwrap().unwrap().get::<Mood>().unwrap(),
+        Some(calm.clone())
+    );
+    // Query returns every carrier of the component in id order.
+    assert_eq!(
+        w.query::<Mood>().unwrap(),
+        vec![(cellar, tense), (key, calm)]
+    );
+
+    w.apply_engine_patch(&Patch::new(vec![remove_op::<Mood>(cellar)]))
+        .unwrap();
+    assert_eq!(w.get::<Mood>(cellar).unwrap(), None);
+
+    // A create can carry a component from the start.
+    let a = w
+        .apply_engine_patch(&Patch::new(vec![Op::Create {
+            handle: None,
+            name: "Ghost".into(),
+            kind: "npc".into(),
+            location: Some(cellar.into()),
+            props: Map::from_iter([prop(&Mood {
+                level: 9,
+                why: "restless".into(),
+            })]),
+        }]))
+        .unwrap();
+    assert_eq!(w.get::<Mood>(a.created[0]).unwrap().unwrap().level, 9);
+
+    // The director still can't write it: the key is engine-owned.
+    let r = rejected(
+        &mut w,
+        vec![set_op(
+            chest,
+            &Mood {
+                level: 0,
+                why: String::new(),
+            },
+        )],
+    );
+    assert!(r.reason.contains("engine-owned"), "{}", r.reason);
+
+    // Replay reproduces components like any prop.
+    assert_eq!(
+        w.replay_in_memory().unwrap().state().unwrap(),
+        w.state().unwrap()
+    );
+}
+
+#[test]
+fn a_malformed_component_is_reported_as_corrupt() {
+    let (mut w, _, chest, _) = seeded();
+    w.apply_engine_patch(&Patch::new(vec![Op::SetProp {
+        entity: chest.into(),
+        key: "_mood".into(),
+        value: json!("grumpy"),
+    }]))
+    .unwrap();
+    let err = w.get::<Mood>(chest).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!("entity {chest}")) && err.contains("_mood"),
+        "{err}"
+    );
+    assert!(w.query::<Mood>().is_err());
+    assert!(w.entity(chest).unwrap().unwrap().get::<Mood>().is_err());
+}
+
+fn temp_store(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("loam-world-test-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("save.db");
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+fn schema_version(w: &World) -> String {
+    w.conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn new_stores_record_the_schema_version_and_reopen() {
+    let path = temp_store("fresh");
+    let mut w = World::open(&path).unwrap();
+    assert_eq!(schema_version(&w), SCHEMA_VERSION.to_string());
+    w.apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .unwrap();
+    drop(w);
+    let w = World::open(&path).unwrap();
+    assert_eq!(w.entities_of_kind("room").unwrap().len(), 1);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn stores_from_other_schema_versions_are_refused() {
+    // A save from before versioning: data but no version row.
+    let path = temp_store("unversioned");
+    let mut w = World::open(&path).unwrap();
+    w.apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .unwrap();
+    w.conn
+        .execute("DELETE FROM meta WHERE key = 'schema_version'", [])
+        .unwrap();
+    drop(w);
+    let err = World::open(&path).err().expect("refused").to_string();
+    assert!(
+        err.contains("older loam") && err.contains("new game"),
+        "{err}"
+    );
+
+    for (stored, made_by) in [
+        ("1", "older loam (schema 1)"),
+        ("99", "newer loam (schema 99)"),
+    ] {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+            [stored],
+        )
+        .unwrap();
+        drop(conn);
+        let err = World::open(&path).err().expect("refused").to_string();
+        assert!(err.contains(made_by), "{err}");
+    }
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}

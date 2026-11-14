@@ -2,8 +2,8 @@
 //! introduced, with a one-line meaning, so rules keep matching the world's
 //! vocabulary (`rotten` doesn't quietly become `decayed`).
 //!
-//! It is one engine-owned entity of kind [`GLOSSARY_KIND`] whose props are
-//! the terms, written by engine patches, so replay and forking carry it with
+//! It is one engine-owned entity of kind [`GLOSSARY_KIND`] holding the terms
+//! in its `_terms` component, written by engine patches, so replay and forking carry it with
 //! no extra code. Terms are registered automatically (with an empty meaning)
 //! whenever a director patch introduces them; the director describes them
 //! with `define_terms`. The director's context holds only a compact index
@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::world::{ApplyError, ENGINE_PROP_PREFIX, EntityId, Op, Patch, StoreError, World};
+use crate::world::{
+    self, ApplyError, Component, ENGINE_PROP_PREFIX, EntityId, Op, Patch, StoreError, World,
+};
 
 /// Kind of the single glossary entity.
 pub const GLOSSARY_KIND: &str = "glossary";
@@ -29,6 +31,15 @@ pub const GLOSSARY_KIND: &str = "glossary";
 const MAX_VALUE_CHARS: usize = 32;
 /// Most words in a recorded string value.
 const MAX_VALUE_WORDS: usize = 3;
+
+/// Every term by name: the glossary entity's `_terms` component.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Terms(BTreeMap<String, Term>);
+
+impl Component for Terms {
+    const KEY: &'static str = "_terms";
+}
 
 /// One registered prop name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -94,22 +105,13 @@ pub fn glossary_id(world: &World) -> Result<Option<EntityId>, StoreError> {
 /// Every term, sorted by name. Before the glossary entity exists this is
 /// the built-in terms.
 pub fn terms(world: &World) -> Result<BTreeMap<String, Term>, StoreError> {
-    let Some(entity) = glossary_id(world)?
-        .map(|id| world.entity(id))
-        .transpose()?
-        .flatten()
-    else {
+    let Some(id) = glossary_id(world)? else {
         return Ok(builtin_terms());
     };
-    entity
-        .props
-        .into_iter()
-        .map(|(name, v)| {
-            serde_json::from_value(v)
-                .map(|t| (name.clone(), t))
-                .map_err(|e| StoreError::Corrupt(format!("glossary term {name:?}: {e}")))
-        })
-        .collect()
+    let Terms(terms) = world
+        .get::<Terms>(id)?
+        .ok_or_else(|| StoreError::Corrupt(format!("glossary #{id} has no terms")))?;
+    Ok(terms)
 }
 
 /// The compact index for the director's context: term names, with `?`
@@ -152,7 +154,7 @@ pub fn register<'a>(
     seen: impl IntoIterator<Item = (&'a str, Option<&'a Value>)>,
 ) -> Result<Vec<String>, StoreError> {
     let mut all = terms(world)?;
-    let mut changed: BTreeMap<String, Term> = BTreeMap::new();
+    let mut changed = false;
     let mut added = Vec::new();
     for (name, value) in seen {
         if name.starts_with(ENGINE_PROP_PREFIX) || name.trim().is_empty() {
@@ -174,12 +176,10 @@ pub fn register<'a>(
             term.values.insert(v, String::new());
             dirty = true;
         }
-        if dirty {
-            changed.insert(name.to_owned(), term.clone());
-        }
+        changed |= dirty;
     }
-    if !changed.is_empty() {
-        write(world, &changed)?;
+    if changed {
+        write(world, all)?;
     }
     Ok(added)
 }
@@ -200,7 +200,6 @@ pub struct Definition {
 /// (`Ok(Err)`) changes nothing.
 pub fn define(world: &mut World, defs: &[Definition]) -> Result<Result<(), String>, StoreError> {
     let mut all = terms(world)?;
-    let mut changed = BTreeMap::new();
     for d in defs {
         if d.name.starts_with(ENGINE_PROP_PREFIX) {
             return Ok(Err(format!(
@@ -219,9 +218,8 @@ pub fn define(world: &mut World, defs: &[Definition]) -> Result<Result<(), Strin
         if let Some(f) = d.free_text {
             term.free_text = f;
         }
-        changed.insert(d.name.clone(), term.clone());
     }
-    write(world, &changed)?;
+    write(world, all)?;
     Ok(Ok(()))
 }
 
@@ -240,36 +238,21 @@ fn value_key(v: &Value) -> Option<String> {
     }
 }
 
-/// Write changed terms with an engine patch, creating the glossary (with the
-/// built-in terms) first if needed.
-fn write(world: &mut World, changed: &BTreeMap<String, Term>) -> Result<(), StoreError> {
-    let to_json = |t: &Term| serde_json::to_value(t).expect("term serializes");
-    let patch = match glossary_id(world)? {
-        Some(id) => Patch::new(
-            changed
-                .iter()
-                .map(|(name, t)| Op::SetProp {
-                    entity: id.into(),
-                    key: name.clone(),
-                    value: to_json(t),
-                })
-                .collect(),
-        ),
-        None => {
-            let mut all = builtin_terms();
-            all.extend(changed.clone());
-            let props: Map<String, Value> =
-                all.iter().map(|(n, t)| (n.clone(), to_json(t))).collect();
-            Patch::new(vec![Op::Create {
-                handle: None,
-                name: "Glossary".into(),
-                kind: GLOSSARY_KIND.into(),
-                location: None,
-                props,
-            }])
-        }
+/// Write the terms with an engine patch, creating the glossary first if
+/// needed.
+fn write(world: &mut World, all: BTreeMap<String, Term>) -> Result<(), StoreError> {
+    let terms = Terms(all);
+    let result = match glossary_id(world)? {
+        Some(id) => world.set(id, &terms),
+        None => world.apply_engine_patch(&Patch::new(vec![Op::Create {
+            handle: None,
+            name: "Glossary".into(),
+            kind: GLOSSARY_KIND.into(),
+            location: None,
+            props: Map::from_iter([world::prop(&terms)]),
+        }])),
     };
-    match world.apply_engine_patch(&patch) {
+    match result {
         Ok(_) => Ok(()),
         Err(ApplyError::Storage(e)) => Err(e.into()),
         Err(ApplyError::Rejected(r)) => {

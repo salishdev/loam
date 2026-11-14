@@ -273,7 +273,7 @@ fn stats_and_their_rules_never_change() {
         .unwrap_err();
     assert!(err.contains("already written"), "{err}");
     // Director patches can't touch the values or the seed.
-    for key in [STATS_PROP, DICE_PROP] {
+    for key in [Values::KEY, Dice::KEY] {
         let patch = Patch::new(vec![Op::SetProp {
             entity: f.player.into(),
             key: key.into(),

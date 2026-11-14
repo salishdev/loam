@@ -9,7 +9,7 @@
 //! with an `entity` condition covers only that one.
 //!
 //! Each rule is an engine-owned entity of kind [`RULE_KIND`] holding its
-//! definition in the `_rule` prop, written by engine patches; every mint,
+//! definition in the private `_rule` component, written by engine patches; every mint,
 //! amendment and retirement bumps its version and logs a `rule_change`
 //! event. Replay and forking need no extra code.
 
@@ -25,15 +25,14 @@ use serde_json::{Map, Value, json};
 
 use crate::glossary;
 use crate::stats::{self, Changes, CheckResult, Roll, StatHook};
+use crate::world;
 use crate::world::{
-    Applied, ApplyError, ENGINE_PROP_PREFIX, Entity, EntityId, EntityRef, EventKind, Op, Patch,
-    StoreError, World,
+    Applied, ApplyError, Component, ENGINE_PROP_PREFIX, Entity, EntityId, EntityRef, EventKind, Op,
+    Patch, StoreError, World,
 };
 
 /// Kind of rule entities.
 pub const RULE_KIND: &str = "rule";
-/// Engine-owned prop holding a rule's definition and status.
-pub const RULE_PROP: &str = "_rule";
 /// Role always bound to the player.
 pub const PLAYER_ROLE: &str = "player";
 /// Role always bound to the player's current room.
@@ -644,23 +643,33 @@ pub fn tag(rule: &Rule) -> Value {
     json!({"id": rule.id, "version": rule.version})
 }
 
+/// A rule's stored definition and status: the `_rule` component.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct Stored(Rule);
+
+impl Component for Stored {
+    const KEY: &'static str = "_rule";
+}
+
+impl Stored {
+    fn into_rule(self, id: RuleId) -> Rule {
+        Rule { id, ..self.0 }
+    }
+}
+
 /// Look up a rule.
 pub fn get(world: &World, id: RuleId) -> Result<Option<Rule>, StoreError> {
-    match world.entity(id)? {
-        Some(e) if e.kind == RULE_KIND => parse(&e).map(Some),
-        _ => Ok(None),
-    }
+    Ok(world.get::<Stored>(id)?.map(|s| s.into_rule(id)))
 }
 
 /// Every rule, in id order.
 pub fn all(world: &World) -> Result<Vec<Rule>, StoreError> {
-    let mut rules = Vec::new();
-    for id in world.entities_of_kind(RULE_KIND)? {
-        if let Some(e) = world.entity(id)? {
-            rules.push(parse(&e)?);
-        }
-    }
-    Ok(rules)
+    Ok(world
+        .query::<Stored>()?
+        .into_iter()
+        .map(|(id, s)| s.into_rule(id))
+        .collect())
 }
 
 /// Active rules, in id order.
@@ -674,17 +683,6 @@ pub fn active_world(world: &World) -> Result<Vec<Rule>, StoreError> {
         .into_iter()
         .filter(|r| r.class == RuleClass::World)
         .collect())
-}
-
-fn parse(e: &Entity) -> Result<Rule, StoreError> {
-    let raw = e
-        .props
-        .get(RULE_PROP)
-        .ok_or_else(|| StoreError::Corrupt(format!("rule #{} has no {RULE_PROP}", e.id)))?;
-    let mut rule: Rule = serde_json::from_value(raw.clone())
-        .map_err(|err| StoreError::Corrupt(format!("rule #{}: {err}", e.id)))?;
-    rule.id = e.id;
-    Ok(rule)
 }
 
 /// Store a new world rule (version 1) and log its minting. Registers the
@@ -735,7 +733,7 @@ fn store_new(
         name: rule.def.name.clone(),
         kind: RULE_KIND.into(),
         location: None,
-        props: Map::from_iter([(RULE_PROP.to_owned(), to_json(&rule))]),
+        props: Map::from_iter([world::prop(&Stored(rule.clone()))]),
     }]);
     rule.id = engine_patch(world, &patch)?.created[0];
     log_change(world, "minted", &rule, reason)?;
@@ -845,11 +843,7 @@ fn store(world: &mut World, rule: &Rule) -> Result<(), StoreError> {
             entity: rule.id.into(),
             name: rule.def.name.clone(),
         },
-        Op::SetProp {
-            entity: rule.id.into(),
-            key: RULE_PROP.into(),
-            value: to_json(rule),
-        },
+        world::set_op(rule.id, &Stored(rule.clone())),
     ]);
     engine_patch(world, &patch).map(|_| ())
 }

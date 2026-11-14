@@ -160,7 +160,7 @@ impl World {
         Ok(self.conn.query_row(
             "SELECT NOT EXISTS (SELECT 1 FROM events)
                 AND NOT EXISTS (SELECT 1 FROM entities)
-                AND NOT EXISTS (SELECT 1 FROM meta)",
+                AND NOT EXISTS (SELECT 1 FROM meta WHERE key != 'schema_version')",
             [],
             |r| r.get(0),
         )?)

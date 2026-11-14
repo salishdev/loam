@@ -81,3 +81,21 @@ fn definitions_fill_in_meanings_and_survive_replay() {
     let replayed = world.replay_in_memory().unwrap();
     assert_eq!(terms(&replayed).unwrap(), terms(&world).unwrap());
 }
+
+#[test]
+fn terms_are_engine_owned() {
+    let mut world = World::open_in_memory().unwrap();
+    register(&mut world, [("rotten", None)]).unwrap();
+    let id = glossary_id(&world).unwrap().unwrap();
+    // Terms live in one engine-owned component, so the director can't edit
+    // them with a patch on the glossary entity.
+    let props = world.entity(id).unwrap().unwrap().props;
+    assert_eq!(props.keys().collect::<Vec<_>>(), vec![Terms::KEY]);
+    let err = world
+        .apply_patch(&patch(json!([
+            {"op": "set_prop", "entity": id, "key": Terms::KEY, "value": {}}
+        ])))
+        .unwrap_err();
+    assert!(err.to_string().contains("engine-owned"), "{err}");
+    assert!(terms(&world).unwrap().contains_key("rotten"));
+}

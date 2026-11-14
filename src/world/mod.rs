@@ -1,6 +1,7 @@
 //! The world store: entities in a containment tree, open key/value props,
 //! validated patches and an append-only event log, all in SQLite.
 
+mod component;
 mod log;
 mod patch;
 mod replay;
@@ -8,6 +9,8 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
+pub use component::Component;
+pub(crate) use component::{prop, remove_op, set_op};
 pub use log::{Event, EventKind};
 pub use patch::{EntityId, EntityRef, Op, Patch};
 pub use replay::{ReplayError, WorldState};
@@ -86,7 +89,14 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("corrupt store: {0}")]
     Corrupt(String),
+    #[error("{0}")]
+    Incompatible(String),
 }
+
+/// Version of the store layout, recorded in `meta` as `schema_version`.
+/// Stores with another version (or none, from before versioning) can't be
+/// opened: saves are not migrated.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Result of an applied patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +115,17 @@ pub const ENGINE_PROP_PREFIX: &str = "_";
 
 /// Engine-owned prop marking an entity whose contents are an inventory.
 pub const CARRIER_PROP: &str = "_carrier";
+
+/// The carrier marker as a component. The world validator reads it (as
+/// [`CARRIER_PROP`]) to guard inventories; [`crate::inventory`] and the
+/// player's creation write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Carrier(pub(crate) bool);
+
+impl Component for Carrier {
+    const KEY: &'static str = CARRIER_PROP;
+}
 
 /// Who is applying a patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +155,7 @@ impl World {
     fn init(conn: Connection) -> Result<World, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        check_schema_version(&conn)?;
         Ok(World { conn })
     }
 
@@ -352,6 +374,48 @@ impl World {
             .collect::<Result<_, _>>()?;
         Ok(ids)
     }
+}
+
+/// Stamp a fresh store with [`SCHEMA_VERSION`], or refuse a store made by
+/// another version.
+fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        let used: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM events) OR EXISTS (SELECT 1 FROM entities)",
+            [],
+            |r| r.get(0),
+        )?;
+        if used {
+            return Err(incompatible("an older loam (before schema versions)"));
+        }
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        return Ok(());
+    };
+    match stored.parse::<i64>() {
+        Ok(SCHEMA_VERSION) => Ok(()),
+        Ok(v) if v > SCHEMA_VERSION => Err(incompatible(&format!("a newer loam (schema {v})"))),
+        Ok(v) => Err(incompatible(&format!("an older loam (schema {v})"))),
+        Err(_) => Err(StoreError::Corrupt(format!(
+            "meta schema_version = {stored:?}"
+        ))),
+    }
+}
+
+fn incompatible(made_by: &str) -> StoreError {
+    StoreError::Incompatible(format!(
+        "this save was made by {made_by}, and this loam (schema {SCHEMA_VERSION}) can't open it: \
+         saves are not compatible across schema versions. Start a new game with a new save file."
+    ))
 }
 
 fn parse_event(seq: i64, kind: String, payload: String, at: String) -> Result<Event, StoreError> {

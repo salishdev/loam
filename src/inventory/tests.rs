@@ -1,6 +1,6 @@
 use super::*;
 use crate::llm::{ToolOutput, ToolUse};
-use crate::world::{EntityRef, EventKind};
+use crate::world::{CARRIER_PROP, EntityRef, EventKind};
 use serde_json::{Map, json};
 
 fn create(handle: &str, kind: &str, location: Option<&str>, props: Value) -> Op {
@@ -236,7 +236,7 @@ fn equip_uses_the_items_only_slot() {
     let p = f.id("player");
     inv.take(&mut w, p, f.id("helm")).unwrap();
     inv.equip(&mut w, p, f.id("helm"), None).unwrap();
-    assert_eq!(f.props(&w, "helm")[EQUIPPED_PROP], json!("head"));
+    assert_eq!(f.props(&w, "helm")[Equipped::KEY], json!("head"));
     let listing = inv.list(&w, p).unwrap();
     let helm = listing.items.iter().find(|i| i.id == f.id("helm")).unwrap();
     assert_eq!(helm.equipped.as_deref(), Some("head"));
@@ -258,7 +258,7 @@ fn occupied_slot_is_a_conflict() {
     // Free the slot and try again.
     inv.unequip(&mut w, p, Unequip::Slot("head".into()))
         .unwrap();
-    assert!(!f.props(&w, "helm").contains_key(EQUIPPED_PROP));
+    assert!(!f.props(&w, "helm").contains_key(Equipped::KEY));
     assert_eq!(f.loc(&w, "helm"), Some(p));
     inv.equip(&mut w, p, f.id("cap"), None).unwrap();
 }
@@ -273,7 +273,7 @@ fn multi_slot_item_takes_first_free_slot() {
         .unwrap();
     inv.take(&mut w, p, f.id("sword")).unwrap();
     inv.equip(&mut w, p, f.id("sword"), None).unwrap();
-    assert_eq!(f.props(&w, "sword")[EQUIPPED_PROP], json!("off_hand"));
+    assert_eq!(f.props(&w, "sword")[Equipped::KEY], json!("off_hand"));
 }
 
 #[test]
@@ -309,7 +309,7 @@ fn moving_an_equipped_item_unequips_it() {
     inv.take(&mut w, p, f.id("helm")).unwrap();
     inv.equip(&mut w, p, f.id("helm"), None).unwrap();
     inv.drop(&mut w, p, f.id("helm")).unwrap();
-    assert!(!f.props(&w, "helm").contains_key(EQUIPPED_PROP));
+    assert!(!f.props(&w, "helm").contains_key(Equipped::KEY));
     let why = refused(inv.unequip(&mut w, p, Unequip::Item(f.id("helm"))));
     assert!(why.contains("doesn't have"), "{why}");
     let why = refused(inv.unequip(&mut w, p, Unequip::Slot("head".into())));
@@ -413,7 +413,7 @@ fn director_patches_cannot_change_inventory() {
         // Engine-owned props.
         Op::SetProp {
             entity: sword.into(),
-            key: EQUIPPED_PROP.into(),
+            key: Equipped::KEY.into(),
             value: json!("head"),
         },
         Op::RemoveProp {

@@ -28,13 +28,21 @@ mod tests;
 
 pub use tools::tool_definitions;
 
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::world::{ApplyError, CARRIER_PROP, Entity, EntityId, Op, Patch, StoreError, World};
+use crate::world::{
+    self, ApplyError, Carrier, Component, Entity, EntityId, Op, Patch, StoreError, World,
+};
 
 /// Engine-owned prop on an equipped item: the slot it occupies.
-pub const EQUIPPED_PROP: &str = "_equipped";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Equipped(String);
+
+impl Component for Equipped {
+    const KEY: &'static str = "_equipped";
+}
 
 /// Slots every carrier has unless the [`Inventory`] is configured otherwise.
 pub const DEFAULT_SLOTS: [&str; 8] = [
@@ -139,17 +147,13 @@ impl Default for Inventory {
 
 /// Mark an entity as a carrier so it has an inventory.
 pub fn make_carrier(world: &mut World, id: EntityId) -> Result<()> {
-    world.apply_engine_patch(&Patch::new(vec![Op::SetProp {
-        entity: id.into(),
-        key: CARRIER_PROP.into(),
-        value: Value::Bool(true),
-    }]))?;
+    world.set(id, &Carrier(true))?;
     Ok(())
 }
 
 /// Whether the entity is a carrier.
 pub fn is_carrier(e: &Entity) -> bool {
-    e.props.get(CARRIER_PROP) == Some(&Value::Bool(true))
+    matches!(e.get::<Carrier>(), Ok(Some(Carrier(true))))
 }
 
 /// How the carrier can reach an entity.
@@ -274,7 +278,7 @@ impl Inventory {
         let c = carrier_entity(world, carrier)?;
         let it = entity(world, item)?;
         require_carried(world, &c, &it)?;
-        if let Some(cur) = equipped_slot(&it) {
+        if let Some(cur) = equipped_slot(&it)? {
             return refuse(format!("{} is already equipped ({cur})", label(&it)));
         }
         let fits = fits_slots(&it)?;
@@ -331,11 +335,7 @@ impl Inventory {
                 to: Some(c.id.into()),
             });
         }
-        ops.push(Op::SetProp {
-            entity: it.id.into(),
-            key: EQUIPPED_PROP.into(),
-            value: json!(slot),
-        });
+        ops.push(world::set_op(it.id, &Equipped(slot.clone())));
         Ok(world.apply_engine_patch(&Patch::new(ops))?.event_seq)
     }
 
@@ -346,7 +346,7 @@ impl Inventory {
         let it = match target {
             Unequip::Item(item) => {
                 let it = entity(world, item)?;
-                if it.location != Some(c.id) || equipped_slot(&it).is_none() {
+                if it.location != Some(c.id) || equipped_slot(&it)?.is_none() {
                     return refuse(format!(
                         "{} doesn't have {} equipped",
                         label(&c),
@@ -364,10 +364,7 @@ impl Inventory {
                 }
             }
         };
-        let patch = Patch::new(vec![Op::RemoveProp {
-            entity: it.id.into(),
-            key: EQUIPPED_PROP.into(),
-        }]);
+        let patch = Patch::new(vec![world::remove_op::<Equipped>(it.id)]);
         Ok(world.apply_engine_patch(&patch)?.event_seq)
     }
 
@@ -477,8 +474,8 @@ fn bulk(e: &Entity) -> f64 {
         .max(0.0)
 }
 
-fn equipped_slot(e: &Entity) -> Option<&str> {
-    e.props.get(EQUIPPED_PROP).and_then(Value::as_str)
+fn equipped_slot(e: &Entity) -> Result<Option<String>> {
+    Ok(e.get::<Equipped>()?.map(|Equipped(slot)| slot))
 }
 
 /// The slots an item fits, from its `slot` prop; `None` means unrestricted.
@@ -508,8 +505,8 @@ fn occupants(world: &World, c: &Entity) -> Result<Vec<(String, Entity)>> {
     let mut out = Vec::new();
     for id in world.contents(Some(c.id))? {
         let e = entity(world, id)?;
-        if let Some(s) = equipped_slot(&e) {
-            out.push((s.to_owned(), e));
+        if let Some(s) = equipped_slot(&e)? {
+            out.push((s, e));
         }
     }
     Ok(out)
@@ -582,11 +579,8 @@ fn world_carries(world: &World, carrier: EntityId, it: &Entity) -> Result<bool> 
 /// Move an item, clearing its equipped mark (equipped means held directly).
 fn move_item(world: &mut World, it: &Entity, to: Option<EntityId>) -> Result<i64> {
     let mut ops = Vec::new();
-    if equipped_slot(it).is_some() {
-        ops.push(Op::RemoveProp {
-            entity: it.id.into(),
-            key: EQUIPPED_PROP.into(),
-        });
+    if equipped_slot(it)?.is_some() {
+        ops.push(world::remove_op::<Equipped>(it.id));
     }
     ops.push(Op::Move {
         entity: it.id.into(),
@@ -614,7 +608,7 @@ fn collect(
             id,
             name: e.name.clone(),
             inside,
-            equipped: equipped_slot(&e).map(str::to_owned),
+            equipped: equipped_slot(&e)?,
             bulk: bulk(&e),
         });
         collect(world, id, Some(id), out)?;

@@ -15,7 +15,7 @@
 //! Stat rules are never amended or retired (see [`rules::amend`]). The sheet
 //! can grow mid-game ([`add_stat`], with the new stat's rules, and
 //! [`mint_advancement`]) but a stat is never renamed or removed: values live
-//! in the player's engine-owned `_stats` prop, which only this module
+//! in the player's engine-owned `_stats` component, which only this module
 //! writes, and the player can't be renamed or destroyed.
 //!
 //! A check rolls d20 + stat against a difficulty. The die comes from a
@@ -38,12 +38,41 @@ use crate::inventory::DEFAULT_CARRY_LIMIT;
 use crate::rules::{
     self, Bindings, PLAYER_ROLE, ROOM_ROLE, Rule, RuleCheck, RuleDef, RuleId, StatDelta,
 };
-use crate::world::{ApplyError, EntityId, EventKind, Op, Patch, StoreError, World};
+use crate::world::{
+    self, ApplyError, Component, EntityId, EventKind, Op, Patch, StoreError, World,
+};
 
-/// Engine-owned player prop holding stat values: `{name: {value, about}}`.
-pub const STATS_PROP: &str = "_stats";
-/// Engine-owned player prop holding the dice seed.
-pub const DICE_PROP: &str = "_dice";
+/// The player's stat values: the `_stats` component.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Values(BTreeMap<String, Value_>);
+
+impl Component for Values {
+    const KEY: &'static str = "_stats";
+}
+
+/// Whether `key` is one of the props holding the sheet (values or dice
+/// seed), which listings show on their own lines or not at all.
+pub(crate) fn is_sheet_key(key: &str) -> bool {
+    key == Values::KEY || key == Dice::KEY
+}
+
+/// One stat's stored value and meaning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Value_ {
+    value: i64,
+    #[serde(default)]
+    about: String,
+}
+
+/// The world's dice seed, on the player: the `_dice` component.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Dice(u64);
+
+impl Component for Dice {
+    const KEY: &'static str = "_dice";
+}
 /// Most stats a sheet may have.
 pub const MAX_STATS: usize = 8;
 /// A total this far below the difficulty (or less) is a partial success.
@@ -199,15 +228,12 @@ fn player(world: &World) -> Result<Option<EntityId>, StoreError> {
     crate::game::player_id(world)
 }
 
-/// The raw `_stats` map on the player.
-fn values(world: &World) -> Result<Map<String, Value>, StoreError> {
+/// The player's stat values.
+fn values(world: &World) -> Result<Values, StoreError> {
     let Some(p) = player(world)? else {
-        return Ok(Map::new());
+        return Ok(Values::default());
     };
-    Ok(world
-        .entity(p)?
-        .and_then(|e| e.props.get(STATS_PROP).and_then(Value::as_object).cloned())
-        .unwrap_or_default())
+    Ok(world.get::<Values>(p)?.unwrap_or_default())
 }
 
 /// Active stat rules, in id order.
@@ -220,7 +246,7 @@ pub fn stat_rules(world: &World) -> Result<Vec<Rule>, StoreError> {
 
 /// The sheet: every stat by name, with its bounds.
 pub fn sheet(world: &World) -> Result<BTreeMap<String, Stat>, StoreError> {
-    let values = values(world)?;
+    let Values(values) = values(world)?;
     if values.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -238,12 +264,8 @@ pub fn sheet(world: &World) -> Result<BTreeMap<String, Stat>, StoreError> {
         sheet.insert(
             name.clone(),
             Stat {
-                value: v.get("value").and_then(Value::as_i64).unwrap_or(min),
-                about: v
-                    .get("about")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                value: v.value,
+                about: v.about,
                 name,
                 min,
                 max,
@@ -285,10 +307,7 @@ pub fn check(
         return Ok(Err(unknown(stat, &sheet)));
     };
     let base = match player(world)? {
-        Some(p) => world
-            .entity(p)?
-            .and_then(|e| e.props.get(DICE_PROP).and_then(Value::as_u64))
-            .unwrap_or(0),
+        Some(p) => world.get::<Dice>(p)?.map_or(0, |Dice(d)| d),
         None => 0,
     };
     let n = world.count_events(EventKind::Roll)? as u64;
@@ -417,8 +436,14 @@ pub(crate) fn apply_delta(
     if to == from {
         return Ok(());
     }
-    let mut map = values(world)?;
-    map.insert(stat.to_owned(), json!({"value": to, "about": s.about}));
+    let mut values = values(world)?;
+    values.0.insert(
+        stat.to_owned(),
+        Value_ {
+            value: to,
+            about: s.about,
+        },
+    );
     // The change and why, e.g. {"reason": ...} or {"rule": ...}.
     let mut change = Map::from_iter([
         ("name".to_owned(), json!(stat)),
@@ -430,15 +455,7 @@ pub(crate) fn apply_delta(
     }
     let fields = Map::from_iter([("stat".to_owned(), Value::Object(change))]);
     let player = player(world)?.expect("a sheet implies a player");
-    engine_patch(
-        world,
-        vec![Op::SetProp {
-            entity: player.into(),
-            key: STATS_PROP.into(),
-            value: Value::Object(map),
-        }],
-        Some(&fields),
-    )?;
+    engine_patch(world, vec![world::set_op(player, &values)], Some(&fields))?;
 
     for rule in stat_rules(world)? {
         let Some(StatHook::Threshold { stat: s, at, when }) = &rule.hook else {
@@ -762,33 +779,26 @@ fn write(
     for (def, hook) in planned {
         ids.push(rules::mint_stat(world, def, hook, reason)?.id);
     }
-    let mut map = values(world)?;
+    let mut values = values(world)?;
     for s in specs {
-        map.insert(
+        values.0.insert(
             s.name.clone(),
-            json!({"value": s.start, "about": s.about.trim()}),
+            Value_ {
+                value: s.start,
+                about: s.about.trim().to_owned(),
+            },
         );
     }
-    let mut ops = vec![Op::SetProp {
-        entity: player.into(),
-        key: STATS_PROP.into(),
-        value: Value::Object(map),
-    }];
+    let mut ops = vec![world::set_op(player, &values)];
     if let Some(seed) = seed {
-        ops.push(Op::SetProp {
-            entity: player.into(),
-            key: DICE_PROP.into(),
-            value: json!(seed),
-        });
+        ops.push(world::set_op(player, &Dice(seed)));
     }
     engine_patch(world, ops, None)?;
     Ok(ids)
 }
 
 fn has_seed(world: &World, player: EntityId) -> Result<bool, StoreError> {
-    Ok(world
-        .entity(player)?
-        .is_some_and(|e| e.props.contains_key(DICE_PROP)))
+    Ok(world.get::<Dice>(player)?.is_some())
 }
 
 /// Write the stat sheet (once, with the bible). Every stat needs bounds, a
@@ -802,7 +812,7 @@ pub fn create_sheet(
     if player(world)?.is_none() {
         return Ok(Err("write the bible first: there is no player yet".into()));
     }
-    if !values(world)?.is_empty() {
+    if !values(world)?.0.is_empty() {
         return Ok(Err(
             "the stat sheet is already written; add_stat adds a stat".into(),
         ));

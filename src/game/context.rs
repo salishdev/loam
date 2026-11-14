@@ -9,7 +9,7 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
-use crate::stats::{DICE_PROP, STATS_PROP};
+use crate::stats;
 use crate::world::{Entity, EntityId, EventKind, StoreError, World};
 use crate::{glossary, rules};
 
@@ -217,7 +217,7 @@ fn line(e: &Entity) -> String {
     let props: serde_json::Map<String, Value> = e
         .props
         .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), STATS_PROP | DICE_PROP))
+        .filter(|(k, _)| !stats::is_sheet_key(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     if props.is_empty() {

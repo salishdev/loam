@@ -16,7 +16,7 @@ use crate::quest;
 use crate::rules::{self, RULE_KIND};
 use crate::stats;
 use crate::world::{
-    ApplyError, CARRIER_PROP, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
+    self, ApplyError, Carrier, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
 };
 
 use super::{BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, player_id, scope};
@@ -228,7 +228,7 @@ fn write_bible(world: &mut World, input: BibleInput) -> Result<ToolOutput, Store
             name: "you".into(),
             kind: PLAYER_KIND.into(),
             location: None,
-            props: Map::from_iter([(CARRIER_PROP.to_owned(), Value::Bool(true))]),
+            props: Map::from_iter([world::prop(&Carrier(true))]),
         },
     ]);
     match try_apply(world, &patch, As::Engine)? {
