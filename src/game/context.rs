@@ -9,6 +9,7 @@ use std::fmt::Write;
 use serde_json::Value;
 
 use crate::world::{Entity, EntityId, EventKind, StoreError, World};
+use crate::{glossary, rules};
 
 use super::tools::exits_of;
 use super::{bible_id, player_id};
@@ -31,6 +32,16 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         None => "(none)".into(),
     };
     writeln!(out, "Bible sections (read_bible): {sections}").unwrap();
+    writeln!(
+        out,
+        "Glossary (lookup_terms; ? = undefined): {}",
+        glossary::index(world)?
+    )
+    .unwrap();
+    let rules = rules::active(world)?.len();
+    if rules > 0 {
+        writeln!(out, "Rules: {rules} active (list_rules)").unwrap();
+    }
 
     let player = match player_id(world)? {
         Some(id) => world.entity(id)?,

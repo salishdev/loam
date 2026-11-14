@@ -78,7 +78,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         match game.turn(&client, input, &mut stream) {
             Ok(outcome) => {
                 if let Some(reason) = outcome.stop_reason {
-                    eprintln!("\n[director stopped early: {reason:?}]");
+                    eprintln!("\n[stopped early: {reason:?}]");
+                }
+                if let Some(rule) = outcome.fast_path {
+                    eprintln!("\n[fast path: rule #{rule}]");
                 }
                 println!();
                 for j in &outcome.judgments {

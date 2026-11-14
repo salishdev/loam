@@ -6,6 +6,7 @@
 //! enters them and persist in the world store from then on.
 
 mod context;
+mod fast_path;
 mod tools;
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ use crate::llm::{
     Effort, LlmClient, LlmError, Message, Model, Request, StopReason, ToolOutput, run_tool_loop,
 };
 use crate::quest::{self, Judgment, Quest};
+use crate::rules::{self, RuleId, Scope};
 use crate::world::{EntityId, EventKind, StoreError, World};
 
 /// Kind of the single entity holding the world bible.
@@ -53,9 +55,14 @@ refuses, adapt; an impossible action is narrated as a non-change. What anyone ca
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
 clear to the player, reveal_goal with the entities it concerns; escalate_quest to raise the \
-stakes. A judge decides when a quest is done. Write no text until your \
-tool calls are done. Your final message is shown to the player verbatim: second person, \
-present tense, in the bible's tone, one to three short paragraphs.";
+stakes. A judge decides when a quest is done. The engine remembers rulings as rules and replays them without you: when you rule on an \
+action that could recur, mint_rule at the generality you judge right (conditions on kind \
+and props make it general) and give apply_to so the rule itself is this turn's ruling; \
+one-off story events need no rule. Use glossary terms for props (lookup_terms) and define \
+new ones (define_terms). When a note says rules conflict or misfire, fix them with \
+amend_rule or retire_rule and, where you can, turn the contradiction into story. Write no \
+text until your tool calls are done. Your final message is shown to the player verbatim: \
+second person, present tense, in the bible's tone, one to three short paragraphs.";
 
 const OPENING: &str = "The story begins. The player is nowhere yet: read the bible, create the \
 opening room with create_room (no via_exit), then narrate the opening scene.";
@@ -72,17 +79,27 @@ pub enum GameError {
     NotStarted,
 }
 
-/// What one director turn produced.
+/// What one turn produced.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     /// The narration shown to the player.
     pub narration: String,
-    /// Why the director stopped, when it wasn't a normal end of turn.
+    /// Why the director (or narrator) stopped, when it wasn't a normal end
+    /// of turn.
     pub stop_reason: Option<StopReason>,
     /// Model calls the turn made (director only, not the judge).
     pub calls: usize,
     /// The judge's rulings on quests this turn touched.
     pub judgments: Vec<Judgment>,
+    /// The rule applied when the turn took the fast path (no director call).
+    pub fast_path: Option<RuleId>,
+}
+
+/// Where a turn's events start, and its input (none for the opening).
+#[derive(Debug, Clone, Copy)]
+struct Turn<'a> {
+    start: i64,
+    input: Option<&'a str>,
 }
 
 /// A game session over a world store.
@@ -146,26 +163,28 @@ impl Game {
         client: &dyn LlmClient,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, GameError> {
-        self.director_turn(client, OPENING, None, on_text)
+        if !self.has_bible()? {
+            return Err(GameError::NotStarted);
+        }
+        let slice = local_slice(&self.world)?;
+        let turn = Turn {
+            start: self.world.last_seq()?,
+            input: None,
+        };
+        self.director_turn(client, &slice, OPENING, turn, on_text)
     }
 
-    /// Play one turn: the director interprets `input`, patches the world
-    /// through tools and narrates, streaming the narration to `on_text`.
+    /// Play one turn, streaming the narration to `on_text`.
+    ///
+    /// The Haiku interpreter first matches `input` against the stored rules;
+    /// if exactly one applies cleanly the engine applies it and a narrator
+    /// describes the result (the fast path). Otherwise the director
+    /// interprets the input, patches the world through tools and narrates,
+    /// told why the rules didn't settle it.
     pub fn turn(
         &mut self,
         client: &dyn LlmClient,
         input: &str,
-        on_text: &mut dyn FnMut(&str),
-    ) -> Result<TurnOutcome, GameError> {
-        let instruction = format!("Player input: {input}");
-        self.director_turn(client, &instruction, Some(input), on_text)
-    }
-
-    fn director_turn(
-        &mut self,
-        client: &dyn LlmClient,
-        instruction: &str,
-        input: Option<&str>,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, GameError> {
         if !self.has_bible()? {
@@ -174,11 +193,66 @@ impl Game {
         // The slice is taken before the input is logged, so "Recent" shows
         // earlier turns only.
         let slice = local_slice(&self.world)?;
-        if let Some(input) = input {
-            self.world
-                .log_event(EventKind::Input, &json!({"text": input}))?;
+        self.world
+            .log_event(EventKind::Input, &json!({"text": input}))?;
+        let turn = Turn {
+            start: self.world.last_seq()?,
+            input: Some(input),
+        };
+
+        let mut note = String::new();
+        let mut calls = 0;
+        if let Some(scope) = scope(&self.world)? {
+            let (verdict, n) = fast_path::interpret(&self.world, client, scope, &slice, input)?;
+            calls += n;
+            match verdict {
+                fast_path::Verdict::Apply { rule, bindings } => {
+                    match rules::apply(
+                        &mut self.world,
+                        &rule.def,
+                        rules::tag(&rule),
+                        scope,
+                        &bindings,
+                    )? {
+                        Ok(app) => {
+                            let response = fast_path::narrate(
+                                &self.world,
+                                client,
+                                &slice,
+                                input,
+                                &rule,
+                                &app,
+                                on_text,
+                            )?;
+                            let mut outcome = self.finish(client, &response, turn)?;
+                            outcome.calls += calls;
+                            outcome.fast_path = Some(rule.id);
+                            return Ok(outcome);
+                        }
+                        Err(refusal) => note = fast_path::refusal_note(&rule, &refusal),
+                    }
+                }
+                fast_path::Verdict::Escalate(why) => note = why,
+            }
         }
-        let turn_start = self.world.last_seq()?;
+        let instruction = if note.is_empty() {
+            format!("Player input: {input}")
+        } else {
+            format!("Engine note: {note}\nPlayer input: {input}")
+        };
+        let mut outcome = self.director_turn(client, &slice, &instruction, turn, on_text)?;
+        outcome.calls += calls;
+        Ok(outcome)
+    }
+
+    fn director_turn(
+        &mut self,
+        client: &dyn LlmClient,
+        slice: &str,
+        instruction: &str,
+        turn: Turn,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, GameError> {
         let request = Request::new(
             Model::Sonnet,
             vec![Message::user(format!("{slice}\n{instruction}"))],
@@ -187,19 +261,33 @@ impl Game {
         .effort(Effort::Medium)
         .tools(tools::definitions(Phase::Play));
         let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text)?;
-        let narration = outcome.final_response.text().trim().to_owned();
+        let mut result = self.finish(client, &outcome.final_response, turn)?;
+        result.calls = outcome.calls;
+        Ok(result)
+    }
+
+    /// Log the final response's prose as the turn's narration, then let the
+    /// quest judge rule on quests the turn touched.
+    fn finish(
+        &mut self,
+        client: &dyn LlmClient,
+        response: &crate::llm::Response,
+        turn: Turn,
+    ) -> Result<TurnOutcome, GameError> {
+        let narration = response.text().trim().to_owned();
         self.world
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
-        let judgments = quest::judge_turn(&mut self.world, client, turn_start, input, &narration)?;
-        let stop_reason = outcome
-            .final_response
-            .stop_reason
-            .filter(|r| *r != StopReason::EndTurn);
+        let judgments =
+            quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
         Ok(TurnOutcome {
             narration,
-            stop_reason,
-            calls: outcome.calls,
+            stop_reason: response
+                .stop_reason
+                .clone()
+                .filter(|r| *r != StopReason::EndTurn),
+            calls: 1,
             judgments,
+            fast_path: None,
         })
     }
 
@@ -280,6 +368,17 @@ impl Game {
 /// The bible entity, if written.
 pub(crate) fn bible_id(world: &World) -> Result<Option<EntityId>, StoreError> {
     Ok(world.entities_of_kind(BIBLE_KIND)?.first().copied())
+}
+
+/// Where the player is, once they are somewhere.
+pub(crate) fn scope(world: &World) -> Result<Option<Scope>, StoreError> {
+    let Some(player) = player_id(world)? else {
+        return Ok(None);
+    };
+    Ok(world
+        .entity(player)?
+        .and_then(|p| p.location)
+        .map(|room| Scope { player, room }))
 }
 
 /// The player entity, if created.

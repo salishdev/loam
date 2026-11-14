@@ -197,6 +197,8 @@ fn replay_event(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
         // Recorded for `:why` and the director; they change no state.
         // Rejected patches were rolled back, and rolls and judgments are
         // outcomes already applied through the patches that follow them.
+        // Rules and the glossary are entities written by engine patches, so
+        // a rule change event is only the record of why.
         // Narration is prose shown to the player.
         EventKind::Input
         | EventKind::PatchRejected

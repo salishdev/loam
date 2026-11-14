@@ -507,3 +507,502 @@ fn the_player_carries_items_through_the_inventory_tools() {
     let replayed = game.world().replay_in_memory().unwrap();
     assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
 }
+
+// ---- rules, glossary and the fast path --------------------------------------
+
+/// A begun game with two rotten doors in the opening room.
+fn with_doors() -> (Game, ScriptedClient, i64, i64) {
+    let (mut game, client) = begun();
+    let room = player_room(&game);
+    let ops = serde_json::from_value(json!([
+        {"op": "create", "handle": "oak", "name": "oak door", "kind": "door", "location": room, "props": {"rotten": true}},
+        {"op": "create", "handle": "elm", "name": "elm door", "kind": "door", "location": room, "props": {"rotten": true}}
+    ]))
+    .unwrap();
+    let a = game
+        .world
+        .apply_patch(&crate::world::Patch::new(ops))
+        .unwrap();
+    (game, client, a.handles["oak"], a.handles["elm"])
+}
+
+fn kick_mint(target: i64) -> Response {
+    Response::canned_tool_use(
+        "k1",
+        "mint_rule",
+        json!({
+            "name": "Kicking a rotten door",
+            "trigger": "kick, shoulder or force <target>",
+            "roles": {"target": "the door"},
+            "conditions": [
+                {"check": "kind", "role": "target", "is": "door"},
+                {"check": "prop", "role": "target", "prop": "rotten", "is": true},
+                {"check": "not_prop", "role": "target", "prop": "broken", "is": true}
+            ],
+            "effects": [
+                {"op": "set_prop", "entity": "target", "key": "broken", "value": true},
+                {"op": "create", "name": "splinters", "kind": "debris", "location": "room", "props": {"state": "damp"}}
+            ],
+            "outcome": "The door bursts inward in wet splinters.",
+            "apply_to": {"target": target}
+        }),
+    )
+}
+
+fn interpret(matches: Value, clean: bool) -> Response {
+    Response::canned_tool_use(
+        "i",
+        "interpret",
+        json!({"matches": matches, "clean": clean}),
+    )
+}
+
+fn models_since(client: &ScriptedClient, from: usize) -> Vec<(Model, usize)> {
+    client.requests()[from..]
+        .iter()
+        .map(|r| (r.model.clone(), r.tools.len()))
+        .collect()
+}
+
+/// Props and new entities a turn produced, with ids abstracted away.
+fn change_shape(
+    game: &Game,
+    door: i64,
+    before: &crate::world::WorldState,
+) -> (Value, Vec<(String, String, Value)>) {
+    let after = game.world().state().unwrap();
+    let props = Value::Object(game.world().entity(door).unwrap().unwrap().props);
+    let new = after
+        .entities
+        .iter()
+        .filter(|e| !before.entities.iter().any(|b| b.id == e.id))
+        .filter(|e| e.kind != crate::rules::RULE_KIND && e.kind != crate::glossary::GLOSSARY_KIND)
+        .map(|e| {
+            (
+                e.name.clone(),
+                e.kind.clone(),
+                Value::Object(e.props.clone()),
+            )
+        })
+        .collect();
+    (props, new)
+}
+
+#[test]
+fn a_ruled_action_repeats_on_the_fast_path_with_the_same_change() {
+    let (mut game, client, oak, elm) = with_doors();
+
+    // Novel: no rules yet, so no interpreter call; the director rules and mints.
+    let before = game.world().state().unwrap();
+    let start = client.requests().len();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("The oak door bursts."));
+    let first = game
+        .turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    assert_eq!(first.fast_path, None);
+    assert_eq!(models_since(&client, start)[0].0, Model::Sonnet);
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    let minted: Value = serde_json::from_str(&msg).unwrap();
+    let rule = minted["rule"].as_i64().unwrap();
+    assert!(
+        minted["new_glossary_terms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("broken"))
+    );
+    let first_change = change_shape(&game, oak, &before);
+    assert_eq!(first_change.0["broken"], json!(true));
+
+    // Repeat on a matching entity: Haiku matches, engine applies, narrator narrates.
+    let before = game.world().state().unwrap();
+    let start = client.requests().len();
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        true,
+    ));
+    client.push(Response::canned_text("The elm door gives way too."));
+    let mut streamed = String::new();
+    let second = game
+        .turn(&client, "boot the elm door", &mut |t| streamed.push_str(t))
+        .unwrap();
+    assert_eq!(second.fast_path, Some(rule));
+    assert_eq!(second.calls, 2);
+    assert_eq!(streamed, "The elm door gives way too.");
+    // Haiku with only the interpret tool, then a tool-less narrator: no director.
+    assert_eq!(
+        models_since(&client, start),
+        [(Model::Haiku, 1), (Model::Sonnet, 0)]
+    );
+    let reqs = client.requests();
+    let interp = first_user_text(&reqs[start]);
+    assert!(
+        interp.contains("Kicking a rotten door")
+            && interp.ends_with("Player input: boot the elm door")
+    );
+    let narr = first_user_text(&reqs[start + 1]);
+    assert!(
+        narr.contains("The door bursts inward in wet splinters."),
+        "{narr}"
+    );
+    assert!(narr.contains("Damp, melancholy folk horror."), "{narr}");
+    assert_eq!(change_shape(&game, elm, &before), first_change);
+
+    // The log explains it: a judgment, a patch tagged with the rule, the narration.
+    let events = game.world().events().unwrap();
+    let tail: Vec<_> = events.iter().rev().take(4).rev().collect();
+    assert_eq!(
+        tail.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [
+            EventKind::Input,
+            EventKind::Judgment,
+            EventKind::Patch,
+            EventKind::Narration
+        ]
+    );
+    assert_eq!(tail[1].payload["verdict"], json!("fast_path"));
+    assert_eq!(tail[2].payload["rule"], json!({"id": rule, "version": 1}));
+
+    // The same door again: the rule matches but its conditions fail, so the
+    // director decides, told why.
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": oak}}]),
+        true,
+    ));
+    client.push(Response::canned_text("It is already in pieces."));
+    let third = game
+        .turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    assert_eq!(third.fast_path, None);
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(
+        director.contains("Engine note: Rules matched this input but don't apply here")
+            && director.contains("target.broken should not be true, is true"),
+        "{director}"
+    );
+
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn a_rule_not_meeting_its_conditions_is_not_minted() {
+    let (mut game, client, oak, _) = with_doors();
+    game.world
+        .apply_patch(&crate::world::Patch::new(vec![crate::world::Op::SetProp {
+            entity: oak.into(),
+            key: "rotten".into(),
+            value: json!(false),
+        }]))
+        .unwrap();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("rule not minted"), "{msg}");
+    assert!(crate::rules::all(game.world()).unwrap().is_empty());
+}
+
+#[test]
+fn unclear_interpretations_go_to_the_director() {
+    let (mut game, client, oak, elm) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+
+    // More than the rule covers.
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        false,
+    ));
+    client.push(Response::canned_text("x"));
+    let t = game
+        .turn(&client, "kick the elm door and run", &mut |_| {})
+        .unwrap();
+    assert_eq!(t.fast_path, None);
+    assert!(
+        first_user_text(client.requests().last().unwrap()).contains("covers part of this input")
+    );
+    assert!(
+        !game
+            .world()
+            .entity(elm)
+            .unwrap()
+            .unwrap()
+            .props
+            .contains_key("broken")
+    );
+
+    // No tool call, or no match: a plain director turn.
+    for reply in [Response::canned_text("no idea"), interpret(json!([]), true)] {
+        client.push(reply);
+        client.push(Response::canned_text("x"));
+        let t = game.turn(&client, "sing to the crow", &mut |_| {}).unwrap();
+        assert_eq!(t.fast_path, None);
+        let text = first_user_text(client.requests().last().unwrap());
+        assert!(!text.contains("Engine note"), "{text}");
+        assert!(text.ends_with("Player input: sing to the crow"));
+    }
+}
+
+#[test]
+fn conflicting_rules_escalate_and_the_director_can_retire_one() {
+    let (mut game, client, oak, elm) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let mut second = kick_mint(elm);
+    if let ContentBlock::ToolUse(t) = &mut second.content[0] {
+        t.input["name"] = json!("Doors hold firm");
+        t.input["effects"] = json!([]);
+        t.input.as_object_mut().unwrap().remove("apply_to");
+    }
+    client.push(interpret(json!([]), true));
+    client.push(second);
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "think about doors", &mut |_| {})
+        .unwrap();
+    let ids: Vec<i64> = crate::rules::active(game.world())
+        .unwrap()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    client.push(interpret(
+        json!([{"rule": ids[0], "bindings": {"target": elm}}, {"rule": ids[1], "bindings": {"target": elm}}]),
+        true,
+    ));
+    client.push(Response::canned_tool_use(
+        "l",
+        "list_rules",
+        json!({"text": "door"}),
+    ));
+    client.push(Response::canned_tool_use(
+        "r",
+        "retire_rule",
+        json!({"id": ids[1], "reason": "contradicts the rotten-door rule"}),
+    ));
+    client.push(Response::canned_tool_use("l2", "list_rules", json!({})));
+    client.push(Response::canned_text("The elm door shudders, undecided."));
+    game.turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    let reqs = client.requests();
+    let director = first_user_text(&reqs[reqs.len() - 4]);
+    assert!(director.contains("Engine note: Conflict:"), "{director}");
+    assert!(director.contains("Doors hold firm"), "{director}");
+
+    // list_rules before and after the retirement.
+    let listed = |i: usize| -> Value {
+        match reqs[i].messages.last().unwrap().content.first().unwrap() {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error, "{content}");
+                serde_json::from_str(content).unwrap()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(listed(reqs.len() - 3)["rules"].as_array().unwrap().len(), 2);
+    let after = listed(reqs.len() - 1);
+    assert_eq!(after["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(after["rules"][0]["id"], json!(ids[0]));
+    let retired = crate::rules::get(game.world(), ids[1]).unwrap().unwrap();
+    assert_eq!(retired.version, 2);
+    assert!(!retired.is_active());
+}
+
+#[test]
+fn the_glossary_index_is_in_context_and_new_terms_are_registered() {
+    let (mut game, client) = begun();
+    let slice = local_slice(game.world()).unwrap();
+    // create_room registered the opening room's props.
+    assert!(
+        slice.contains("Glossary (lookup_terms; ? = undefined): "),
+        "{slice}"
+    );
+    assert!(
+        slice.contains("material?") && slice.contains("lit?") && slice.contains("closed,"),
+        "{slice}"
+    );
+
+    let altar = game
+        .world()
+        .state()
+        .unwrap()
+        .entities
+        .into_iter()
+        .find(|e| e.name == "altar")
+        .unwrap()
+        .id;
+    client.push(Response::canned_tool_use(
+        "p",
+        "apply_patch",
+        json!({"ops": [{"op": "set_prop", "entity": altar, "key": "cracked", "value": true}]}),
+    ));
+    client.push(Response::canned_tool_use(
+        "d",
+        "define_terms",
+        json!({"terms": [{"name": "cracked", "meaning": "split; may break further", "values": {"true": "visibly split"}}]}),
+    ));
+    client.push(Response::canned_tool_use(
+        "l",
+        "lookup_terms",
+        json!({"names": ["cracked", "rotten"]}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "strike the altar", &mut |_| {}).unwrap();
+    let reqs = client.requests();
+    let result = |i: usize| match reqs[i].messages.last().unwrap().content.first().unwrap() {
+        ContentBlock::ToolResult { content, .. } => serde_json::from_str::<Value>(content).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        result(reqs.len() - 3)["new_glossary_terms"],
+        json!(["cracked"])
+    );
+    let looked = result(reqs.len() - 1);
+    assert_eq!(
+        looked["terms"]["cracked"]["meaning"],
+        json!("split; may break further")
+    );
+    assert_eq!(looked["not_in_glossary"], json!(["rotten"]));
+    assert!(!local_slice(game.world()).unwrap().contains("cracked?"));
+}
+
+#[test]
+fn rules_and_glossary_are_protected_from_patches() {
+    let (mut game, client, oak, _) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+    let glossary = crate::glossary::glossary_id(game.world()).unwrap().unwrap();
+    for (i, (ops, want)) in [
+        (json!([{"op": "destroy", "entity": rule}]), "mint_rule"),
+        (
+            json!([{"op": "set_prop", "entity": glossary, "key": "x", "value": 1}]),
+            "define_terms",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client.push(interpret(json!([]), true));
+        client.push(Response::canned_tool_use(
+            format!("p{i}"),
+            "apply_patch",
+            json!({"ops": ops}),
+        ));
+        client.push(Response::canned_text("x"));
+        game.turn(&client, "cheat", &mut |_| {}).unwrap();
+        let (msg, is_error) = last_tool_result(&client);
+        assert!(is_error && msg.contains(want), "{msg}");
+    }
+    assert!(
+        crate::rules::get(game.world(), rule)
+            .unwrap()
+            .unwrap()
+            .is_active()
+    );
+    for (id, name) in [(rule, "list_rules"), (glossary, "lookup_terms")] {
+        client.push(interpret(json!([]), true));
+        client.push(Response::canned_tool_use(
+            "q",
+            "query_entity",
+            json!({"id": id}),
+        ));
+        client.push(Response::canned_text("x"));
+        game.turn(&client, "peek", &mut |_| {}).unwrap();
+        let (msg, is_error) = last_tool_result(&client);
+        assert!(is_error && msg.contains(name), "{msg}");
+    }
+}
+
+#[test]
+fn an_interpreter_failure_falls_back_to_the_director() {
+    let (mut game, client, oak, _) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+
+    struct FailFirst<'a>(&'a ScriptedClient, std::cell::Cell<bool>);
+    impl crate::llm::LlmClient for FailFirst<'_> {
+        fn send(
+            &self,
+            r: &crate::llm::Request,
+            on_text: &mut dyn FnMut(&str),
+        ) -> Result<Response, crate::llm::LlmError> {
+            if self.1.replace(false) {
+                return Err(crate::llm::LlmError::Stream("overloaded".into()));
+            }
+            self.0.send(r, on_text)
+        }
+    }
+    client.push(Response::canned_text("The director carries on."));
+    let t = game
+        .turn(
+            &FailFirst(&client, true.into()),
+            "kick the elm door",
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(t.narration, "The director carries on.");
+    let judgment = game
+        .world()
+        .events()
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == EventKind::Judgment)
+        .unwrap();
+    assert!(
+        judgment.payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("overloaded")
+    );
+}
+
+#[test]
+fn the_quest_judge_also_rules_on_fast_path_turns() {
+    let (mut game, client, oak, elm) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+    let q = crate::quest::spawn(
+        &mut game.world,
+        "Through the elm",
+        "It bars the way",
+        &[elm],
+    )
+    .unwrap();
+    crate::quest::reveal_goal(&mut game.world, q, "Break the elm door", &[elm]).unwrap();
+
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        true,
+    ));
+    client.push(Response::canned_text("The elm door gives way."));
+    client.push(Response::canned_tool_use(
+        "j",
+        crate::quest::JUDGE_TOOL,
+        json!({"verdict": "complete", "reason": "the door is broken"}),
+    ));
+    let t = game
+        .turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    assert_eq!(t.fast_path, Some(rule));
+    assert_eq!(t.judgments.len(), 1);
+    assert_eq!(t.judgments[0].quest, q);
+    assert_eq!(client.remaining(), 0);
+}

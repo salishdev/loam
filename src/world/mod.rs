@@ -145,17 +145,46 @@ impl World {
     /// whose key starts with `_`, and moves into or out of a carrier's
     /// inventory), which go through [`crate::inventory`] instead.
     pub fn apply_patch(&mut self, patch: &Patch) -> Result<Applied, ApplyError> {
-        self.apply_patch_as(patch, Authority::Director)
+        self.apply_patch_as(patch, Authority::Director, None)
+    }
+
+    /// [`apply_patch`](Self::apply_patch) with extra fields recorded in the
+    /// `patch` event (e.g. the rule that produced it), for `:why`.
+    pub fn apply_patch_noted(
+        &mut self,
+        patch: &Patch,
+        note: &Map<String, Value>,
+    ) -> Result<Applied, ApplyError> {
+        self.apply_patch_as(patch, Authority::Director, Some(note))
     }
 
     /// Apply a patch without the engine-owned guard. Used by engine modules
     /// such as inventory; the `patch` event records `"by": "engine"` so
     /// replay knows to apply it the same way.
     pub(crate) fn apply_engine_patch(&mut self, patch: &Patch) -> Result<Applied, ApplyError> {
-        self.apply_patch_as(patch, Authority::Engine)
+        self.apply_patch_as(patch, Authority::Engine, None)
     }
 
-    fn apply_patch_as(&mut self, patch: &Patch, by: Authority) -> Result<Applied, ApplyError> {
+    fn apply_patch_as(
+        &mut self,
+        patch: &Patch,
+        by: Authority,
+        note: Option<&Map<String, Value>>,
+    ) -> Result<Applied, ApplyError> {
+        let annotate = |payload: &mut Value| {
+            if by == Authority::Engine {
+                payload["by"] = json!("engine");
+            }
+            // A note never overrides what replay reads.
+            for (k, v) in note.into_iter().flatten() {
+                if !matches!(
+                    k.as_str(),
+                    "patch" | "created" | "handles" | "by" | "op" | "reason"
+                ) {
+                    payload[k] = v.clone();
+                }
+            }
+        };
         let tx = self.conn.transaction()?;
         match apply_ops(&tx, patch, by)? {
             Ok((created, handles)) => {
@@ -164,9 +193,7 @@ impl World {
                     "created": created,
                     "handles": handles,
                 });
-                if by == Authority::Engine {
-                    payload["by"] = json!("engine");
-                }
+                annotate(&mut payload);
                 let event_seq = insert_event(&tx, EventKind::Patch, &payload)?;
                 tx.commit()?;
                 Ok(Applied {
@@ -182,9 +209,7 @@ impl World {
                     "op": rejection.op,
                     "reason": rejection.reason,
                 });
-                if by == Authority::Engine {
-                    payload["by"] = json!("engine");
-                }
+                annotate(&mut payload);
                 insert_event(&self.conn, EventKind::PatchRejected, &payload)?;
                 Err(ApplyError::Rejected(rejection))
             }

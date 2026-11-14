@@ -9,14 +9,16 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::glossary::{self, GLOSSARY_KIND};
 use crate::inventory::{self, Inventory};
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
 use crate::quest;
+use crate::rules::{self, RULE_KIND};
 use crate::world::{
     ApplyError, CARRIER_PROP, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
 };
 
-use super::{BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, player_id};
+use super::{BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, player_id, scope};
 
 /// Which tools a director call gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,8 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         .into_iter()
         .chain(inventory::tool_definitions())
         .chain(quest::tool_definitions())
+        .chain(rules::tools::tool_definitions())
+        .chain(glossary::tools::tool_definitions())
         .collect(),
     }
 }
@@ -66,6 +70,12 @@ pub fn dispatch(
     }
     if let Some(result) = quest::handle_tool(world, call) {
         return result;
+    }
+    if let Some(output) = rules::tools::handle_tool(world, scope(world)?, call) {
+        return output;
+    }
+    if let Some(output) = glossary::tools::handle_tool(world, call) {
+        return output;
     }
     macro_rules! input {
         ($t:ty) => {
@@ -266,8 +276,11 @@ fn query_entity(world: &World, input: QueryEntityInput) -> Result<ToolOutput, St
     let Some(e) = world.entity(input.id)? else {
         return refuse(format!("entity #{} does not exist", input.id));
     };
-    if e.kind == BIBLE_KIND {
-        return refuse("the bible is read with read_bible");
+    match e.kind.as_str() {
+        BIBLE_KIND => return refuse("the bible is read with read_bible"),
+        RULE_KIND => return refuse("rules are read with list_rules"),
+        GLOSSARY_KIND => return refuse("the glossary is read with lookup_terms"),
+        _ => {}
     }
     let location = match e.location {
         Some(id) => world.entity(id)?.map(|l| brief(&l)),
@@ -490,10 +503,12 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
             props: c.props,
         });
     }
-    let applied = match try_apply(world, &Patch::new(ops), As::Director)? {
+    let patch = Patch::new(ops);
+    let applied = match try_apply(world, &patch, As::Director)? {
         Ok(a) => a,
         Err(reason) => return refuse(reason),
     };
+    let new_terms = glossary::register_patch(world, &patch)?;
     let room_id = applied.handles[ROOM_HANDLE];
 
     // Link the explored exit and move the player in.
@@ -521,7 +536,10 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
             contents.push(brief(&e));
         }
     }
-    ok(json!({"room": room_id, "player_moved_to": room_id, "contents": contents}))
+    ok(glossary::tools::with_new_terms(
+        json!({"room": room_id, "player_moved_to": room_id, "contents": contents}),
+        &new_terms,
+    ))
 }
 
 pub(crate) fn exits_of(room: &Entity) -> Map<String, Value> {
@@ -622,9 +640,7 @@ fn apply_patch_def() -> ToolDefinition {
 }
 
 fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError> {
-    let bible = bible_id(world)?;
     let player = player_id(world)?;
-    let is = |r: &EntityRef, id: Option<EntityId>| matches!(r, EntityRef::Id(x) if Some(*x) == id);
     for (i, op) in patch.ops.iter().enumerate() {
         // Every entity the op touches or places something into.
         let refs: Vec<&EntityRef> = match op {
@@ -635,10 +651,18 @@ fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError
             | Op::Rename { entity, .. }
             | Op::Destroy { entity } => vec![entity],
         };
-        if refs.iter().any(|r| is(r, bible)) {
-            return refuse(format!(
-                "op {i}: the bible is hidden and fixed; read it with read_bible"
-            ));
+        for r in &refs {
+            let EntityRef::Id(id) = r else { continue };
+            let kind = world.entity(*id)?.map(|e| e.kind);
+            let why = match kind.as_deref() {
+                Some(BIBLE_KIND) => "the bible is hidden and fixed; read it with read_bible",
+                Some(RULE_KIND) => {
+                    "rules change only through mint_rule, amend_rule and retire_rule"
+                }
+                Some(GLOSSARY_KIND) => "the glossary changes only through define_terms",
+                _ => continue,
+            };
+            return refuse(format!("op {i}: {why}"));
         }
         for r in &refs {
             if let EntityRef::Id(id) = r
@@ -651,14 +675,18 @@ fn apply_patch(world: &mut World, patch: Patch) -> Result<ToolOutput, StoreError
             }
         }
         if let Op::Destroy { entity } | Op::Rename { entity, .. } = op
-            && is(entity, player)
+            && matches!(entity, EntityRef::Id(x) if Some(*x) == player)
         {
             return refuse(format!("op {i}: the player cannot be renamed or destroyed"));
         }
     }
     match try_apply(world, &patch, As::Director)? {
         Ok(applied) => {
-            ok(json!({"applied": true, "created": applied.created, "handles": applied.handles}))
+            let new_terms = glossary::register_patch(world, &patch)?;
+            ok(glossary::tools::with_new_terms(
+                json!({"applied": true, "created": applied.created, "handles": applied.handles}),
+                &new_terms,
+            ))
         }
         Err(reason) => refuse(reason),
     }
