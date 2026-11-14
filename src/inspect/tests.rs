@@ -382,11 +382,14 @@ fn with_npcs() -> (Fixture, EntityId) {
              "Wren"
          ]}},
         {"op": "create", "handle": "cellar", "name": "Cellar", "kind": "room"},
-        {"op": "create", "handle": "hal", "name": "old hal", "kind": "npc", "location": "cellar",
-         "props": {"mood": "wary"}},
-        {"op": "create", "handle": "cart", "name": "cart", "kind": "item", "location": f.scope.room},
-        {"op": "create", "handle": "rat", "name": "Rat", "kind": "npc", "location": "cart"},
-        {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "npc"}
+        {"op": "create", "handle": "hal", "name": "old hal", "kind": "miller", "location": "cellar",
+         "props": {"mood": "wary", "acts": true}},
+        {"op": "create", "handle": "cart", "name": "cart", "kind": "cart", "location": f.scope.room,
+         "props": {"container": true}},
+        {"op": "create", "handle": "rat", "name": "Rat", "kind": "rat", "location": "cart",
+         "props": {"acts": true}},
+        {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "spirit", "props": {"acts": true}},
+        {"op": "create", "name": "stuffed heron", "kind": "npc", "location": "cellar"}
     ]))
     .unwrap();
     let a = f.world.apply_engine_patch(&Patch::new(ops)).unwrap();
@@ -418,6 +421,8 @@ fn npcs_lists_each_npc_with_where_it_is_and_its_props() {
     );
     // Nowhere.
     assert!(line("Ghost").ends_with("Ghost: nowhere"), "{out}");
+    // A kind of "npc" means nothing without acts: true.
+    assert!(!out.contains("stuffed heron"), "{out}");
     // Bible NPCs with no entity yet; Old Hal is in the world.
     let tail = out
         .split("In the bible, not yet in the world:")

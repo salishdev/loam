@@ -8,7 +8,7 @@ use crate::llm::{ContentBlock, Model, Response, ScriptedClient};
 fn world() -> (World, EntityId, EntityId, EntityId) {
     let mut w = World::open_in_memory().unwrap();
     let a = w
-        .apply_patch(&Patch::new(vec![
+        .apply_engine_patch(&Patch::new(vec![
             Op::Create {
                 handle: Some("room".into()),
                 name: "Yard".into(),
@@ -21,7 +21,7 @@ fn world() -> (World, EntityId, EntityId, EntityId) {
                 name: "well".into(),
                 kind: "feature".into(),
                 location: Some("room".into()),
-                props: Map::new(),
+                props: Map::from_iter([("container".to_owned(), json!(true))]),
             },
             Op::Create {
                 handle: None,

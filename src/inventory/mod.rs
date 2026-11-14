@@ -16,8 +16,8 @@
 //! [`InventoryError::Refused`] with a reason the director can narrate.
 //!
 //! The engine reads a few director-invented props by convention: `closed` or
-//! `locked` (true) on a container blocks reach into it, `portable: false`
-//! stops an item being picked up, `bulk` (number, default 1) is what an item
+//! `locked` (true) on a container blocks reach into it, the marker
+//! `fixed: true` stops an item being picked up, `bulk` (number, default 1) is what an item
 //! weighs against the carry limit, and `slot` (a string or array of strings)
 //! says where an item can be equipped.
 
@@ -519,8 +519,11 @@ fn check_portable(c: &Entity, it: &Entity) -> Result<()> {
     if is_carrier(it) {
         return refuse(format!("{} can't be carried", label(it)));
     }
-    if it.props.get("portable") == Some(&Value::Bool(false)) {
-        return refuse(format!("{} can't be picked up", label(it)));
+    if truthy(it, world::FIXED) {
+        return refuse(format!(
+            "{} is fixed in place (fixed: true) and can't be picked up",
+            label(it)
+        ));
     }
     Ok(())
 }

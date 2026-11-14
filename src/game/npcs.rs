@@ -1,17 +1,14 @@
-//! Where the world's NPCs are: shared by the tick director's slice and the
+//! Where the world's NPCs (entities marked `acts: true`) are: shared by the tick director's slice and the
 //! `:npcs` inspector, so both see the same list.
 
 use serde_json::Value;
 
-use crate::world::{Entity, EntityId, StoreError, World};
+use crate::world::{ACTS, Entity, EntityId, StoreError, World};
 
 use super::exits::is_stub_entity;
 use super::{ROOM_KIND, bible_id, player_id};
 
-/// The entity kind NPCs are created with.
-pub const NPC_KIND: &str = "npc";
-
-/// One NPC entity and where it is.
+/// One NPC (an entity marked `acts: true`) and where it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NpcSighting {
     pub npc: Entity,
@@ -21,11 +18,11 @@ pub struct NpcSighting {
     pub with_player: bool,
 }
 
-/// Every NPC entity, in id order, with where it is.
+/// Every entity marked `acts: true`, in id order, with where it is.
 pub fn npcs(world: &World) -> Result<Vec<NpcSighting>, StoreError> {
     let here = player_room(world)?;
     let mut out = Vec::new();
-    for id in world.entities_of_kind(NPC_KIND)? {
+    for id in world.entities_marked(ACTS)? {
         let Some(npc) = world.entity(id)? else {
             continue;
         };

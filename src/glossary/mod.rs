@@ -71,7 +71,23 @@ pub fn builtin_terms() -> BTreeMap<String, Term> {
         free_text: true,
         ..Term::new(m)
     };
+    let marker = |m: &str| Term {
+        values: BTreeMap::from([("true".into(), m.into())]),
+        ..Term::new(m)
+    };
     BTreeMap::from([
+        (
+            world::ACTS.into(),
+            marker("true: moves, speaks or acts on its own (an NPC); can hold things"),
+        ),
+        (
+            world::FIXED.into(),
+            marker("true: the player can't take it; patches and rules can still move it"),
+        ),
+        (
+            world::CONTAINER.into(),
+            marker("true: things can be put inside it"),
+        ),
         (
             "closed".into(),
             Term::new("true: a container that must be opened before reaching inside"),
@@ -80,7 +96,6 @@ pub fn builtin_terms() -> BTreeMap<String, Term> {
             "locked".into(),
             Term::new("true: closed and needs unlocking before it can be opened"),
         ),
-        ("portable".into(), Term::new("false: cannot be picked up")),
         (
             "bulk".into(),
             Term::new("number: how much carry capacity an item takes (default 1)"),
@@ -162,7 +177,12 @@ pub fn register<'a>(
     let mut changed = false;
     let mut added = Vec::new();
     for (name, value) in seen {
-        if name.starts_with(ENGINE_PROP_PREFIX) || name.trim().is_empty() {
+        // Markers are pre-registered with fixed meanings; their values
+        // aren't vocabulary.
+        if name.starts_with(ENGINE_PROP_PREFIX)
+            || name.trim().is_empty()
+            || world::MARKERS.contains(&name)
+        {
             continue;
         }
         let is_new = !all.contains_key(name);
@@ -209,6 +229,12 @@ pub fn define(world: &mut World, defs: &[Definition]) -> Result<Result<(), Strin
         if d.name.starts_with(ENGINE_PROP_PREFIX) {
             return Ok(Err(format!(
                 "{:?} is engine-owned, not a glossary term",
+                d.name
+            )));
+        }
+        if world::MARKERS.contains(&d.name.as_str()) {
+            return Ok(Err(format!(
+                "{:?} is an engine marker with a fixed meaning; it can't be redefined",
                 d.name
             )));
         }

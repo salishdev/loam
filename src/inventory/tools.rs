@@ -24,7 +24,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "take",
-            "Pick up an item within reach: in the same place, not inside a closed/locked container or another carrier, and not `portable: false`. Refused if it would exceed the carry limit (item `bulk`, default 1).",
+            "Pick up an item within reach: in the same place, not inside a closed/locked container or another carrier, and not `fixed: true`. Refused if it would exceed the carry limit (item `bulk`, default 1).",
             schema(json!({"item": item, "carrier": carrier}), &["item"]),
         ),
         ToolDefinition::new(

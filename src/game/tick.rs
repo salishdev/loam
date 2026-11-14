@@ -365,9 +365,9 @@ mod tests {
             {"op": "create", "handle": "hall", "name": "Hall", "kind": "room"},
             {"op": "create", "handle": "cellar", "name": "Cellar", "kind": "room"},
             {"op": "create", "handle": "you", "name": "you", "kind": "player", "location": "hall"},
-            {"op": "create", "handle": "rat", "name": "Rat", "kind": "npc", "location": "hall"},
-            {"op": "create", "handle": "hal", "name": "Hal", "kind": "npc", "location": "cellar"},
-            {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "npc"}
+            {"op": "create", "handle": "rat", "name": "Rat", "kind": "rat", "location": "hall", "props": {"acts": true}},
+            {"op": "create", "handle": "hal", "name": "Hal", "kind": "miller", "location": "cellar", "props": {"acts": true}},
+            {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "spirit", "props": {"acts": true}}
         ]))
         .unwrap();
         let a = world.apply_engine_patch(&Patch::new(ops)).unwrap();

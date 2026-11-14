@@ -55,12 +55,16 @@ fn record_session() -> World {
             patch_call(
                 "t1",
                 json!([
-                    {"op": "create", "handle": "nave", "name": "Nave", "kind": "room"},
-                    {"op": "create", "handle": "crypt", "name": "Crypt", "kind": "room"},
+                    // Kind is a label: the director can't create rooms or
+                    // players, so these are plain places marked container.
+                    {"op": "create", "handle": "nave", "name": "Nave", "kind": "nave",
+                     "props": {"container": true}},
+                    {"op": "create", "handle": "crypt", "name": "Crypt", "kind": "crypt",
+                     "props": {"container": true}},
                     {"op": "create", "handle": "door", "name": "Rotten door", "kind": "door",
                      "location": "nave", "props": {"rotten": true}},
-                    {"op": "create", "handle": "me", "name": "You", "kind": "player",
-                     "location": "nave", "props": {"hp": 10}},
+                    {"op": "create", "handle": "me", "name": "You", "kind": "pilgrim",
+                     "location": "nave", "props": {"hp": 10, "acts": true}},
                     {"op": "create", "handle": "lamp", "name": "Lamp", "kind": "item",
                      "location": "me"},
                 ]),
@@ -384,7 +388,8 @@ fn concerns_and_pins_replay_and_fork() {
     let a = w
         .apply_patch(&Patch::new(
             serde_json::from_value(json!([
-                {"op": "create", "handle": "nave", "name": "Nave", "kind": "room"},
+                {"op": "create", "handle": "nave", "name": "Nave", "kind": "nave",
+                 "props": {"container": true}},
                 {"op": "create", "handle": "door", "name": "Rotten door", "kind": "door",
                  "location": "nave"},
                 {"op": "create", "handle": "bell", "name": "Bell", "kind": "item",

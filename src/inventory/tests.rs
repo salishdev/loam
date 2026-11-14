@@ -29,12 +29,12 @@ impl Ids {
 }
 
 /// hall: player, npc, sword, helm, ring, open chest (gem), locked box
-/// (coin), statue (not portable), anvil (bulk 20). The player carries a bag
+/// (coin), statue (fixed), anvil (bulk 20). The player carries a bag
 /// holding an apple. yard (elsewhere): pebble.
 fn fixture() -> (World, Ids) {
     let mut w = World::open_in_memory().unwrap();
     let a = w
-        .apply_patch(&Patch::new(vec![
+        .apply_engine_patch(&Patch::new(vec![
             create("hall", "room", None, json!({})),
             create("yard", "room", None, json!({})),
             create("player", "person", Some("hall"), json!({})),
@@ -48,13 +48,23 @@ fn fixture() -> (World, Ids) {
             create("helm", "item", Some("hall"), json!({"slot": "head"})),
             create("cap", "item", Some("hall"), json!({"slot": "head"})),
             create("ring", "item", Some("hall"), json!({})),
-            create("chest", "container", Some("hall"), json!({"bulk": 5})),
+            create(
+                "chest",
+                "container",
+                Some("hall"),
+                json!({"bulk": 5, "container": true}),
+            ),
             create("gem", "item", Some("chest"), json!({})),
-            create("box", "container", Some("hall"), json!({"locked": true})),
+            create(
+                "box",
+                "container",
+                Some("hall"),
+                json!({"locked": true, "container": true}),
+            ),
             create("coin", "item", Some("box"), json!({})),
-            create("statue", "item", Some("hall"), json!({"portable": false})),
+            create("statue", "item", Some("hall"), json!({"fixed": true})),
             create("anvil", "item", Some("hall"), json!({"bulk": 20})),
-            create("bag", "container", Some("hall"), json!({})),
+            create("bag", "container", Some("hall"), json!({"container": true})),
             create("apple", "item", Some("bag"), json!({})),
             create("pebble", "item", Some("yard"), json!({})),
         ]))
@@ -131,11 +141,18 @@ fn items_held_by_another_carrier_are_out_of_reach() {
 }
 
 #[test]
-fn non_portable_items_carriers_and_rooms_cannot_be_taken() {
+fn fixed_items_carriers_and_rooms_cannot_be_taken() {
     let (mut w, f) = fixture();
     let inv = Inventory::default();
     let p = f.id("player");
-    assert!(refused(inv.take(&mut w, p, f.id("statue"))).contains("can't be picked up"));
+    let why = refused(inv.take(&mut w, p, f.id("statue")));
+    assert!(why.contains("fixed in place (fixed: true)"), "{why}");
+    // Fixed only stops the player: the director can still move it.
+    w.apply_patch(&Patch::new(vec![Op::Move {
+        entity: f.id("statue").into(),
+        to: Some(f.id("yard").into()),
+    }]))
+    .unwrap();
     assert!(refused(inv.take(&mut w, p, f.id("npc"))).contains("can't be carried"));
     refused(inv.take(&mut w, p, f.id("hall")));
     refused(inv.take(&mut w, p, p));
@@ -482,8 +499,21 @@ fn inventory_changes_are_logged_as_engine_patches() {
     assert_eq!(ev.kind, EventKind::Patch);
     assert_eq!(ev.payload["by"], json!("engine"));
     // Director patches don't carry the marker.
-    let first = &w.events().unwrap()[0];
-    assert!(first.payload.get("by").is_none());
+    let seq = w
+        .apply_patch(&Patch::new(vec![Op::SetProp {
+            entity: f.id("ring").into(),
+            key: "shiny".into(),
+            value: json!(true),
+        }]))
+        .unwrap()
+        .event_seq;
+    let ev = w
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.seq == seq)
+        .unwrap();
+    assert!(ev.payload.get("by").is_none());
 }
 
 // ---- tools ----
@@ -566,7 +596,7 @@ fn impossible_moves_return_reasons() {
     assert_eq!(
         out,
         Some(ToolOutput::Err(format!(
-            "statue (#{}) can't be picked up",
+            "statue (#{}) is fixed in place (fixed: true) and can't be picked up",
             f.id("statue")
         )))
     );
@@ -610,4 +640,13 @@ fn inventory_session_replays_identically() {
             "{h}"
         );
     }
+}
+
+#[test]
+fn transfer_into_something_that_is_not_a_container_is_refused() {
+    let (mut w, f) = fixture();
+    let inv = Inventory::default();
+    let why = refused(inv.transfer(&mut w, f.id("player"), f.id("ring"), f.id("anvil")));
+    assert!(why.contains("not a container"), "{why}");
+    assert_eq!(f.loc(&w, "ring"), Some(f.id("hall")));
 }

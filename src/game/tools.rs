@@ -420,7 +420,7 @@ fn create_room_def() -> ToolDefinition {
                     "items": {"type": "object", "properties": {
                         "handle": {"type": "string", "description": "Name to put other contents inside this one."},
                         "name": {"type": "string"},
-                        "kind": {"type": "string", "description": "Free-form, e.g. item, feature, container. Use npc for any being that can move, speak or act on its own (people, animals, monsters, spirits); put its role or species in props."},
+                        "kind": {"type": "string", "description": KIND_DESCRIPTION},
                         "inside": {"type": "string", "description": "handle of a container listed earlier"},
                         "props": {"type": "object"}
                     }, "required": ["name", "kind"]}
@@ -455,6 +455,13 @@ struct ContentInput {
 }
 
 const ROOM_HANDLE: &str = "@room";
+
+/// What the `kind` field means, in the create_room and apply_patch schemas.
+const KIND_DESCRIPTION: &str = "A free descriptive label, e.g. sword, heron, door, chest. \
+    Not room, player, bible, rule, quest or glossary (reserved). Capabilities are marker \
+    props: acts: true for anything that moves, speaks or acts on its own (people, animals, \
+    spirits, a talking sword); container: true for anything things can be put inside; \
+    fixed: true for anything the player can't take.";
 
 fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, StoreError> {
     let Some(player) = player_id(world)? else {
@@ -558,6 +565,12 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
                 "{}: prop {key:?} is engine-owned (keys starting with \
                  '{ENGINE_PROP_PREFIX}'); only the engine's tools change it",
                 c.name
+            ));
+        }
+        if world::RESERVED_KINDS.contains(&c.kind.as_str()) {
+            return refuse(format!(
+                "{}: kind {:?} is reserved; pick a descriptive kind",
+                c.name, c.kind
             ));
         }
         let location = match c.inside {
@@ -728,7 +741,7 @@ fn patch_schema() -> Value {
                 "entity": r, "to": r, "location": r, "subject": r, "object": r,
                 "rel": {"type": "string", "description": "relate/unrelate only: relation name, e.g. guards, owns, loves"},
                 "handle": {"type": "string"}, "name": {"type": "string"},
-                "kind": {"type": "string", "description": "create only. Free-form, e.g. item, feature, container. Use npc for any being that can move, speak or act on its own (people, animals, monsters, spirits); put its role or species in props."},
+                "kind": {"type": "string", "description": format!("create only. {KIND_DESCRIPTION}")},
                 "key": {"type": "string"}, "value": {},
                 "props": {"type": "object", "description": "create: the new entity's props; relate: the relation's props"}
             },

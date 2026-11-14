@@ -30,7 +30,7 @@ fn opening_room() -> Response {
             "description": "Brackish water laps at the pews.",
             "exits": {"north": "a reed path toward the bell tower"},
             "contents": [
-                {"handle": "altar", "name": "altar", "kind": "feature", "props": {"material": "slate"}},
+                {"handle": "altar", "name": "altar", "kind": "feature", "props": {"material": "slate", "container": true}},
                 {"name": "tallow candle", "kind": "item", "inside": "altar", "props": {"lit": false}}
             ]
         }),
@@ -179,7 +179,7 @@ fn context_holds_section_titles_but_not_bible_contents() {
     assert!(slice.contains("Drowned Chapel"));
     // Contents one level down, with props.
     assert!(
-        slice.contains("altar [feature] {\"material\":\"slate\"}"),
+        slice.contains("altar [feature] {\"container\":true,\"material\":\"slate\"}"),
         "{slice}"
     );
     assert!(
@@ -268,7 +268,7 @@ fn rooms_are_generated_on_arrival_and_the_same_on_return() {
             "region": "Saltmarsh",
             "description": "A leaning tower; the bell is gone.",
             "exits": {"up": "rotten stairs"},
-            "contents": [{"name": "crow", "kind": "npc", "props": {"mood": "wary"}}]
+            "contents": [{"name": "crow", "kind": "crow", "props": {"mood": "wary", "acts": true}}]
         }),
     ));
     client.push(Response::canned_text("You climb to the tower."));
@@ -277,7 +277,7 @@ fn rooms_are_generated_on_arrival_and_the_same_on_return() {
     assert_ne!(tower, chapel);
     let tower_slice = local_slice(game.world()).unwrap();
     assert!(tower_slice.contains(&format!("south -> #{chapel} Drowned Chapel")));
-    assert!(tower_slice.contains("crow [npc]"));
+    assert!(tower_slice.contains("crow [crow]"));
 
     // Exploring the same exit twice is refused.
     client.push(Response::canned_tool_use(
@@ -1027,12 +1027,12 @@ fn two_rooms(with_loft: bool) -> (Game, ScriptedClient, i64, i64, i64, Option<i6
         "create_room",
         json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
                "description": "A leaning tower.", "exits": {"up": "rotten stairs"},
-               "contents": [{"name": "crow", "kind": "npc", "props": {"mood": "wary"}}]}),
+               "contents": [{"name": "crow", "kind": "crow", "props": {"mood": "wary", "acts": true}}]}),
     ));
     client.push(Response::canned_text("The tower."));
     game.turn(&client, "go north", &mut |_| {}).unwrap();
     let tower = player_room(&game);
-    let crow = game.world().entities_of_kind("npc").unwrap()[0];
+    let crow = game.world().entities_marked(crate::world::ACTS).unwrap()[0];
     let mut loft = None;
     if with_loft {
         client.push(Response::canned_tool_use(
@@ -1491,7 +1491,8 @@ fn director_relations_show_in_query_entity_slice_and_glossary() {
         "p",
         "apply_patch",
         json!({"ops": [
-            {"op": "create", "handle": "hound", "name": "Hound", "kind": "npc", "location": chapel},
+            {"op": "create", "handle": "hound", "name": "Hound", "kind": "hound", "location": chapel,
+             "props": {"acts": true}},
             {"op": "relate", "subject": "hound", "rel": "guards", "object": altar,
              "props": {"since": "dawn"}},
         ]}),
@@ -1592,7 +1593,7 @@ fn unexplored_exits_lead_to_stub_rooms_that_create_room_fills_in() {
         "create_room",
         json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
                "description": "A leaning tower.", "exits": {"up": "rotten stairs", "east": "a causeway"},
-               "contents": [{"name": "crow", "kind": "npc", "props": {"mood": "wary"}}]}),
+               "contents": [{"name": "crow", "kind": "crow", "props": {"mood": "wary", "acts": true}}]}),
     ));
     client.push(Response::canned_text("The tower."));
     game.turn(&client, "go north", &mut |_| {}).unwrap();
@@ -1607,7 +1608,7 @@ fn unexplored_exits_lead_to_stub_rooms_that_create_room_fills_in() {
     assert_eq!(t.props["description"], json!("A leaning tower."));
     assert_eq!(t.props["region"], json!("Saltmarsh"));
     assert!(!t.props.contains_key("_unexplored"));
-    let crow = game.world().entities_of_kind("npc").unwrap()[0];
+    let crow = game.world().entities_marked(crate::world::ACTS).unwrap()[0];
     assert_eq!(
         game.world().entity(crow).unwrap().unwrap().location,
         Some(tower)
@@ -1702,7 +1703,7 @@ fn a_rule_effect_that_relates_an_exit_makes_it_walkable() {
     let chapel = player_room(&game);
     let w = game.world_mut();
     let a = w
-        .apply_patch(&crate::world::Patch::new(
+        .apply_engine_patch(&crate::world::Patch::new(
             serde_json::from_value(json!([
                 {"op": "create", "handle": "crypt", "name": "Crypt", "kind": "room",
                  "props": {"description": "Bones.", "region": "Saltmarsh"}},
@@ -1931,4 +1932,101 @@ fn a_related_rule_takes_the_fast_path_only_while_the_relation_holds() {
         director.contains("no guards relation runs from guard to door"),
         "{director}"
     );
+}
+
+#[test]
+fn reserved_kinds_name_the_engine_kinds() {
+    use crate::world::RESERVED_KINDS;
+    for k in [
+        ROOM_KIND,
+        PLAYER_KIND,
+        BIBLE_KIND,
+        crate::rules::RULE_KIND,
+        crate::quest::QUEST_KIND,
+        crate::glossary::GLOSSARY_KIND,
+    ] {
+        assert!(RESERVED_KINDS.contains(&k), "{k}");
+    }
+}
+
+#[test]
+fn the_director_cannot_create_entities_of_reserved_kinds() {
+    let (mut game, client) = begun();
+    let room = player_room(&game);
+    let before = game.world().state().unwrap();
+    for (i, kind) in ["quest", "room", "player", "rule"].into_iter().enumerate() {
+        client.push(Response::canned_tool_use(
+            format!("p{i}"),
+            "apply_patch",
+            json!({"ops": [{"op": "create", "name": "fake", "kind": kind, "location": room}]}),
+        ));
+        client.push(Response::canned_text("x"));
+        game.turn(&client, "cheat", &mut |_| {}).unwrap();
+        let (msg, is_error) = last_tool_result(&client);
+        assert!(is_error && msg.contains("is reserved"), "{msg}");
+    }
+    // create_room's contents can't smuggle one in either.
+    client.push(Response::canned_tool_use(
+        "r",
+        "create_room",
+        json!({
+            "via_exit": "north", "back_exit": "south", "name": "Bell Tower",
+            "region": "Saltmarsh", "description": "A tower.", "exits": {},
+            "contents": [{"name": "fake quest", "kind": "quest"}]
+        }),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("is reserved"), "{msg}");
+    assert_eq!(game.world().state().unwrap().entities, before.entities);
+    assert!(crate::quest::quests(game.world()).unwrap().is_empty());
+}
+
+#[test]
+fn acts_beings_hold_items_and_npcs_are_found_by_acts() {
+    let (mut game, client) = begun();
+    let room = player_room(&game);
+    client.push(Response::canned_tool_use(
+        "p",
+        "apply_patch",
+        json!({"ops": [
+            {"op": "create", "handle": "sword", "name": "talking sword", "kind": "sword",
+             "location": room, "props": {"acts": true}},
+            {"op": "create", "handle": "heron", "name": "heron", "kind": "heron",
+             "location": room},
+            {"op": "create", "name": "gem", "kind": "gem", "location": "sword"}
+        ]}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "look", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    let names: Vec<String> = npcs(game.world())
+        .unwrap()
+        .into_iter()
+        .map(|s| s.npc.name)
+        .collect();
+    // The sword acts, whatever its kind; the heron doesn't.
+    assert_eq!(names, ["talking sword"]);
+
+    // Nothing goes into the heron until it is marked.
+    let heron = game
+        .world()
+        .state()
+        .unwrap()
+        .entities
+        .into_iter()
+        .find(|e| e.name == "heron")
+        .unwrap()
+        .id;
+    client.push(Response::canned_tool_use(
+        "q",
+        "apply_patch",
+        json!({"ops": [{"op": "create", "name": "fish", "kind": "fish", "location": heron}]}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "feed the heron", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("not a container"), "{msg}");
 }

@@ -25,7 +25,8 @@ fn fixture() -> Fixture {
         {"op": "create", "handle": "rotten", "name": "oak door", "kind": "door", "location": "hall",
          "props": {"rotten": true}},
         {"op": "create", "handle": "sound", "name": "iron door", "kind": "door", "location": "hall"},
-        {"op": "create", "handle": "crate", "name": "crate", "kind": "container", "location": "hall"},
+        {"op": "create", "handle": "crate", "name": "crate", "kind": "crate", "location": "hall",
+         "props": {"container": true}},
         {"op": "create", "handle": "nail", "name": "nail", "kind": "item", "location": "crate"},
         {"op": "create", "handle": "bar", "name": "crowbar", "kind": "item", "location": "you"},
         {"op": "create", "handle": "gate", "name": "gate", "kind": "door", "location": "far"}
@@ -250,6 +251,10 @@ fn invalid_definitions_are_refused() {
         validate(&serde_json::from_value(v).unwrap()).unwrap_err()
     };
     assert!(refused(json!({"trigger": " "})).contains("trigger"));
+    assert!(
+        refused(json!({"effects": [{"op": "create", "name": "q", "kind": "quest"}]}))
+            .contains("reserved")
+    );
     assert!(refused(json!({"roles": {"room": "x"}})).contains("built in"));
     assert!(
         refused(json!({"conditions": [{"check": "kind", "role": "ghost", "is": "x"}]}))

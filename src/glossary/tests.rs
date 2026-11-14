@@ -10,7 +10,15 @@ fn patch(ops: serde_json::Value) -> Patch {
 fn starts_with_the_terms_the_engine_reads() {
     let world = World::open_in_memory().unwrap();
     let index = index(&world).unwrap();
-    for t in ["closed", "locked", "portable", "bulk", "slot"] {
+    for t in [
+        "acts",
+        "fixed",
+        "container",
+        "closed",
+        "locked",
+        "bulk",
+        "slot",
+    ] {
         assert!(index.split(", ").any(|x| x == t), "{index}");
     }
     assert!(!index.contains('?'));
@@ -98,4 +106,35 @@ fn terms_are_engine_owned() {
         .unwrap_err();
     assert!(err.to_string().contains("engine-owned"), "{err}");
     assert!(terms(&world).unwrap().contains_key("rotten"));
+}
+
+#[test]
+fn markers_are_pre_registered_and_cannot_be_redefined() {
+    let mut world = World::open_in_memory().unwrap();
+    let all = terms(&world).unwrap();
+    for m in crate::world::MARKERS {
+        assert!(!all[m].meaning.is_empty(), "{m}");
+    }
+    let def = |name: &str| Definition {
+        name: name.into(),
+        meaning: "something else".into(),
+        values: BTreeMap::new(),
+        free_text: None,
+    };
+    for m in crate::world::MARKERS {
+        let refused = define(&mut world, &[def("rotten"), def(m)])
+            .unwrap()
+            .unwrap_err();
+        assert!(refused.contains("engine marker"), "{refused}");
+    }
+    // A refusal changes nothing, not even the other terms in the call.
+    assert_eq!(terms(&world).unwrap(), all);
+    // Using a marker in a patch registers nothing new.
+    let added = register_patch(
+        &mut world,
+        &patch(json!([{"op": "create", "name": "x", "kind": "x",
+                       "props": {"acts": false, "fixed": true}}])),
+    )
+    .unwrap();
+    assert!(added.is_empty(), "{added:?}");
 }

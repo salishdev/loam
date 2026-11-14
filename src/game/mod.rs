@@ -16,7 +16,7 @@ mod tools;
 mod tests;
 
 pub use context::local_slice;
-pub use npcs::{NPC_KIND, NpcSighting, bible_npc_names, npcs};
+pub use npcs::{NpcSighting, bible_npc_names, npcs};
 pub use tick::{ROOM_CHANGE_GAP, TICK_EVERY, TickChange, TickOutcome};
 pub use tools::Phase;
 
@@ -35,7 +35,7 @@ use crate::world::{EntityId, EventKind, StoreError, World};
 /// Kind of the single entity holding the world bible.
 pub const BIBLE_KIND: &str = "bible";
 /// Kind of the player entity.
-pub const PLAYER_KIND: &str = "player";
+pub use crate::world::PLAYER_KIND;
 /// Kind of generated rooms.
 pub use crate::world::ROOM_KIND;
 /// The bible's sections, in the order the director writes them.
@@ -61,7 +61,12 @@ consequences happen with tools, then narrate. The engine's state is the truth: l
 up (query_entity, read_bible, search_events) rather than inventing facts that may already \
 exist, and never change the world only in prose. When the player goes through an \
 unexplored exit, generate the room with create_room, furnished to fit the bible; through an \
-explored one, move_player. Exits are exit relations between rooms. If a tool \
+explored one, move_player. Exits are exit relations between rooms. An entity's kind is a \
+free descriptive label (sword, heron, door); what it can do comes from marker props: \
+acts: true for anything that moves, speaks or acts on its own (people, animals, spirits, a \
+talking sword; these are the NPCs), container: true for anything things can be put inside, \
+fixed: true for anything the player can't take. Only rooms, the player, acts beings and \
+containers can hold things. If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \

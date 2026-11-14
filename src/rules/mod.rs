@@ -450,6 +450,13 @@ fn validate_effects(
         if let Some(k) = keys.iter().find(|k| k.starts_with(ENGINE_PROP_PREFIX)) {
             return Err(format!("{what} {i}: prop {k:?} is engine-owned"));
         }
+        if let Op::Create { kind, .. } = op
+            && world::RESERVED_KINDS.contains(&kind.as_str())
+        {
+            return Err(format!(
+                "{what} {i}: kind {kind:?} is reserved; a rule can't create one"
+            ));
+        }
         if let Op::Create {
             handle: Some(h), ..
         } = op

@@ -11,6 +11,17 @@ fn create(handle: &str, name: &str, kind: &str, location: Option<EntityRef>) -> 
     }
 }
 
+/// A `create` of something marked `container: true`.
+fn create_container(handle: &str, name: &str, location: Option<EntityRef>) -> Op {
+    Op::Create {
+        handle: Some(handle.into()),
+        name: name.into(),
+        kind: "container".into(),
+        location,
+        props: Map::from_iter([(CONTAINER.to_owned(), json!(true))]),
+    }
+}
+
 fn mv(entity: impl Into<EntityRef>, to: Option<EntityRef>) -> Op {
     Op::Move {
         entity: entity.into(),
@@ -22,9 +33,9 @@ fn mv(entity: impl Into<EntityRef>, to: Option<EntityRef>) -> Op {
 fn seeded() -> (World, EntityId, EntityId, EntityId) {
     let mut w = World::open_in_memory().unwrap();
     let a = w
-        .apply_patch(&Patch::new(vec![
+        .apply_engine_patch(&Patch::new(vec![
             create("cellar", "Cellar", "room", None),
-            create("chest", "Chest", "container", Some("cellar".into())),
+            create_container("chest", "Chest", Some("cellar".into())),
             create("key", "Iron key", "item", Some("chest".into())),
         ]))
         .unwrap();
@@ -63,7 +74,7 @@ fn create_builds_containment_tree_with_props() {
     props.insert("rotten".into(), json!(true));
     props.insert("hp".into(), json!(3));
     let a = w
-        .apply_patch(&Patch::new(vec![
+        .apply_engine_patch(&Patch::new(vec![
             create("hall", "Hall", "room", None),
             Op::Create {
                 handle: Some("door".into()),
@@ -154,6 +165,11 @@ fn moving_out_of_a_subtree_then_inverting_it_is_not_a_cycle() {
     let (mut w, cellar, _chest, key) = seeded();
     w.apply_patch(&Patch::new(vec![
         mv(key, None),
+        Op::SetProp {
+            entity: key.into(),
+            key: CONTAINER.into(),
+            value: json!(true),
+        },
         mv(cellar, Some(key.into())),
     ]))
     .unwrap();
@@ -265,8 +281,8 @@ fn rejects_duplicate_handle() {
     let r = rejected(
         &mut w,
         vec![
-            create("a", "A", "room", None),
-            create("a", "A2", "room", None),
+            create("a", "A", "thing", None),
+            create("a", "A2", "thing", None),
         ],
     );
     assert_eq!(r.op, 1);
@@ -541,7 +557,7 @@ fn new_stores_record_the_schema_version_and_reopen() {
     let path = temp_store("fresh");
     let mut w = World::open(&path).unwrap();
     assert_eq!(schema_version(&w), SCHEMA_VERSION.to_string());
-    w.apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+    w.apply_engine_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
         .unwrap();
     drop(w);
     let w = World::open(&path).unwrap();
@@ -554,7 +570,7 @@ fn stores_from_other_schema_versions_are_refused() {
     // A save from before versioning: data but no version row.
     let path = temp_store("unversioned");
     let mut w = World::open(&path).unwrap();
-    w.apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+    w.apply_engine_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
         .unwrap();
     w.conn
         .execute("DELETE FROM meta WHERE key = 'schema_version'", [])
@@ -716,7 +732,7 @@ fn engine_owned_relation_names_are_refused_for_the_director_only() {
 fn destroy_cascades_relations_both_ways_and_logs_them() {
     let (mut w, cellar, chest, key) = seeded();
     let hall = w
-        .apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .apply_engine_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
         .unwrap()
         .created[0];
     w.apply_patch(&Patch::new(vec![
@@ -827,7 +843,7 @@ fn exit(subject: impl Into<EntityRef>, object: impl Into<EntityRef>, props: Valu
 fn exits_join_two_rooms_with_distinct_dirs() {
     let (mut w, cellar, chest, _) = seeded();
     let a = w
-        .apply_patch(&Patch::new(vec![
+        .apply_engine_patch(&Patch::new(vec![
             create("hall", "Hall", ROOM_KIND, None),
             create("yard", "Yard", ROOM_KIND, None),
             exit(cellar, "hall", json!({"dir": "up", "label": "Hall"})),
@@ -892,4 +908,138 @@ fn exits_join_two_rooms_with_distinct_dirs() {
     )]))
     .unwrap();
     assert_eq!(w.relations_from(cellar, Some(EXIT_REL)).unwrap().len(), 2);
+}
+
+// ---- markers and reserved kinds ----
+
+fn create_with(handle: &str, kind: &str, location: Option<EntityRef>, props: Value) -> Op {
+    Op::Create {
+        handle: Some(handle.into()),
+        name: handle.into(),
+        kind: kind.into(),
+        location,
+        props: props.as_object().unwrap().clone(),
+    }
+}
+
+/// A cellar (room) holding a plain stone and a key; a person who acts; a
+/// player; and a carrier pouch.
+fn holders() -> (World, BTreeMap<String, EntityId>) {
+    let mut w = World::open_in_memory().unwrap();
+    let a = w
+        .apply_engine_patch(&Patch::new(vec![
+            create("cellar", "Cellar", ROOM_KIND, None),
+            create("stone", "Stone", "stone", Some("cellar".into())),
+            create("key", "Key", "key", Some("cellar".into())),
+            create_with(
+                "ferry",
+                "ferryman",
+                Some("cellar".into()),
+                json!({ACTS: true}),
+            ),
+            create("you", "You", PLAYER_KIND, Some("cellar".into())),
+            create_with("pouch", "pouch", None, json!({CARRIER_PROP: true})),
+        ]))
+        .unwrap();
+    (w, a.handles)
+}
+
+#[test]
+fn moving_or_creating_into_a_non_container_is_refused_for_every_authority() {
+    let (mut w, h) = holders();
+    let (stone, key) = (h["stone"], h["key"]);
+    let before = snapshot(&w);
+    for by_engine in [false, true] {
+        for ops in [
+            vec![mv(key, Some(stone.into()))],
+            vec![create("gem", "Gem", "gem", Some(stone.into()))],
+        ] {
+            let patch = Patch::new(ops);
+            let result = if by_engine {
+                w.apply_engine_patch(&patch)
+            } else {
+                w.apply_patch(&patch)
+            };
+            match result {
+                Err(ApplyError::Rejected(r)) => {
+                    assert!(r.reason.contains("not a container"), "{}", r.reason)
+                }
+                other => panic!("expected rejection, got {other:?}"),
+            }
+        }
+    }
+    assert_eq!(snapshot(&w), before);
+    // Top level is always allowed.
+    w.apply_patch(&Patch::new(vec![mv(key, None)])).unwrap();
+}
+
+#[test]
+fn rooms_players_carriers_actors_and_containers_hold_things() {
+    let (mut w, h) = holders();
+    let key = h["key"];
+    for holder in ["cellar", "ferry", "you", "pouch"] {
+        w.apply_engine_patch(&Patch::new(vec![mv(key, Some(h[holder].into()))]))
+            .unwrap();
+        assert_eq!(w.entity(key).unwrap().unwrap().location, Some(h[holder]));
+    }
+    // An acts being holds things for the director too.
+    w.apply_engine_patch(&Patch::new(vec![mv(key, Some(h["cellar"].into()))]))
+        .unwrap();
+    w.apply_patch(&Patch::new(vec![mv(key, Some(h["ferry"].into()))]))
+        .unwrap();
+    // Marking the stone a container (in the same patch) lets it hold things.
+    w.apply_patch(&Patch::new(vec![
+        Op::SetProp {
+            entity: h["stone"].into(),
+            key: CONTAINER.into(),
+            value: json!(true),
+        },
+        mv(key, Some(h["stone"].into())),
+    ]))
+    .unwrap();
+    // `container: false` is not a container.
+    let r = rejected(
+        &mut w,
+        vec![
+            create_with(
+                "box",
+                "box",
+                Some(h["cellar"].into()),
+                json!({CONTAINER: false}),
+            ),
+            create("pin", "Pin", "pin", Some("box".into())),
+        ],
+    );
+    assert_eq!(r.op, 1);
+}
+
+#[test]
+fn reserved_kinds_are_refused_for_the_director_only() {
+    let mut w = World::open_in_memory().unwrap();
+    for kind in RESERVED_KINDS {
+        let r = rejected(&mut w, vec![create("x", "X", kind, None)]);
+        assert!(r.reason.contains("is reserved"), "{}", r.reason);
+        w.apply_engine_patch(&Patch::new(vec![create("x", "X", kind, None)]))
+            .unwrap();
+    }
+    // Any other kind is a free label.
+    w.apply_patch(&Patch::new(vec![create("x", "X", "npc", None)]))
+        .unwrap();
+}
+
+#[test]
+fn entities_marked_finds_true_markers_only() {
+    let mut w = World::open_in_memory().unwrap();
+    let a = w
+        .apply_patch(&Patch::new(vec![
+            create_with("a", "x", None, json!({ACTS: true})),
+            create_with("b", "x", None, json!({ACTS: false})),
+            create_with("c", "x", None, json!({ACTS: "yes"})),
+            create_with("d", "x", None, json!({ACTS: true})),
+        ]))
+        .unwrap();
+    assert_eq!(
+        w.entities_marked(ACTS).unwrap(),
+        vec![a.handles["a"], a.handles["d"]]
+    );
 }

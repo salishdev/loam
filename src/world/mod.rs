@@ -107,7 +107,7 @@ pub enum StoreError {
 /// Version of the store layout, recorded in `meta` as `schema_version`.
 /// Stores with another version (or none, from before versioning) can't be
 /// opened: saves are not migrated.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Result of an applied patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +130,27 @@ pub const PINS_REL: &str = "_pins";
 /// Kind of rooms. The validator checks that both ends of an
 /// [`EXIT_REL`] relation have it.
 pub const ROOM_KIND: &str = "room";
+
+/// Kind of the player entity.
+pub const PLAYER_KIND: &str = "player";
+
+/// Kinds the engine gives meaning to. The director can't create entities of
+/// these kinds (rooms come only from `create_room`); every other kind is a
+/// free descriptive label.
+pub const RESERVED_KINDS: [&str; 6] =
+    [ROOM_KIND, PLAYER_KIND, "bible", "rule", "quest", "glossary"];
+
+/// Marker prop: `acts: true` moves, speaks or acts on its own. NPCs are
+/// the entities carrying it, and it may hold things.
+pub const ACTS: &str = "acts";
+/// Marker prop: `fixed: true` can't be taken by the player. Patches and
+/// rule effects can still move it.
+pub const FIXED: &str = "fixed";
+/// Marker prop: `container: true` may have things put inside it.
+pub const CONTAINER: &str = "container";
+/// The engine's marker props: plain, director-writable props with an
+/// engine meaning.
+pub const MARKERS: [&str; 3] = [ACTS, FIXED, CONTAINER];
 
 /// Prop keys starting with this are engine-owned: director patches can't
 /// set or remove them.
@@ -399,6 +420,18 @@ impl World {
         Ok(ids)
     }
 
+    /// Ids of every entity whose prop `key` is `true` (a marker such as
+    /// [`ACTS`]), in id order.
+    pub fn entities_marked(&self, key: &str) -> Result<Vec<EntityId>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entity_id FROM props WHERE key = ?1 AND value = 'true' ORDER BY entity_id",
+        )?;
+        let ids = stmt
+            .query_map([key], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
     /// Up to `limit` events whose payload contains `text` (case-insensitive
     /// for ASCII), newest first. `kinds` restricts the search when non-empty.
     pub fn search_events(
@@ -581,6 +614,14 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
                     Some(r) => Some(resolve!(r)),
                     None => None,
                 };
+                if guarded && RESERVED_KINDS.contains(&kind.as_str()) {
+                    return reject(reserved_kind_reason(kind));
+                }
+                if let Some(loc) = loc
+                    && let Some(reason) = not_a_holder(tx, loc)?
+                {
+                    return reject(format!("cannot create {name:?} inside #{loc}: {reason}"));
+                }
                 if guarded {
                     if let Some(key) = props.keys().find(|k| is_engine_prop(k)) {
                         return reject(engine_prop_reason(key));
@@ -644,6 +685,11 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
                         "moving {entity} into {}: {reason}",
                         to.as_ref().unwrap()
                     ));
+                }
+                if let Some(dest) = dest
+                    && let Some(reason) = not_a_holder(tx, dest)?
+                {
+                    return reject(format!("cannot move {entity} into #{dest}: {reason}"));
                 }
                 tx.execute(
                     "UPDATE entities SET location = ?1 WHERE id = ?2",
@@ -814,6 +860,38 @@ fn bad_rel_name(rel: &str, guarded: bool) -> Option<String> {
     } else {
         None
     }
+}
+
+fn reserved_kind_reason(kind: &str) -> String {
+    let how = if kind == ROOM_KIND {
+        "rooms are generated with create_room"
+    } else {
+        "the engine creates these through its own tools"
+    };
+    format!("kind {kind:?} is reserved: {how}; pick a descriptive kind")
+}
+
+/// Why `id` can't hold things, if it can't. Rooms, the player, carriers,
+/// `acts` beings and `container: true` entities can.
+fn not_a_holder(tx: &Transaction, id: EntityId) -> rusqlite::Result<Option<String>> {
+    let (name, kind): (String, String) =
+        tx.query_row("SELECT name, kind FROM entities WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    if kind == ROOM_KIND || kind == PLAYER_KIND {
+        return Ok(None);
+    }
+    let marked: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM props WHERE entity_id = ?1 AND key IN (?2, ?3, ?4) AND value = 'true'",
+        params![id, CARRIER_PROP, ACTS, CONTAINER],
+        |r| r.get(0),
+    )?;
+    Ok((marked == 0).then(|| {
+        format!(
+            "{name:?} is not a container (only rooms, the player, carriers, beings that act \
+             and things marked container: true hold others; set container: true first if it should)"
+        )
+    }))
 }
 
 fn engine_prop_reason(key: &str) -> String {

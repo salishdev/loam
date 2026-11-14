@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn patch_that_no_longer_validates_is_divergence() {
         let mut w = World::open_in_memory().unwrap();
-        w.apply_patch(&room("Hall")).unwrap();
+        w.apply_engine_patch(&room("Hall")).unwrap();
         let seq = w
             .apply_patch(&Patch::new(vec![Op::Rename {
                 entity: 1.into(),
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn mismatched_ids_are_divergence() {
         let mut w = World::open_in_memory().unwrap();
-        let seq = w.apply_patch(&room("Hall")).unwrap().event_seq;
+        let seq = w.apply_engine_patch(&room("Hall")).unwrap().event_seq;
         tamper(
             &w,
             seq,
