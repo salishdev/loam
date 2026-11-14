@@ -6,3 +6,6 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Local secrets, such as ANTHROPIC_API_KEY
+.env

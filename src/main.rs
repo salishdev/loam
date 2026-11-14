@@ -8,6 +8,10 @@
 //! A world tick runs between turns when due. Lines starting with `:` are
 //! commands (`:help` lists them); the inspector commands read only the
 //! store and its log, never the LLM.
+//!
+//! Variables such as `ANTHROPIC_API_KEY` can live in a `.env` file, read from
+//! the current directory and then the repo root; real environment variables
+//! win.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +34,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    load_env_files();
     let args = match parse_args(std::env::args().skip(1))? {
         Command::Help => {
             println!("{USAGE}");
@@ -219,6 +224,51 @@ fn seed_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+fn env_files() -> Vec<PathBuf> {
+    let mut files = vec![PathBuf::from(".env")];
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    if !files.contains(&bundled) {
+        files.push(bundled);
+    }
+    files
+}
+
+/// Sets each variable from the `.env` files that isn't already set, so the
+/// real environment and earlier files win.
+fn load_env_files() {
+    for file in env_files() {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for (key, value) in parse_env(&text) {
+            if std::env::var_os(&key).is_none() {
+                // SAFETY: runs at the start of `run`, before any other threads exist.
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
+}
+
+/// Parses `KEY=value` lines, skipping blanks and `#` comments. An optional
+/// `export ` prefix and matching quotes around the value are dropped.
+fn parse_env(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let l = l.strip_prefix("export ").unwrap_or(l);
+            let (key, value) = l.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            let value = [('"', '"'), ('\'', '\'')]
+                .iter()
+                .find_map(|&(a, b)| value.strip_prefix(a)?.strip_suffix(b))
+                .unwrap_or(value);
+            (!key.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 fn seeds_dir_names() -> String {
     seed_dirs()
         .iter()
@@ -377,5 +427,16 @@ mod tests {
         }
         let err = resolve_seed("nope", &dirs).unwrap_err();
         assert!(err.contains("drowned-mill"), "{err}");
+    }
+
+    #[test]
+    fn parse_env_reads_keys_and_strips_quotes() {
+        let text = "# key\n\nA=1\nexport B = \"two words\"\nC='x=y'\nnot a pair\n=empty\n";
+        let pairs = parse_env(text);
+        let want = [("A", "1"), ("B", "two words"), ("C", "x=y")];
+        assert_eq!(
+            pairs,
+            want.map(|(k, v)| (k.to_string(), v.to_string())).to_vec()
+        );
     }
 }
