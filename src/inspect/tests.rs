@@ -298,3 +298,74 @@ fn stats_counts_events_turns_rules_and_entities() {
         assert!(out.contains(want), "missing {want:?} in\n{out}");
     }
 }
+
+fn with_sheet() -> Fixture {
+    let mut f = fixture();
+    let specs: Vec<stats::StatSpec> = serde_json::from_value(stats::sample_sheet()).unwrap();
+    stats::create_sheet(&mut f.world, &specs, 7)
+        .unwrap()
+        .unwrap();
+    f
+}
+
+/// The text between `Stat sheet:` and the engine counts.
+fn sheet_part(out: &str) -> &str {
+    out.split("\nEvents:").next().unwrap()
+}
+
+#[test]
+fn stats_shows_the_stat_sheet_with_thresholds_capacity_and_growth() {
+    let f = with_sheet();
+    let ids: Vec<_> = stats::stat_rules(&f.world)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.def.trigger.clone(), r.id))
+        .collect();
+    let id = |trigger: &str| ids.iter().find(|(t, _)| t == trigger).unwrap().1;
+    let out = stats(&f.world).unwrap();
+    let want = format!(
+        "Stat sheet:\n  \
+         brawn 2 [0..5]: strength and endurance\n    \
+         #{} carry limit = 6 + 2 per point of brawn (now carry limit 10)\n    \
+         grows #{} hard labour finished (+1)\n  \
+         nerve 3 [0..5]: steadiness before the uncanny\n    \
+         threshold #{} nerve falls to 0 or below => Your nerve breaks; you flee back the way you came, shaking.\n    \
+         grows #{} facing a horror without fleeing (+1)",
+        id("carry limit = 6 + 2 per point of brawn"),
+        id("hard labour finished"),
+        id("nerve falls to 0 or below"),
+        id("facing a horror without fleeing"),
+    );
+    assert_eq!(sheet_part(&out), want, "\n{out}");
+    assert!(
+        out.contains("Rules: 6 (0 world active, 0 world retired, 6 stat)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn stats_marks_thresholds_already_reached_and_live_capacity() {
+    let mut f = with_sheet();
+    stats::adjust_stat(&mut f.world, "nerve", -3, "the thing in the well", None)
+        .unwrap()
+        .unwrap();
+    stats::adjust_stat(&mut f.world, "brawn", -1, "a wrenched back", None)
+        .unwrap()
+        .unwrap();
+    let out = stats(&f.world).unwrap();
+    let sheet = sheet_part(&out);
+    assert!(sheet.contains("nerve 0 [0..5]"), "{sheet}");
+    assert!(
+        sheet.contains("nerve falls to 0 or below (reached) =>"),
+        "{sheet}"
+    );
+    assert!(sheet.contains("brawn 1 [0..5]"), "{sheet}");
+    assert!(sheet.contains("(now carry limit 8)"), "{sheet}");
+}
+
+#[test]
+fn stats_says_when_there_is_no_sheet() {
+    let f = fixture();
+    let out = stats(&f.world).unwrap();
+    assert!(out.starts_with("Stat sheet: none yet\nEvents: "), "{out}");
+}

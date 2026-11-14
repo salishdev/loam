@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::glossary;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
+use crate::stats::{self, Capacity, Crossing, StatHook};
 use crate::world::{Entity, EntityId, Event, EventKind, Op, StoreError, World};
 
 /// Longest value shown inline before it is clipped.
@@ -99,8 +100,69 @@ pub fn quests(world: &World) -> Result<String, StoreError> {
     Ok(trim_end(out))
 }
 
-/// Counts of what the engine has done and holds.
+/// The player's stat sheet, then counts of what the engine has done and
+/// holds.
 pub fn stats(world: &World) -> Result<String, StoreError> {
+    let mut out = stat_sheet(world)?;
+    writeln!(out).unwrap();
+    out.push_str(&engine_counts(world)?);
+    Ok(out)
+}
+
+/// Each stat with its value, bounds and stat rules: thresholds (marked
+/// when the value is already on their firing side), capacity and growth.
+fn stat_sheet(world: &World) -> Result<String, StoreError> {
+    let sheet = stats::sheet(world)?;
+    if sheet.is_empty() {
+        return Ok("Stat sheet: none yet".into());
+    }
+    let rules = stats::stat_rules(world)?;
+    let mut out = String::from("Stat sheet:");
+    for s in sheet.values() {
+        write!(out, "\n  {} {} [{}..{}]", s.name, s.value, s.min, s.max).unwrap();
+        if !s.about.trim().is_empty() {
+            write!(out, ": {}", s.about.trim()).unwrap();
+        }
+        for r in &rules {
+            let Some(hook) = r.hook.as_ref().filter(|h| h.stat() == s.name) else {
+                continue;
+            };
+            match hook {
+                StatHook::Bounds { .. } => {}
+                StatHook::Threshold { at, when, .. } => {
+                    let reached = match when {
+                        Crossing::FallsTo => s.value <= *at,
+                        Crossing::RisesTo => s.value >= *at,
+                    };
+                    let mark = if reached { " (reached)" } else { "" };
+                    write!(out, "\n    threshold #{} {}{mark}", r.id, r.def.trigger).unwrap();
+                    if !r.def.outcome.trim().is_empty() {
+                        write!(out, " => {}", clip(r.def.outcome.trim(), VALUE_CHARS)).unwrap();
+                    }
+                }
+                StatHook::Capacity {
+                    capacity,
+                    base,
+                    per_point,
+                    ..
+                } => {
+                    let name = match capacity {
+                        Capacity::CarryLimit => "carry limit",
+                    };
+                    let now = stats::capacity_at(*base, *per_point, s.value);
+                    write!(out, "\n    #{} {} (now {name} {now})", r.id, r.def.trigger).unwrap();
+                }
+                StatHook::Advancement { step, .. } => {
+                    write!(out, "\n    grows #{} {} (+{step})", r.id, r.def.trigger).unwrap();
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Counts of what the engine has done and holds.
+fn engine_counts(world: &World) -> Result<String, StoreError> {
     let events = world.events()?;
     let mut by_kind: BTreeMap<&str, usize> = BTreeMap::new();
     let (mut turns, mut fast, mut escalated, mut tool_errors) = (0, 0, 0, 0);

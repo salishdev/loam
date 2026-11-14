@@ -520,10 +520,15 @@ pub fn carry_limit(world: &World, carrier: EntityId) -> Result<f64, StoreError> 
         }) = &r.hook
             && let Some(s) = sheet(world)?.get(stat)
         {
-            return Ok((base + per_point * s.value as f64).max(0.0));
+            return Ok(capacity_at(*base, *per_point, s.value));
         }
     }
     Ok(DEFAULT_CARRY_LIMIT)
+}
+
+/// A capacity a stat drives, at a given value of that stat.
+pub fn capacity_at(base: f64, per_point: f64, value: i64) -> f64 {
+    (base + per_point * value as f64).max(0.0)
 }
 
 // ---- writing the sheet -----------------------------------------------------
