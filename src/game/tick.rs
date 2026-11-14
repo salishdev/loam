@@ -119,7 +119,7 @@ impl Game {
         let summary = outcome.final_response.text().trim().to_owned();
         let changes: Vec<TickChange> = changes
             .into_iter()
-            .filter(|(_, applied)| *applied)
+            .filter(|(_, pending)| pending.is_none())
             .map(|(c, _)| c)
             .collect();
         self.world.log_event(
@@ -139,32 +139,41 @@ impl Game {
     }
 }
 
+/// A tick change in progress: the change so far and, until the call's
+/// result says it applied, the last event before the call.
+type Pending = (TickChange, Option<i64>);
+
 /// Collect the rooms an `apply_patch` call touches. Called once before the
-/// call runs (`output` is `None`) to record the rooms its entities are in
-/// beforehand, and once after; an applied patch becomes a [`TickChange`].
+/// call runs (`output` is `None`) to record the rooms the patch's entities
+/// are in beforehand (a move's origin isn't in the log), and once after,
+/// when an applied patch adds the rooms of everything
+/// [`World::changed_since`] the call began and becomes a [`TickChange`].
 fn track_change(
     world: &World,
     call: &ToolUse,
     output: Option<&ToolOutput>,
-    changes: &mut Vec<(TickChange, bool)>,
+    changes: &mut Vec<Pending>,
 ) {
     if call.name != "apply_patch" {
         return;
     }
-    let Ok(patch) = serde_json::from_value::<Patch>(call.input.clone()) else {
-        return;
-    };
-    let mut ids: Vec<EntityId> = patch
-        .ops
-        .iter()
-        .flat_map(op_refs)
-        .filter_map(|r| match r {
-            EntityRef::Id(id) => Some(*id),
-            EntityRef::Handle(_) => None,
-        })
-        .collect();
     match output {
         None => {
+            let Ok(patch) = serde_json::from_value::<Patch>(call.input.clone()) else {
+                return;
+            };
+            let Ok(before) = world.last_seq() else {
+                return;
+            };
+            let ids: Vec<EntityId> = patch
+                .ops
+                .iter()
+                .flat_map(op_refs)
+                .filter_map(|r| match r {
+                    EntityRef::Id(id) => Some(*id),
+                    EntityRef::Handle(_) => None,
+                })
+                .collect();
             let note = call
                 .input
                 .get("note")
@@ -172,26 +181,26 @@ fn track_change(
                 .unwrap_or_default()
                 .to_owned();
             let rooms = rooms_of(world, &ids);
-            // Pending until the call's result says it applied.
-            changes.push((TickChange { note, rooms }, false));
+            changes.push((TickChange { note, rooms }, Some(before)));
         }
         Some(output) => {
-            let Some((change, done)) = changes.last_mut().filter(|(_, done)| !done) else {
+            let Some((change, pending)) = changes.last_mut() else {
                 return;
             };
-            let ToolOutput::Ok(result) = output else {
+            let Some(before) = pending.take() else {
+                return;
+            };
+            if !matches!(output, ToolOutput::Ok(_)) {
                 changes.pop();
                 return;
-            };
-            if let Ok(v) = serde_json::from_str::<Value>(result)
-                && let Some(created) = v.get("created").and_then(Value::as_array)
-            {
-                ids.extend(created.iter().filter_map(Value::as_i64));
             }
+            let Ok(changed) = world.changed_since(before) else {
+                return;
+            };
+            let changed: Vec<EntityId> = changed.into_iter().collect();
             let mut rooms: BTreeSet<EntityId> = change.rooms.iter().copied().collect();
-            rooms.extend(rooms_of(world, &ids));
+            rooms.extend(rooms_of(world, &changed));
             change.rooms = rooms.into_iter().collect();
-            *done = true;
         }
     }
 }

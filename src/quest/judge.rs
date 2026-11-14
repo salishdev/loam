@@ -6,7 +6,7 @@ use std::fmt::Write;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{CONCERNS_REL, Quest, Status, quests, resolve, touched_since};
+use super::{CONCERNS_REL, Quest, Status, quests, resolve};
 use crate::llm::{LlmClient, Message, Model, Request, ToolDefinition};
 use crate::world::{Cascaded, EntityId, EventKind, StoreError, World};
 
@@ -89,7 +89,7 @@ pub fn judge_turn(
     input: Option<&str>,
     narration: &str,
 ) -> Result<Vec<Judgment>, StoreError> {
-    let touched = touched_since(world, turn_start)?;
+    let touched = world.changed_since(turn_start)?;
     if touched.is_empty() {
         return Ok(Vec::new());
     }

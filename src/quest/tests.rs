@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::game::Game;
 use crate::llm::{ContentBlock, Model, Response, ScriptedClient};
+use crate::world::EventKind;
 
 /// A world with a room holding a well and a bucket.
 fn world() -> (World, EntityId, EntityId, EntityId) {
@@ -86,43 +87,6 @@ fn bad_concerns_are_refused() {
     assert!(refused(reveal_goal(&mut w, id, "goal", &[id])).contains("is a quest"));
     assert!(refused(reveal_goal(&mut w, well, "goal", &[well])).contains("not a quest"));
     assert!(refused(spawn(&mut w, " ", "y", &[])).contains("title"));
-}
-
-#[test]
-fn touched_covers_every_op_and_resolves_handles() {
-    let (mut w, room, well, bucket) = world();
-    let start = w.last_seq().unwrap();
-    assert!(touched_since(&w, start).unwrap().is_empty());
-    let a = w
-        .apply_patch(&Patch::new(vec![
-            Op::Create {
-                handle: Some("rope".into()),
-                name: "rope".into(),
-                kind: "item".into(),
-                location: None,
-                props: Map::new(),
-            },
-            Op::Move {
-                entity: "rope".into(),
-                to: Some(well.into()),
-            },
-            Op::SetProp {
-                entity: bucket.into(),
-                key: "full".into(),
-                value: json!(true),
-            },
-        ]))
-        .unwrap();
-    let rope = a.created[0];
-    // A rejected patch touches nothing.
-    w.apply_patch(&Patch::new(vec![Op::Destroy {
-        entity: room.into(),
-    }]))
-    .unwrap_err();
-    let touched: Vec<_> = touched_since(&w, start).unwrap().into_iter().collect();
-    let mut want = vec![rope, well, bucket];
-    want.sort();
-    assert_eq!(touched, want);
 }
 
 #[test]

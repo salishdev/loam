@@ -1043,3 +1043,178 @@ fn entities_marked_finds_true_markers_only() {
         vec![a.handles["a"], a.handles["d"]]
     );
 }
+
+// ---- changed_since ---------------------------------------------------------
+
+/// Apply `ops` as the engine and return what `changed_since` reports for it.
+fn changed_by(w: &mut World, ops: Vec<Op>) -> Vec<EntityId> {
+    let before = w.last_seq().unwrap();
+    w.apply_engine_patch(&Patch::new(ops)).unwrap();
+    w.changed_since(before).unwrap().into_iter().collect()
+}
+
+#[test]
+fn changed_since_nothing_is_empty() {
+    let (w, ..) = seeded();
+    assert!(w.changed_since(w.last_seq().unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn a_create_changes_the_new_entity_and_its_location() {
+    let (mut w, cellar, chest, key) = seeded();
+    let before = w.last_seq().unwrap();
+    let a = w
+        .apply_patch(&Patch::new(vec![create(
+            "coin",
+            "Coin",
+            "item",
+            Some(chest.into()),
+        )]))
+        .unwrap();
+    let changed: Vec<_> = w.changed_since(before).unwrap().into_iter().collect();
+    assert_eq!(changed, vec![chest, a.created[0]]);
+    // Neither the chest's room nor its other contents.
+    assert!(!changed.contains(&cellar) && !changed.contains(&key));
+    // A top-level create changes only itself.
+    let before = w.last_seq().unwrap();
+    let b = w
+        .apply_patch(&Patch::new(vec![create("cloud", "Cloud", "item", None)]))
+        .unwrap();
+    let changed: Vec<_> = w.changed_since(before).unwrap().into_iter().collect();
+    assert_eq!(changed, vec![b.created[0]]);
+}
+
+#[test]
+fn a_move_changes_the_entity_and_its_destination_not_its_origin() {
+    let (mut w, cellar, chest, key) = seeded();
+    let changed = changed_by(&mut w, vec![mv(key, Some(cellar.into()))]);
+    assert_eq!(changed, vec![cellar, key]);
+    assert!(!changed.contains(&chest));
+}
+
+#[test]
+fn prop_and_rename_ops_change_only_their_entity() {
+    let (mut w, _, _, key) = seeded();
+    let set = Op::SetProp {
+        entity: key.into(),
+        key: "rusty".into(),
+        value: json!(true),
+    };
+    assert_eq!(changed_by(&mut w, vec![set]), vec![key]);
+    let remove = Op::RemoveProp {
+        entity: key.into(),
+        key: "rusty".into(),
+    };
+    assert_eq!(changed_by(&mut w, vec![remove]), vec![key]);
+    let rename = Op::Rename {
+        entity: key.into(),
+        name: "Rusty key".into(),
+    };
+    assert_eq!(changed_by(&mut w, vec![rename]), vec![key]);
+}
+
+#[test]
+fn a_destroy_changes_the_destroyed_entity() {
+    let (mut w, _, _, key) = seeded();
+    assert_eq!(
+        changed_by(&mut w, vec![Op::Destroy { entity: key.into() }]),
+        vec![key]
+    );
+}
+
+#[test]
+fn relate_and_unrelate_change_both_ends() {
+    let (mut w, cellar, chest, _) = seeded();
+    assert_eq!(
+        changed_by(&mut w, vec![relate(chest, "guards", cellar)]),
+        vec![cellar, chest]
+    );
+    assert_eq!(
+        changed_by(&mut w, vec![unrelate(chest, "guards", cellar)]),
+        vec![cellar, chest]
+    );
+}
+
+#[test]
+fn an_engine_owned_relation_changes_only_its_subject() {
+    let (mut w, _, chest, key) = seeded();
+    assert_eq!(
+        changed_by(&mut w, vec![relate(chest, "_watches", key)]),
+        vec![chest]
+    );
+    assert_eq!(
+        changed_by(&mut w, vec![unrelate(chest, "_watches", key)]),
+        vec![chest]
+    );
+}
+
+#[test]
+fn a_destroy_changes_both_ends_of_every_cascaded_relation() {
+    let (mut w, cellar, chest, key) = seeded();
+    let a = w
+        .apply_engine_patch(&Patch::new(vec![
+            create("hound", "Hound", "npc", None),
+            relate(key, "opens", chest),
+            relate("hound", "wants", key),
+            relate(cellar, "_watches", key),
+        ]))
+        .unwrap();
+    let hound = a.handles["hound"];
+    let mut want = vec![cellar, chest, key, hound];
+    want.sort();
+    assert_eq!(
+        changed_by(&mut w, vec![Op::Destroy { entity: key.into() }]),
+        want
+    );
+}
+
+#[test]
+fn changed_since_resolves_handles_and_spans_patches_after_seq_only() {
+    let (mut w, cellar, chest, key) = seeded();
+    let start = w.last_seq().unwrap();
+    let a = w
+        .apply_patch(&Patch::new(vec![
+            create("rope", "Rope", "item", None),
+            mv("rope", Some(chest.into())),
+        ]))
+        .unwrap();
+    let rope = a.created[0];
+    let mid = w.last_seq().unwrap();
+    rejected(
+        &mut w,
+        vec![Op::Destroy {
+            entity: cellar.into(),
+        }],
+    );
+    w.apply_patch(&Patch::new(vec![mv(key, Some(cellar.into()))]))
+        .unwrap();
+    let all: Vec<_> = w.changed_since(start).unwrap().into_iter().collect();
+    let mut want = vec![rope, chest, key, cellar];
+    want.sort();
+    assert_eq!(all, want);
+    let later: Vec<_> = w.changed_since(mid).unwrap().into_iter().collect();
+    assert_eq!(later, vec![cellar, key]);
+}
+
+#[test]
+fn a_rejected_patch_changes_nothing() {
+    let (mut w, cellar, _, _) = seeded();
+    let before = w.last_seq().unwrap();
+    rejected(
+        &mut w,
+        vec![Op::Destroy {
+            entity: cellar.into(),
+        }],
+    );
+    assert!(w.last_seq().unwrap() > before);
+    assert!(w.changed_since(before).unwrap().is_empty());
+}
+
+#[test]
+fn other_events_change_nothing() {
+    let (w, ..) = seeded();
+    let before = w.last_seq().unwrap();
+    w.log_event(EventKind::Input, &json!({"text": "look"}))
+        .unwrap();
+    assert!(w.changed_since(before).unwrap().is_empty());
+}

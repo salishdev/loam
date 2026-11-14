@@ -4,7 +4,8 @@
 //! suggests one ([`spawn`]), records the goal with the entities it concerns
 //! once the goal reveals itself ([`reveal_goal`]), and may raise the stakes
 //! later ([`escalate`]). It never marks a quest done. After each turn the
-//! engine finds the entities the turn's patches touched ([`touched_since`])
+//! engine finds the entities the turn's patches changed
+//! ([`World::changed_since`](crate::world::World::changed_since))
 //! and asks the judge ([`judge_turn`]) about each active quest that concerns
 //! one of them, and only those.
 //!
@@ -32,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
 use crate::world::{
-    self, ApplyError, Component, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
+    self, ApplyError, Component, EntityId, EntityRef, Op, Patch, StoreError, World,
 };
 
 /// Kind of quest entities.
@@ -351,21 +352,6 @@ fn resolve(world: &mut World, id: EntityId, status: Status, reason: &str) -> Res
     state.resolution = Some(reason.to_owned());
     engine_patch(world, vec![world::set_op(id, &state)])?;
     Ok(())
-}
-
-/// Entities touched by the patches applied after event `after`: created,
-/// moved (and where to), given or stripped of props, renamed or destroyed.
-/// A move's origin isn't recorded in the log, so it doesn't count.
-pub fn touched_since(world: &World, after: i64) -> Result<BTreeSet<EntityId>, StoreError> {
-    let mut touched = BTreeSet::new();
-    for event in world.events_since(after)? {
-        if event.kind == EventKind::Patch {
-            for (_, ids) in event.patch_touches()? {
-                touched.extend(ids);
-            }
-        }
-    }
-    Ok(touched)
 }
 
 /// How many resolved quests the director's slice still mentions.

@@ -17,7 +17,7 @@ pub use patch::{EntityId, EntityRef, Op, Patch};
 pub use relation::{EXIT_REL, Relation};
 pub use replay::{ReplayError, WorldState};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -346,6 +346,35 @@ impl World {
     /// All events in order.
     pub fn events(&self) -> Result<Vec<Event>, StoreError> {
         self.events_since(0)
+    }
+
+    /// Every entity the patches applied after event `after` changed: each
+    /// id an op names ([`Event::patch_touches`]: created and where, moved
+    /// and where to, given or stripped of a prop, renamed, destroyed, either
+    /// end of a relation made or removed, only the subject of an
+    /// engine-owned one) plus both ends of every relation a destroy cascaded. Derived from the log alone, so replay and fork need
+    /// nothing. Rejected patches change nothing; a container doesn't count
+    /// as changed because something inside it did.
+    pub fn changed_since(&self, after: i64) -> Result<BTreeSet<EntityId>, StoreError> {
+        let mut changed = BTreeSet::new();
+        for event in self.events_since(after)? {
+            if event.kind != EventKind::Patch {
+                continue;
+            }
+            for (_, ids) in event.patch_touches()? {
+                changed.extend(ids);
+            }
+            if let Some(cascaded) = event.payload.get("cascaded") {
+                let cascaded: Vec<Cascaded> =
+                    serde_json::from_value(cascaded.clone()).map_err(|e| {
+                        StoreError::Corrupt(format!("event {}: bad cascaded list: {e}", event.seq))
+                    })?;
+                for c in cascaded {
+                    changed.extend([c.relation.subject, c.relation.object]);
+                }
+            }
+        }
+        Ok(changed)
     }
 
     /// Events with `seq > after`, in order.
