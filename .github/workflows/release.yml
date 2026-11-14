@@ -1,0 +1,124 @@
+name: Release
+
+# Push a tag such as v0.1.0 (matching Cargo.toml's version) to build and publish.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04 # older glibc, so the binary runs on more distros
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      # Signing and notarization run only when these secrets are set; otherwise
+      # the macOS binary ships unsigned.
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo test --locked --target "$TARGET"
+      - run: cargo build --locked --release --target "$TARGET"
+
+      - name: Sign (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12_BASE64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          kc_pass=$(uuidgen)
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          codesign --force --timestamp --options runtime \
+            --identifier dev.salishdev.loam \
+            --keychain "$keychain" \
+            --sign "$MACOS_SIGN_IDENTITY" \
+            "target/$TARGET/release/loam"
+          codesign --verify --strict --verbose=2 "target/$TARGET/release/loam"
+
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12_BASE64 != '' && env.APPLE_API_KEY_P8_BASE64 != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$key"
+          # A bare binary can't be stapled; Gatekeeper looks the ticket up online.
+          ditto -c -k --keepParent "target/$TARGET/release/loam" "$RUNNER_TEMP/loam-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/loam-notarize.zip" \
+            --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 30m
+          rm "$key"
+
+      - name: Remove the signing keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="loam-$GITHUB_REF_NAME-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/loam" README.md LICENSE "dist/$name/"
+          cp -R seeds "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

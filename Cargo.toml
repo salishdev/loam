@@ -2,6 +2,8 @@
 name = "loam"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/salishdev/loam"
 
 [dependencies]
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
