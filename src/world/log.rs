@@ -1,6 +1,8 @@
 //! Append-only event log: the source of truth for replay and `:why`.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use super::{EntityId, EntityRef, Op, Patch, StoreError};
 
 /// What kind of thing an event records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,4 +69,56 @@ pub struct Event {
     pub payload: Value,
     /// UTC timestamp, RFC 3339 with milliseconds.
     pub at: String,
+}
+
+impl Event {
+    /// For a `patch` or `patch_rejected` event, each op with the entities it
+    /// touched: created (and where), moved (and where to), given or stripped
+    /// of props, renamed or destroyed. A move's origin isn't logged, so it
+    /// doesn't count. A rejected patch created nothing, so only ops naming
+    /// existing ids count there. Other kinds of event touch nothing.
+    pub fn patch_touches(&self) -> Result<Vec<(Op, Vec<EntityId>)>, StoreError> {
+        if !matches!(self.kind, EventKind::Patch | EventKind::PatchRejected) {
+            return Ok(Vec::new());
+        }
+        let corrupt = |what: String| StoreError::Corrupt(format!("event {}: {what}", self.seq));
+        let patch: Patch = serde_json::from_value(self.payload["patch"].clone())
+            .map_err(|e| corrupt(format!("bad patch: {e}")))?;
+        let created: Vec<EntityId> = match self.payload.get("created") {
+            Some(c) => serde_json::from_value(c.clone())
+                .map_err(|e| corrupt(format!("bad created list: {e}")))?,
+            None => Vec::new(),
+        };
+        let handles: Map<String, Value> = self.payload["handles"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let id_of = |r: &EntityRef| match r {
+            EntityRef::Id(id) => Some(*id),
+            EntityRef::Handle(h) => handles.get(h).and_then(Value::as_i64),
+        };
+        let mut created = created.into_iter();
+        Ok(patch
+            .ops
+            .into_iter()
+            .map(|op| {
+                let ids: Vec<EntityId> = match &op {
+                    Op::Create { location, .. } => created
+                        .next()
+                        .into_iter()
+                        .chain(location.as_ref().and_then(id_of))
+                        .collect(),
+                    Op::Move { entity, to } => id_of(entity)
+                        .into_iter()
+                        .chain(to.as_ref().and_then(id_of))
+                        .collect(),
+                    Op::SetProp { entity, .. }
+                    | Op::RemoveProp { entity, .. }
+                    | Op::Rename { entity, .. }
+                    | Op::Destroy { entity } => id_of(entity).into_iter().collect(),
+                };
+                (op, ids)
+            })
+            .collect())
+    }
 }

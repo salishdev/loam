@@ -2,13 +2,15 @@
 //!
 //! A new save asks for a seed prompt (ended by a blank line), builds the
 //! world bible and opens the story; an existing save resumes where it was.
-//! A world tick runs between turns when due. `:quests` lists quests;
-//! `:tick` forces a world tick; `:quit` exits.
+//! A world tick runs between turns when due. Lines starting with `:` are
+//! commands (`:help` lists them); the inspector commands read only the
+//! store and its log, never the LLM.
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use loam::game::{Game, GameError, TickOutcome};
+use loam::inspect;
 use loam::llm::AnthropicClient;
 use loam::quest::Verdict;
 use loam::world::World;
@@ -66,18 +68,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let Some(line) = lines.next() else { break };
         let input = line?;
         let input = input.trim();
-        match input {
-            "" => continue,
-            ":quit" | ":q" => break,
-            ":quests" => {
-                print_quests(&game);
-                continue;
+        if input.is_empty() {
+            continue;
+        }
+        if input.starts_with(':') {
+            let (cmd, arg) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+            let arg = arg.trim();
+            let world = game.world();
+            match cmd {
+                ":quit" | ":q" => break,
+                ":tick" => report_tick(game.tick(&client)),
+                ":rules" => show(cmd, inspect::rules(world)),
+                ":glossary" => show(cmd, inspect::glossary(world)),
+                ":why" => show(cmd, inspect::why(world, arg)),
+                ":quests" => show(cmd, inspect::quests(world)),
+                ":stats" => show(cmd, inspect::stats(world)),
+                ":fork" => fork(world, arg),
+                ":help" => println!("{HELP}"),
+                _ => println!("Unknown command {cmd}. {HELP}"),
             }
-            ":tick" => {
-                report_tick(game.tick(&client));
-                continue;
-            }
-            _ => {}
+            continue;
         }
         println!();
         match game.turn(&client, input, &mut stream) {
@@ -109,26 +119,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_quests(game: &Game) {
-    let quests = match game.quests() {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("[quests unavailable: {e}]");
+const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :quests, :stats, \
+:fork <event> <path>, :tick, :quit";
+
+/// Print an inspector report; a failure leaves the save usable.
+fn show(cmd: &str, report: Result<String, loam::world::StoreError>) {
+    match report {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("[{cmd} unavailable: {e}]"),
+    }
+}
+
+/// `:fork <event> <path>`: branch the session at an event into a new save.
+fn fork(world: &World, arg: &str) {
+    let mut parts = arg.split_whitespace();
+    let (Some(Ok(at)), Some(path), None) = (
+        parts
+            .next()
+            .map(|n| n.trim_start_matches('#').parse::<i64>()),
+        parts.next(),
+        parts.next(),
+    ) else {
+        println!("Usage: :fork <event> <path>");
+        return;
+    };
+    // Checked first so a bad event number doesn't leave an empty save behind.
+    match world.last_seq() {
+        Ok(last) if (0..=last).contains(&at) => {}
+        Ok(last) => {
+            println!("No event #{at}: the log ends at #{last}.");
             return;
         }
-    };
-    if quests.is_empty() {
-        println!("No quests yet.");
+        Err(e) => {
+            eprintln!("[fork failed: {e}]");
+            return;
+        }
     }
-    for q in quests {
-        println!("#{} {} [{}]", q.id, q.title, q.status.as_str());
-        println!("  {}", q.goal.as_deref().unwrap_or(&q.hook));
-        for d in &q.developments {
-            println!("  - {d}");
-        }
-        if let Some(r) = &q.resolution {
-            println!("  => {r}");
-        }
+    match world.fork(at, path) {
+        Ok(_) => println!("Forked at event #{at} into {path}; run `loam {path}` to play it."),
+        Err(e) => eprintln!("[fork failed: {e}]"),
     }
 }
 

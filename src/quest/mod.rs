@@ -382,37 +382,9 @@ fn resolve(world: &mut World, id: EntityId, status: Status, reason: &str) -> Res
 pub fn touched_since(world: &World, after: i64) -> Result<BTreeSet<EntityId>, StoreError> {
     let mut touched = BTreeSet::new();
     for event in world.events_since(after)? {
-        if event.kind != EventKind::Patch {
-            continue;
-        }
-        let corrupt = |what: &str| StoreError::Corrupt(format!("event {}: {what}", event.seq));
-        let patch: Patch = serde_json::from_value(event.payload["patch"].clone())
-            .map_err(|e| corrupt(&format!("bad patch: {e}")))?;
-        let created: Vec<EntityId> = serde_json::from_value(event.payload["created"].clone())
-            .map_err(|e| corrupt(&format!("bad created list: {e}")))?;
-        let handles: Map<String, Value> = event.payload["handles"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let id_of = |r: &EntityRef| match r {
-            EntityRef::Id(id) => Some(*id),
-            EntityRef::Handle(h) => handles.get(h).and_then(Value::as_i64),
-        };
-        let mut created = created.into_iter();
-        for op in &patch.ops {
-            match op {
-                Op::Create { location, .. } => {
-                    touched.extend(created.next());
-                    touched.extend(location.as_ref().and_then(id_of));
-                }
-                Op::Move { entity, to } => {
-                    touched.extend(id_of(entity));
-                    touched.extend(to.as_ref().and_then(id_of));
-                }
-                Op::SetProp { entity, .. }
-                | Op::RemoveProp { entity, .. }
-                | Op::Rename { entity, .. }
-                | Op::Destroy { entity } => touched.extend(id_of(entity)),
+        if event.kind == EventKind::Patch {
+            for (_, ids) in event.patch_touches()? {
+                touched.extend(ids);
             }
         }
     }
