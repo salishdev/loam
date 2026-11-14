@@ -400,7 +400,7 @@ fn create_room_def() -> ToolDefinition {
                     "items": {"type": "object", "properties": {
                         "handle": {"type": "string", "description": "Name to put other contents inside this one."},
                         "name": {"type": "string"},
-                        "kind": {"type": "string", "description": "e.g. item, npc, feature, container"},
+                        "kind": {"type": "string", "description": "Free-form, e.g. item, feature, container. Use npc for any being that can move, speak or act on its own (people, animals, monsters, spirits); put its role or species in props."},
                         "inside": {"type": "string", "description": "handle of a container listed earlier"},
                         "props": {"type": "object"}
                     }, "required": ["name", "kind"]}
@@ -675,7 +675,8 @@ fn patch_schema() -> Value {
             "properties": {
                 "op": {"type": "string", "enum": ["create", "move", "set_prop", "remove_prop", "rename", "destroy"]},
                 "entity": r, "to": r, "location": r,
-                "handle": {"type": "string"}, "name": {"type": "string"}, "kind": {"type": "string"},
+                "handle": {"type": "string"}, "name": {"type": "string"},
+                "kind": {"type": "string", "description": "create only. Free-form, e.g. item, feature, container. Use npc for any being that can move, speak or act on its own (people, animals, monsters, spirits); put its role or species in props."},
                 "key": {"type": "string"}, "value": {}, "props": {"type": "object"}
             },
             "required": ["op"]
