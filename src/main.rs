@@ -119,6 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":glossary" => show(cmd, inspect::glossary(world)),
                 ":why" => show(cmd, inspect::why(world, arg)),
                 ":quests" => show(cmd, inspect::quests(world)),
+                ":npcs" => show(cmd, inspect::npcs(world)),
                 ":stats" => show(cmd, inspect::stats(world)),
                 ":fork" => fork(world, arg),
                 ":help" => println!("{HELP}"),
@@ -267,7 +268,7 @@ fn list_seeds(dirs: &[PathBuf]) -> Vec<String> {
     names
 }
 
-const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :quests, :stats, \
+const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :quests, :npcs, :stats, \
 :fork <event> <path>, :tick, :quit";
 
 /// Print an inspector report; a failure leaves the save usable.

@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use crate::llm::{Effort, LlmClient, Message, Model, Request, ToolOutput, ToolUse};
 use crate::world::{EntityId, EntityRef, Event, EventKind, Patch, StoreError, World};
 
+use super::npcs::{enclosing_room, npcs, player_room};
 use super::tools::{Phase, definitions, op_refs};
-use super::{Game, GameError, ROOM_KIND, bible_id, player_id};
+use super::{Game, GameError, ROOM_KIND, bible_id};
 
 /// A tick is due after this many player turns without one.
 pub const TICK_EVERY: usize = 5;
@@ -206,27 +207,6 @@ fn rooms_of(world: &World, ids: &[EntityId]) -> Vec<EntityId> {
     rooms.into_iter().collect()
 }
 
-fn enclosing_room(world: &World, id: EntityId) -> Result<Option<EntityId>, StoreError> {
-    let mut at = Some(id);
-    while let Some(here) = at {
-        let Some(e) = world.entity(here)? else {
-            return Ok(None);
-        };
-        if e.kind == ROOM_KIND {
-            return Ok(Some(e.id));
-        }
-        at = e.location;
-    }
-    Ok(None)
-}
-
-fn player_room(world: &World) -> Result<Option<EntityId>, StoreError> {
-    Ok(match player_id(world)? {
-        Some(p) => world.entity(p)?.and_then(|p| p.location),
-        None => None,
-    })
-}
-
 fn last_tick(world: &World) -> Result<Option<Event>, StoreError> {
     Ok(world
         .search_events("", &[EventKind::Tick], 1)?
@@ -314,18 +294,17 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         writeln!(out, "Other explored rooms: {}", rooms.join("; ")).unwrap();
     }
 
-    let mut npcs = Vec::new();
-    for id in world.entities_of_kind("npc")? {
-        let Some(npc) = world.entity(id)? else {
-            continue;
-        };
-        let at = match enclosing_room(world, id)? {
-            Some(r) if Some(r) == here => "with the player".to_owned(),
-            Some(r) => format!("in #{r}"),
-            None => "nowhere in particular".to_owned(),
-        };
-        npcs.push(format!("#{} {} {at}", npc.id, npc.name));
-    }
+    let npcs: Vec<String> = npcs(world)?
+        .into_iter()
+        .map(|s| {
+            let at = match s.room {
+                Some(_) if s.with_player => "with the player".to_owned(),
+                Some(r) => format!("in #{r}"),
+                None => "nowhere in particular".to_owned(),
+            };
+            format!("#{} {} {at}", s.npc.id, s.npc.name)
+        })
+        .collect();
     if !npcs.is_empty() {
         writeln!(out, "NPCs: {}", npcs.join("; ")).unwrap();
     }
@@ -370,4 +349,37 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
     }
     writeln!(out, "Advance the off-screen world, then summarise.").unwrap();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::world::Op;
+
+    #[test]
+    fn tick_slice_lists_npcs_and_where_they_are() {
+        let mut world = World::open_in_memory().unwrap();
+        let ops: Vec<Op> = serde_json::from_value(json!([
+            {"op": "create", "handle": "hall", "name": "Hall", "kind": "room"},
+            {"op": "create", "handle": "cellar", "name": "Cellar", "kind": "room"},
+            {"op": "create", "handle": "you", "name": "you", "kind": "player", "location": "hall"},
+            {"op": "create", "handle": "rat", "name": "Rat", "kind": "npc", "location": "hall"},
+            {"op": "create", "handle": "hal", "name": "Hal", "kind": "npc", "location": "cellar"},
+            {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "npc"}
+        ]))
+        .unwrap();
+        let a = world.apply_engine_patch(&Patch::new(ops)).unwrap();
+        let h = |n: &str| a.handles[n];
+        let slice = tick_slice(&world).unwrap();
+        let want = format!(
+            "NPCs: #{} Rat with the player; #{} Hal in #{}; #{} Ghost nowhere in particular\n",
+            h("rat"),
+            h("hal"),
+            h("cellar"),
+            h("ghost")
+        );
+        assert!(slice.contains(&want), "{slice}");
+    }
 }

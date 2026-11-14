@@ -1,4 +1,5 @@
-//! The REPL inspector: `:rules`, `:glossary`, `:why`, `:quests`, `:stats`.
+//! The REPL inspector: `:rules`, `:glossary`, `:why`, `:quests`, `:npcs`,
+//! `:stats`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -11,6 +12,7 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
+use crate::game;
 use crate::glossary;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
@@ -95,6 +97,54 @@ pub fn quests(world: &World) -> Result<String, StoreError> {
         }
         if let Some(r) = &q.resolution {
             writeln!(out, "  => {r}").unwrap();
+        }
+    }
+    Ok(trim_end(out))
+}
+
+/// Every NPC entity with where it is and its props, then the bible's NPCs
+/// that have no entity yet. Bible NPCs match entities by name, ignoring
+/// case.
+pub fn npcs(world: &World) -> Result<String, StoreError> {
+    let sightings = game::npcs(world)?;
+    let bible = game::bible_npc_names(world)?;
+    if sightings.is_empty() && bible.is_empty() {
+        return Ok("No NPCs yet.".into());
+    }
+    let same = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    let mut out = String::new();
+    for s in &sightings {
+        let n = &s.npc;
+        let in_bible = if bible.iter().any(|b| same(b, &n.name)) {
+            " [bible]"
+        } else {
+            ""
+        };
+        let at = match s.room {
+            Some(r) => {
+                let name = world.entity(r)?.map(|e| e.name).unwrap_or_default();
+                let with = if s.with_player {
+                    "with the player, "
+                } else {
+                    ""
+                };
+                format!("{with}in #{r} {name}").trim_end().to_owned()
+            }
+            None => "nowhere".to_owned(),
+        };
+        writeln!(out, "#{} {}{in_bible}: {at}", n.id, n.name).unwrap();
+        for (k, v) in &n.props {
+            writeln!(out, "  {k} = {}", clip_value(v)).unwrap();
+        }
+    }
+    let missing: Vec<&String> = bible
+        .iter()
+        .filter(|b| !sightings.iter().any(|s| same(b, &s.npc.name)))
+        .collect();
+    if !missing.is_empty() {
+        writeln!(out, "In the bible, not yet in the world:").unwrap();
+        for name in missing {
+            writeln!(out, "  {name}").unwrap();
         }
     }
     Ok(trim_end(out))

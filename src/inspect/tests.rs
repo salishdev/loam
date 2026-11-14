@@ -369,3 +369,88 @@ fn stats_says_when_there_is_no_sheet() {
     let out = stats(&f.world).unwrap();
     assert!(out.starts_with("Stat sheet: none yet\nEvents: "), "{out}");
 }
+
+/// The fixture plus a cellar, a bible naming three NPCs, and NPCs in the
+/// cellar, in the hall (one inside a cart), and nowhere.
+fn with_npcs() -> (Fixture, EntityId) {
+    let mut f = fixture();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "create", "handle": "bible", "name": "bible", "kind": "bible",
+         "props": {"npcs": [
+             {"name": "Old Hal", "description": "The miller."},
+             {"name": "Brother Ash", "description": "Last monk."},
+             "Wren"
+         ]}},
+        {"op": "create", "handle": "cellar", "name": "Cellar", "kind": "room"},
+        {"op": "create", "handle": "hal", "name": "old hal", "kind": "npc", "location": "cellar",
+         "props": {"mood": "wary"}},
+        {"op": "create", "handle": "cart", "name": "cart", "kind": "item", "location": f.scope.room},
+        {"op": "create", "handle": "rat", "name": "Rat", "kind": "npc", "location": "cart"},
+        {"op": "create", "handle": "ghost", "name": "Ghost", "kind": "npc"}
+    ]))
+    .unwrap();
+    let a = f.world.apply_engine_patch(&Patch::new(ops)).unwrap();
+    let cellar = a.handles["cellar"];
+    (f, cellar)
+}
+
+#[test]
+fn npcs_lists_each_npc_with_where_it_is_and_its_props() {
+    let (f, cellar) = with_npcs();
+    let out = npcs(&f.world).unwrap();
+    let hall = f.scope.room;
+    let line = |name: &str| {
+        out.lines()
+            .find(|l| l.contains(name) && l.starts_with('#'))
+            .unwrap_or_else(|| panic!("no line for {name}: {out}"))
+            .to_owned()
+    };
+    // In another room, marked as a bible NPC despite the case difference.
+    assert!(
+        line("old hal").ends_with(&format!("old hal [bible]: in #{cellar} Cellar")),
+        "{out}"
+    );
+    assert!(out.contains("\n  mood = \"wary\""), "{out}");
+    // With the player, even inside a container.
+    assert!(
+        line("Rat").ends_with(&format!("Rat: with the player, in #{hall} Hall")),
+        "{out}"
+    );
+    // Nowhere.
+    assert!(line("Ghost").ends_with("Ghost: nowhere"), "{out}");
+    // Bible NPCs with no entity yet; Old Hal is in the world.
+    let tail = out
+        .split("In the bible, not yet in the world:")
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        tail.trim().lines().map(str::trim).collect::<Vec<_>>(),
+        ["Brother Ash", "Wren"]
+    );
+    // The engine's other entities aren't listed.
+    assert!(!out.contains("crowbar") && !out.contains("you"), "{out}");
+}
+
+#[test]
+fn npcs_says_when_there_are_none() {
+    let f = fixture();
+    assert_eq!(npcs(&f.world).unwrap(), "No NPCs yet.");
+}
+
+#[test]
+fn npc_sightings_are_shared_with_the_tick() {
+    let (f, cellar) = with_npcs();
+    let s = crate::game::npcs(&f.world).unwrap();
+    let names: Vec<_> = s
+        .iter()
+        .map(|s| (s.npc.name.as_str(), s.room, s.with_player))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("old hal", Some(cellar), false),
+            ("Rat", Some(f.scope.room), true),
+            ("Ghost", None, false)
+        ]
+    );
+}

@@ -7,6 +7,7 @@
 
 mod context;
 mod fast_path;
+mod npcs;
 mod tick;
 mod tools;
 
@@ -14,6 +15,7 @@ mod tools;
 mod tests;
 
 pub use context::local_slice;
+pub use npcs::{NPC_KIND, NpcSighting, bible_npc_names, npcs};
 pub use tick::{ROOM_CHANGE_GAP, TICK_EVERY, TickChange, TickOutcome};
 pub use tools::Phase;
 
