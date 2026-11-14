@@ -22,7 +22,8 @@ tool call.";
 
 const NARRATOR_SYSTEM: &str = "You narrate a text adventure. The engine has already resolved \
 the player's action by a known rule; describe exactly that outcome, nothing more: don't \
-invent other changes to the world. Second person, present tense, in the world's tone, one \
+invent other changes to the world. If a check was rolled, the outcome given is the one its \
+result produced. Second person, present tense, in the world's tone, one \
 or two short paragraphs. Output only the prose.";
 
 /// Most tokens the interpreter may spend (thinking included).
@@ -34,7 +35,7 @@ const NARRATOR_MAX_TOKENS: u32 = 4_000;
 #[derive(Debug)]
 pub(crate) enum Verdict {
     /// Exactly one rule applies cleanly.
-    Apply { rule: Rule, bindings: Bindings },
+    Apply { rule: Box<Rule>, bindings: Bindings },
     /// The director decides; the note (possibly empty) says why.
     Escalate(String),
 }
@@ -86,7 +87,7 @@ pub(crate) fn interpret(
     slice: &str,
     input: &str,
 ) -> Result<(Verdict, usize), GameError> {
-    let active = rules::active(world)?;
+    let active = rules::active_world(world)?;
     if active.is_empty() {
         return Ok((Verdict::Escalate(String::new()), 0));
     }
@@ -177,7 +178,7 @@ fn decide(
         1 if interp.clean => {
             let (rule, bindings) = applicable.pop().unwrap();
             Verdict::Apply {
-                rule: rule.clone(),
+                rule: Box::new(rule.clone()),
                 bindings,
             }
         }
@@ -248,8 +249,32 @@ pub(crate) fn narrate(
     let mut prompt =
         format!("Tone: {tone}\nScene before the action:\n{slice}\nPlayer input: {input}\n");
     writeln!(prompt, "Resolved by rule: {}", rule.def.name).unwrap();
-    if !rule.def.outcome.is_empty() {
-        writeln!(prompt, "Outcome: {}", rule.def.outcome).unwrap();
+    if let Some(roll) = &application.roll {
+        writeln!(
+            prompt,
+            "Check: {} d20 {} + {} = {} against {}: {}",
+            roll.stat,
+            roll.die,
+            roll.value,
+            roll.total,
+            roll.difficulty,
+            json!(roll.result)
+        )
+        .unwrap();
+    }
+    if !application.outcome.is_empty() {
+        writeln!(prompt, "Outcome: {}", application.outcome).unwrap();
+    }
+    for c in &application.stats.changed {
+        writeln!(prompt, "Stat: {} {} -> {}", c.stat, c.from, c.to).unwrap();
+    }
+    for t in &application.stats.fired {
+        writeln!(
+            prompt,
+            "Threshold fired ({}): {} (a setback; the game goes on)",
+            t.name, t.outcome
+        )
+        .unwrap();
     }
     writeln!(prompt, "Engine changes: {}", json!(application.patch.ops)).unwrap();
     writeln!(prompt, "Involved now:").unwrap();

@@ -148,7 +148,7 @@ fn director_patches_cannot_touch_quests() {
 
 fn begun() -> (Game, ScriptedClient) {
     let client = ScriptedClient::new([
-        Response::canned_tool_use(
+        crate::stats::with_sample_sheet(Response::canned_tool_use(
             "b1",
             "write_bible",
             json!({
@@ -158,7 +158,7 @@ fn begun() -> (Game, ScriptedClient) {
                 "npcs": [{"name": "Old Hal", "description": "The miller."}],
                 "secrets": [{"name": "Spring", "description": "Under the well."}]
             }),
-        ),
+        )),
         Response::canned_text(""),
         Response::canned_tool_use(
             "r1",

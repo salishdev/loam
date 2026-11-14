@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::glossary;
+use crate::stats::{self, Changes, CheckResult, Roll, StatHook};
 use crate::world::{
     Applied, ApplyError, ENGINE_PROP_PREFIX, Entity, EntityId, EntityRef, EventKind, Op, Patch,
     StoreError, World,
@@ -120,6 +121,47 @@ pub struct RuleDef {
     /// What happens, for the narrator.
     #[serde(default)]
     pub outcome: String,
+    /// Stat changes applied after the effects. A world rule may only lower
+    /// stats: they grow through their advancement rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjust: Vec<StatDelta>,
+    /// A dice check rolled once the conditions hold. On success the
+    /// effects, `adjust` and `outcome` above apply; on a partial or a
+    /// failure, that branch's do instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<RuleCheck>,
+}
+
+/// A change to one stat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatDelta {
+    pub stat: String,
+    pub by: i64,
+}
+
+/// A check a rule embeds: `check(stat, difficulty)` decides which
+/// consequence applies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleCheck {
+    pub stat: String,
+    pub difficulty: i64,
+    /// What a partial success does; nothing when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<Branch>,
+    /// What a failure does; nothing when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Branch>,
+}
+
+/// The consequence of one check result other than success.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Branch {
+    #[serde(default)]
+    pub effects: Vec<Op>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adjust: Vec<StatDelta>,
+    #[serde(default)]
+    pub outcome: String,
 }
 
 /// A stored rule.
@@ -130,6 +172,9 @@ pub struct Rule {
     #[serde(flatten)]
     pub def: RuleDef,
     pub class: RuleClass,
+    /// What a stat rule governs; `None` for world rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<StatHook>,
     pub version: u32,
     pub status: RuleStatus,
 }
@@ -141,7 +186,7 @@ impl Rule {
 
     /// One line for prompts and listings.
     pub fn summary(&self) -> Value {
-        json!({
+        let mut v = json!({
             "id": self.id,
             "name": self.def.name,
             "trigger": self.def.trigger,
@@ -149,7 +194,14 @@ impl Rule {
             "conditions": self.def.conditions,
             "class": self.class,
             "version": self.version,
-        })
+        });
+        if let Some(hook) = &self.hook {
+            v["stat"] = json!(hook);
+        }
+        if let Some(check) = &self.def.check {
+            v["check"] = json!({"stat": check.stat, "difficulty": check.difficulty});
+        }
+        v
     }
 }
 
@@ -185,15 +237,48 @@ pub fn validate(def: &RuleDef) -> Result<(), String> {
             return Err(format!("prop {prop:?} is engine-owned"));
         }
     }
+    validate_effects(&def.effects, &known, "effect")?;
+    validate_deltas(&def.adjust)?;
+    if let Some(check) = &def.check {
+        if check.stat.trim().is_empty() {
+            return Err("a check needs a stat".into());
+        }
+        for (label, branch) in [("partial", &check.partial), ("failure", &check.failure)] {
+            if let Some(b) = branch {
+                validate_effects(&b.effects, &known, &format!("{label} effect"))?;
+                validate_deltas(&b.adjust)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_deltas(deltas: &[StatDelta]) -> Result<(), String> {
+    for d in deltas {
+        if d.stat.trim().is_empty() {
+            return Err("a stat change needs a stat".into());
+        }
+        if d.by == 0 {
+            return Err(format!("a change to {:?} by 0 does nothing", d.stat));
+        }
+    }
+    Ok(())
+}
+
+fn validate_effects(
+    effects: &[Op],
+    known: &dyn Fn(&str) -> bool,
+    what: &str,
+) -> Result<(), String> {
     let mut created: HashSet<&str> = HashSet::new();
-    for (i, op) in def.effects.iter().enumerate() {
+    for (i, op) in effects.iter().enumerate() {
         for r in op_refs(op) {
             if let EntityRef::Handle(h) = r
                 && !known(h)
                 && !created.contains(h.as_str())
             {
                 return Err(format!(
-                    "effect {i}: {r} is neither a role nor created by an earlier effect"
+                    "{what} {i}: {r} is neither a role nor created by an earlier effect"
                 ));
             }
         }
@@ -203,19 +288,53 @@ pub fn validate(def: &RuleDef) -> Result<(), String> {
             _ => vec![],
         };
         if let Some(k) = keys.iter().find(|k| k.starts_with(ENGINE_PROP_PREFIX)) {
-            return Err(format!("effect {i}: prop {k:?} is engine-owned"));
+            return Err(format!("{what} {i}: prop {k:?} is engine-owned"));
         }
         if let Op::Create {
             handle: Some(h), ..
         } = op
         {
             if known(h) {
-                return Err(format!("effect {i}: handle {h:?} clashes with a role"));
+                return Err(format!("{what} {i}: handle {h:?} clashes with a role"));
             }
             created.insert(h);
         }
     }
     Ok(())
+}
+
+/// Check what only a world rule must satisfy, against the stat sheet:
+/// every stat it names exists, and it only lowers stats.
+pub(crate) fn validate_world(
+    world: &World,
+    def: &RuleDef,
+) -> Result<Result<(), String>, StoreError> {
+    let sheet = stats::sheet(world)?;
+    let mut deltas: Vec<&StatDelta> = def.adjust.iter().collect();
+    if let Some(check) = &def.check {
+        if !sheet.contains_key(&check.stat) {
+            return Ok(Err(format!(
+                "the check names unknown stat {:?}",
+                check.stat
+            )));
+        }
+        for b in [&check.partial, &check.failure].into_iter().flatten() {
+            deltas.extend(&b.adjust);
+        }
+    }
+    for d in deltas {
+        if !sheet.contains_key(&d.stat) {
+            return Ok(Err(format!("unknown stat {:?}", d.stat)));
+        }
+        if d.by > 0 {
+            return Ok(Err(format!(
+                "a world rule may only lower stats ({:?} by {}); stats grow through their \
+                 advancement rules with adjust_stat",
+                d.stat, d.by
+            )));
+        }
+    }
+    Ok(Ok(()))
 }
 
 /// Every entity ref an op uses.
@@ -376,7 +495,11 @@ fn carried_by(world: &World, player: EntityId, id: EntityId) -> Result<bool, Sto
 
 /// The patch a rule's effects make for these bindings.
 pub fn instantiate(rule: &RuleDef, bindings: &Bindings) -> Patch {
-    let mut ops = rule.effects.clone();
+    instantiate_ops(&rule.effects, bindings)
+}
+
+fn instantiate_ops(effects: &[Op], bindings: &Bindings) -> Patch {
+    let mut ops = effects.to_vec();
     for op in &mut ops {
         for r in op_refs_mut(op) {
             if let EntityRef::Handle(h) = r
@@ -396,6 +519,8 @@ pub enum Refusal {
     Binding(String),
     /// Conditions that don't hold.
     Unmet(Vec<String>),
+    /// The rule's check couldn't be rolled.
+    Check(String),
     /// The world store rejected the effects.
     Rejected(String),
 }
@@ -405,6 +530,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::Binding(r) => write!(f, "bindings don't fit: {r}"),
             Refusal::Unmet(rs) => write!(f, "conditions not met: {}", rs.join("; ")),
+            Refusal::Check(r) => write!(f, "check not rolled: {r}"),
             Refusal::Rejected(r) => write!(f, "effects rejected: {r}"),
         }
     }
@@ -418,6 +544,13 @@ pub struct Application {
     pub applied: Applied,
     /// Glossary entries the effects introduced.
     pub new_terms: Vec<String>,
+    /// The rule's check, when it has one.
+    pub roll: Option<Roll>,
+    /// What happened, for the narrator: the rule's outcome, or the check
+    /// branch's.
+    pub outcome: String,
+    /// Stat changes the rule made, and thresholds they fired.
+    pub stats: Changes,
 }
 
 /// Bind, check and apply a rule (stored or about to be minted) with
@@ -437,22 +570,72 @@ pub fn apply(
     if !reasons.is_empty() {
         return Ok(Err(Refusal::Unmet(reasons)));
     }
-    let patch = instantiate(rule, &bindings);
-    let note = Map::from_iter([
-        ("rule".to_owned(), tag),
+    resolve(world, rule, tag, bindings, 0)
+}
+
+/// Roll the rule's check, if any, then apply the consequence it picks:
+/// effects (with director authority), then stat changes. `depth` counts
+/// thresholds firing thresholds.
+pub(crate) fn resolve(
+    world: &mut World,
+    rule: &RuleDef,
+    tag: Value,
+    bindings: Bindings,
+    depth: usize,
+) -> Result<Result<Application, Refusal>, StoreError> {
+    let main = Branch {
+        effects: rule.effects.clone(),
+        adjust: rule.adjust.clone(),
+        outcome: rule.outcome.clone(),
+    };
+    let (roll, branch) = match &rule.check {
+        None => (None, main),
+        Some(c) => {
+            let roll = match stats::check(world, &c.stat, c.difficulty, json!({"rule": tag}))? {
+                Ok(r) => r,
+                Err(why) => return Ok(Err(Refusal::Check(why))),
+            };
+            let branch = match roll.result {
+                CheckResult::Success => main,
+                CheckResult::Partial => c.partial.clone().unwrap_or_default(),
+                CheckResult::Failure => c.failure.clone().unwrap_or_default(),
+            };
+            (Some(roll), branch)
+        }
+    };
+    let patch = instantiate_ops(&branch.effects, &bindings);
+    let mut note = Map::from_iter([
+        ("rule".to_owned(), tag.clone()),
         ("bindings".to_owned(), json!(bindings)),
     ]);
+    if let Some(r) = &roll {
+        note.insert("roll".into(), json!(r.seq));
+    }
     let applied = match world.apply_patch_noted(&patch, &note) {
         Ok(a) => a,
         Err(ApplyError::Rejected(r)) => return Ok(Err(Refusal::Rejected(r.to_string()))),
         Err(ApplyError::Storage(e)) => return Err(e.into()),
     };
     let new_terms = glossary::register_patch(world, &patch)?;
+    let mut changes = Changes::default();
+    for d in &branch.adjust {
+        stats::apply_delta(
+            world,
+            &d.stat,
+            d.by,
+            json!({"rule": tag}),
+            depth,
+            &mut changes,
+        )?;
+    }
     Ok(Ok(Application {
         bindings,
         patch,
         applied,
         new_terms,
+        roll,
+        outcome: branch.outcome,
+        stats: changes,
     }))
 }
 
@@ -485,6 +668,14 @@ pub fn active(world: &World) -> Result<Vec<Rule>, StoreError> {
     Ok(all(world)?.into_iter().filter(Rule::is_active).collect())
 }
 
+/// Active world rules (what player actions can match), in id order.
+pub fn active_world(world: &World) -> Result<Vec<Rule>, StoreError> {
+    Ok(active(world)?
+        .into_iter()
+        .filter(|r| r.class == RuleClass::World)
+        .collect())
+}
+
 fn parse(e: &Entity) -> Result<Rule, StoreError> {
     let raw = e
         .props
@@ -496,22 +687,46 @@ fn parse(e: &Entity) -> Result<Rule, StoreError> {
     Ok(rule)
 }
 
-/// Store a new rule (version 1) and log its minting. Registers the prop
-/// names it uses in the glossary. Returns the rule and the new glossary
-/// entries, or why the definition is invalid.
+/// Store a new world rule (version 1) and log its minting. Registers the
+/// prop names it uses in the glossary. Returns the rule and the new
+/// glossary entries, or why the definition is invalid.
 pub fn mint(
     world: &mut World,
     def: RuleDef,
-    class: RuleClass,
     reason: &str,
 ) -> Result<Result<(Rule, Vec<String>), String>, StoreError> {
     if let Err(r) = validate(&def) {
         return Ok(Err(r));
     }
+    if let Err(r) = validate_world(world, &def)? {
+        return Ok(Err(r));
+    }
+    store_new(world, def, RuleClass::World, None, reason).map(Ok)
+}
+
+/// Store a stat rule. The caller ([`crate::stats`]) has validated it.
+/// Stat rules are fixed from here on.
+pub(crate) fn mint_stat(
+    world: &mut World,
+    def: RuleDef,
+    hook: StatHook,
+    reason: &str,
+) -> Result<Rule, StoreError> {
+    Ok(store_new(world, def, RuleClass::Stat, Some(hook), reason)?.0)
+}
+
+fn store_new(
+    world: &mut World,
+    def: RuleDef,
+    class: RuleClass,
+    hook: Option<StatHook>,
+    reason: &str,
+) -> Result<(Rule, Vec<String>), StoreError> {
     let mut rule = Rule {
         id: 0,
         def,
         class,
+        hook,
         version: 1,
         status: RuleStatus::Active,
     };
@@ -525,7 +740,7 @@ pub fn mint(
     rule.id = engine_patch(world, &patch)?.created[0];
     log_change(world, "minted", &rule, reason)?;
     let new_terms = register_vocabulary(world, &rule.def)?;
-    Ok(Ok((rule, new_terms)))
+    Ok((rule, new_terms))
 }
 
 /// Changes to a world rule; absent fields stay as they are.
@@ -537,6 +752,8 @@ pub struct Amendment {
     pub conditions: Option<Vec<Condition>>,
     pub effects: Option<Vec<Op>>,
     pub outcome: Option<String>,
+    pub adjust: Option<Vec<StatDelta>>,
+    pub check: Option<RuleCheck>,
 }
 
 /// Amend an active world rule: a new version replaces the old one, which
@@ -570,7 +787,16 @@ pub fn amend(
     if let Some(v) = changes.outcome {
         d.outcome = v;
     }
+    if let Some(v) = changes.adjust {
+        d.adjust = v;
+    }
+    if let Some(v) = changes.check {
+        d.check = Some(v);
+    }
     if let Err(r) = validate(&rule.def) {
+        return Ok(Err(r));
+    }
+    if let Err(r) = validate_world(world, &rule.def)? {
         return Ok(Err(r));
     }
     rule.version += 1;
@@ -661,8 +887,13 @@ fn register_vocabulary(world: &mut World, def: &RuleDef) -> Result<Vec<String>, 
         }
     }
     let mut added = glossary::register(world, seen)?;
-    let effects = Patch::new(def.effects.clone());
-    for t in glossary::register_patch(world, &effects)? {
+    let mut effects = def.effects.clone();
+    if let Some(c) = &def.check {
+        for b in [&c.partial, &c.failure].into_iter().flatten() {
+            effects.extend(b.effects.iter().cloned());
+        }
+    }
+    for t in glossary::register_patch(world, &Patch::new(effects))? {
         if !added.contains(&t) {
             added.push(t);
         }

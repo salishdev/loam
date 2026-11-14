@@ -6,7 +6,7 @@ use crate::llm::{ContentBlock, Response, ScriptedClient};
 const SECRET: &str = "The abbot drowned the bell to hide the ledger";
 
 fn bible_call() -> Response {
-    Response::canned_tool_use(
+    crate::stats::with_sample_sheet(Response::canned_tool_use(
         "b1",
         "write_bible",
         json!({
@@ -16,7 +16,7 @@ fn bible_call() -> Response {
             "npcs": [{"name": "Brother Ash", "description": "Last monk, lies kindly."}],
             "secrets": [{"name": "The bell", "description": SECRET}]
         }),
-    )
+    ))
 }
 
 fn opening_room() -> Response {
@@ -39,6 +39,7 @@ fn opening_room() -> Response {
 fn new_game() -> (Game, ScriptedClient) {
     let client = ScriptedClient::new([bible_call(), Response::canned_text("")]);
     let mut game = Game::new(World::open_in_memory().unwrap());
+    game.set_dice_seed(7);
     game.create_bible(&client, "A drowned abbey in the fens.")
         .unwrap();
     (game, client)
@@ -95,7 +96,8 @@ fn seed_builds_a_bible_readable_through_tools() {
     let mut want = BIBLE_SECTIONS.to_vec();
     want.sort();
     assert_eq!(keys, want);
-    // The bible call only offers write_bible, and the seed is the prompt.
+    // The bible call offers write_bible and write_stats, and the seed is
+    // the prompt.
     let req = &client.requests()[0];
     assert_eq!(req.model, Model::Sonnet);
     assert_eq!(first_user_text(req), "A drowned abbey in the fens.");
@@ -104,8 +106,9 @@ fn seed_builds_a_bible_readable_through_tools() {
             .iter()
             .map(|t| t.name.as_str())
             .collect::<Vec<_>>(),
-        ["write_bible"]
+        ["write_bible", "write_stats"]
     );
+    assert_eq!(game.stats().unwrap().len(), 2);
 
     let mut game = game;
     let client = ScriptedClient::new([
@@ -503,7 +506,10 @@ fn the_player_carries_items_through_the_inventory_tools() {
     let (msg, is_error) = last_tool_result(&client);
     assert!(!is_error, "{msg}");
     let slice = local_slice(game.world()).unwrap();
-    assert!(slice.contains("Carrying:\n- #5 tallow candle"), "{slice}");
+    assert!(
+        slice.contains(&format!("Carrying:\n- #{} tallow candle", candle.id)),
+        "{slice}"
+    );
     let replayed = game.world().replay_in_memory().unwrap();
     assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
 }
@@ -702,7 +708,7 @@ fn a_rule_not_meeting_its_conditions_is_not_minted() {
         .unwrap();
     let (msg, is_error) = last_tool_result(&client);
     assert!(is_error && msg.contains("rule not minted"), "{msg}");
-    assert!(crate::rules::all(game.world()).unwrap().is_empty());
+    assert!(crate::rules::active_world(game.world()).unwrap().is_empty());
 }
 
 #[test]
@@ -712,7 +718,7 @@ fn unclear_interpretations_go_to_the_director() {
     client.push(Response::canned_text("x"));
     game.turn(&client, "kick the oak door", &mut |_| {})
         .unwrap();
-    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
 
     // More than the rule covers.
     client.push(interpret(
@@ -767,7 +773,7 @@ fn conflicting_rules_escalate_and_the_director_can_retire_one() {
     client.push(Response::canned_text("x"));
     game.turn(&client, "think about doors", &mut |_| {})
         .unwrap();
-    let ids: Vec<i64> = crate::rules::active(game.world())
+    let ids: Vec<i64> = crate::rules::active_world(game.world())
         .unwrap()
         .iter()
         .map(|r| r.id)
@@ -883,7 +889,7 @@ fn rules_and_glossary_are_protected_from_patches() {
     client.push(Response::canned_text("x"));
     game.turn(&client, "kick the oak door", &mut |_| {})
         .unwrap();
-    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
     let glossary = crate::glossary::glossary_id(game.world()).unwrap().unwrap();
     for (i, (ops, want)) in [
         (json!([{"op": "destroy", "entity": rule}]), "mint_rule"),
@@ -978,7 +984,7 @@ fn the_quest_judge_also_rules_on_fast_path_turns() {
     client.push(Response::canned_text("x"));
     game.turn(&client, "kick the oak door", &mut |_| {})
         .unwrap();
-    let rule = crate::rules::active(game.world()).unwrap()[0].id;
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
     let q = crate::quest::spawn(
         &mut game.world,
         "Through the elm",
@@ -1298,4 +1304,173 @@ fn a_session_with_ticks_replays_to_the_same_state() {
     let replayed = game.world().replay_in_memory().unwrap();
     assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
     assert_eq!(replayed.events().unwrap(), game.world().events().unwrap());
+}
+
+// ---- stats and checks ---------------------------------------------------------
+
+fn bible_only() -> Response {
+    let mut r = bible_call();
+    r.content
+        .retain(|b| !matches!(b, ContentBlock::ToolUse(t) if t.name == "write_stats"));
+    r
+}
+
+#[test]
+fn the_bible_needs_a_stat_sheet() {
+    let client = ScriptedClient::new([bible_only(), Response::canned_text("")]);
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    assert!(matches!(
+        game.create_bible(&client, "seed"),
+        Err(GameError::NoStats)
+    ));
+
+    // A bad sheet is refused with the reason, and the director retries.
+    let mut bad = crate::stats::sample_sheet();
+    bad[0]["advancement"] = json!([]);
+    let mut first = bible_only();
+    first
+        .content
+        .push(ContentBlock::ToolUse(crate::llm::ToolUse {
+            id: "s0".into(),
+            name: "write_stats".into(),
+            input: json!({"stats": bad}),
+        }));
+    let client = ScriptedClient::new([
+        first,
+        Response::canned_tool_use(
+            "s1",
+            "write_stats",
+            json!({"stats": crate::stats::sample_sheet()}),
+        ),
+        Response::canned_text(""),
+    ]);
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.create_bible(&client, "seed").unwrap();
+    let retry = &client.requests()[1];
+    let refused = retry.messages[2].content.iter().any(|b| {
+        matches!(b, ContentBlock::ToolResult { is_error: true, content, .. } if content.contains("advancement"))
+    });
+    assert!(refused, "{:?}", retry.messages[2]);
+    assert_eq!(game.stats().unwrap().len(), 2);
+}
+
+#[test]
+fn a_threshold_setback_is_narrated_and_play_goes_on() {
+    let (mut game, client) = begun();
+    let slice = local_slice(game.world()).unwrap();
+    assert!(
+        slice.contains("Stats (check, adjust_stat):\n- brawn 2 [0..5]"),
+        "{slice}"
+    );
+    assert!(!slice.contains("_stats"), "{slice}");
+
+    client.push(Response::canned_tool_use(
+        "c",
+        "check",
+        json!({"stat": "nerve", "difficulty": 30, "reason": "stare into the bell shaft"}),
+    ));
+    client.push(Response::canned_tool_use(
+        "a",
+        "adjust_stat",
+        json!({"stat": "nerve", "by": -3, "reason": "the bell shaft stared back"}),
+    ));
+    client.push(Response::canned_text("You run."));
+    let out = game
+        .turn(&client, "stare into the bell shaft", &mut |_| {})
+        .unwrap();
+    assert_eq!(out.narration, "You run.");
+    let reqs = client.requests();
+    let result = |i: usize| match reqs[i].messages.last().unwrap().content.first().unwrap() {
+        ContentBlock::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(!is_error, "{content}");
+            serde_json::from_str::<Value>(content).unwrap()
+        }
+        other => panic!("{other:?}"),
+    };
+    // Even a 20 can't reach 30.
+    assert_eq!(result(reqs.len() - 2)["result"], json!("failure"));
+    let adjusted = result(reqs.len() - 1);
+    assert_eq!(
+        adjusted["changed"],
+        json!([{"stat": "nerve", "from": 3, "to": 0}])
+    );
+    assert!(
+        adjusted["thresholds"][0]["outcome"]
+            .as_str()
+            .unwrap()
+            .contains("nerve breaks")
+    );
+    assert!(
+        adjusted["note"]
+            .as_str()
+            .unwrap()
+            .contains("the game goes on")
+    );
+    let player = player_id(game.world()).unwrap().unwrap();
+    assert_eq!(
+        game.world().entity(player).unwrap().unwrap().props["shaken"],
+        json!(true)
+    );
+    let roll = game
+        .world()
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == EventKind::Roll)
+        .unwrap();
+    assert_eq!(roll.payload["reason"], json!("stare into the bell shaft"));
+
+    // No game over: the next turn plays as usual.
+    client.push(Response::canned_text("You catch your breath."));
+    let next = game.turn(&client, "breathe", &mut |_| {}).unwrap();
+    assert_eq!(next.narration, "You catch your breath.");
+    assert!(
+        local_slice(game.world())
+            .unwrap()
+            .contains("- nerve 0 [0..5]")
+    );
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn a_checked_rule_rolls_on_the_fast_path() {
+    let (mut game, client, oak, elm) = with_doors();
+    let mut mint = kick_mint(oak);
+    if let ContentBlock::ToolUse(t) = &mut mint.content[0] {
+        // nerve 3 + d20 always beats 1.
+        t.input["check"] = json!({"stat": "nerve", "difficulty": 1,
+                                  "failure": {"outcome": "You bounce off.", "adjust": [{"stat": "brawn", "by": -1}]}});
+    }
+    client.push(mint);
+    client.push(Response::canned_text("The oak door bursts."));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    let minted: Value = serde_json::from_str(&msg).unwrap();
+    assert_eq!(minted["applied"]["check"]["result"], json!("success"));
+    let rule = minted["rule"].as_i64().unwrap();
+
+    let start = client.requests().len();
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        true,
+    ));
+    client.push(Response::canned_text("The elm door gives way too."));
+    let out = game
+        .turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    assert_eq!(out.fast_path, Some(rule));
+    let narr = first_user_text(&client.requests()[start + 1]);
+    assert!(
+        narr.contains("Check: nerve d20 ") && narr.contains("against 1: \"success\""),
+        "{narr}"
+    );
+    assert!(narr.contains("Outcome: The door bursts inward"), "{narr}");
+    assert_eq!(game.world().count_events(EventKind::Roll).unwrap(), 2);
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
 }

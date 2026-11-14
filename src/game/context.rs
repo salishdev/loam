@@ -9,6 +9,7 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
+use crate::stats::{DICE_PROP, STATS_PROP};
 use crate::world::{Entity, EntityId, EventKind, StoreError, World};
 use crate::{glossary, rules};
 
@@ -42,7 +43,7 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         glossary::index(world)?
     )
     .unwrap();
-    let rules = rules::active(world)?.len();
+    let rules = rules::active_world(world)?.len();
     if rules > 0 {
         writeln!(out, "Rules: {rules} active (list_rules)").unwrap();
     }
@@ -56,6 +57,13 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         return Ok(out);
     };
     writeln!(out, "Player: {}", line(&player)).unwrap();
+    let stats = crate::stats::slice_lines(world)?;
+    if !stats.is_empty() {
+        writeln!(out, "Stats (check, adjust_stat):").unwrap();
+        for s in stats {
+            writeln!(out, "{s}").unwrap();
+        }
+    }
     let carried = world.contents(Some(player.id))?;
     if carried.is_empty() {
         writeln!(out, "Carrying: nothing").unwrap();
@@ -205,16 +213,17 @@ fn tree(world: &World, ids: &[EntityId], depth: usize, out: &mut String) -> Resu
 }
 
 fn line(e: &Entity) -> String {
-    if e.props.is_empty() {
+    // The sheet is shown on its own lines.
+    let props: serde_json::Map<String, Value> = e
+        .props
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), STATS_PROP | DICE_PROP))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if props.is_empty() {
         format!("#{} {} [{}]", e.id, e.name, e.kind)
     } else {
-        format!(
-            "#{} {} [{}] {}",
-            e.id,
-            e.name,
-            e.kind,
-            Value::Object(e.props.clone())
-        )
+        format!("#{} {} [{}] {}", e.id, e.name, e.kind, Value::Object(props))
     }
 }
 

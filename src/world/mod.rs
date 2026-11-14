@@ -165,6 +165,25 @@ impl World {
         self.apply_patch_as(patch, Authority::Engine, None)
     }
 
+    /// [`apply_engine_patch`](Self::apply_engine_patch) with extra fields
+    /// recorded in the `patch` event.
+    pub(crate) fn apply_engine_patch_noted(
+        &mut self,
+        patch: &Patch,
+        note: &Map<String, Value>,
+    ) -> Result<Applied, ApplyError> {
+        self.apply_patch_as(patch, Authority::Engine, Some(note))
+    }
+
+    /// How many events of `kind` the log holds.
+    pub fn count_events(&self, kind: EventKind) -> Result<i64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = ?1",
+            [kind.as_str()],
+            |r| r.get(0),
+        )?)
+    }
+
     fn apply_patch_as(
         &mut self,
         patch: &Patch,

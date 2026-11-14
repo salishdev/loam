@@ -7,4 +7,5 @@ pub mod inventory;
 pub mod llm;
 pub mod quest;
 pub mod rules;
+pub mod stats;
 pub mod world;

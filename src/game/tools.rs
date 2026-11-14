@@ -14,6 +14,7 @@ use crate::inventory::{self, Inventory};
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
 use crate::quest;
 use crate::rules::{self, RULE_KIND};
+use crate::stats;
 use crate::world::{
     ApplyError, CARRIER_PROP, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
 };
@@ -33,7 +34,7 @@ pub enum Phase {
 
 pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
     match phase {
-        Phase::Bible => vec![write_bible_def()],
+        Phase::Bible => vec![write_bible_def(), stats::tools::sheet_tool_definition()],
         Phase::Play => vec![
             read_bible_def(),
             query_entity_def(),
@@ -47,6 +48,7 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         .chain(quest::tool_definitions())
         .chain(rules::tools::tool_definitions())
         .chain(glossary::tools::tool_definitions())
+        .chain(stats::tools::tool_definitions())
         .collect(),
         Phase::Tick => vec![
             read_bible_def(),
@@ -61,6 +63,7 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
 pub fn dispatch(
     world: &mut World,
     inventory: &Inventory,
+    dice_seed: u64,
     phase: Phase,
     call: &ToolUse,
 ) -> Result<ToolOutput, StoreError> {
@@ -83,6 +86,9 @@ pub fn dispatch(
         return output;
     }
     if let Some(output) = glossary::tools::handle_tool(world, call) {
+        return output;
+    }
+    if let Some(output) = stats::tools::handle_tool(world, dice_seed, call) {
         return output;
     }
     macro_rules! input {

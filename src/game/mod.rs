@@ -19,13 +19,14 @@ pub use tools::Phase;
 
 use serde_json::json;
 
-use crate::inventory::Inventory;
+use crate::inventory::{DEFAULT_SLOTS, Inventory};
 use crate::llm::ToolUse;
 use crate::llm::{
     Effort, LlmClient, LlmError, Message, Model, Request, StopReason, ToolOutput, run_tool_loop,
 };
 use crate::quest::{self, Judgment, Quest};
 use crate::rules::{self, RuleId, Scope};
+use crate::stats;
 use crate::world::{EntityId, EventKind, StoreError, World};
 
 /// Kind of the single entity holding the world bible.
@@ -40,13 +41,16 @@ pub const BIBLE_SECTIONS: [&str; 5] = ["tone", "regions", "factions", "npcs", "s
 /// Most model calls one director turn may make.
 const MAX_TURN_CALLS: usize = 16;
 /// Most model calls building the bible may make.
-const MAX_BIBLE_CALLS: usize = 4;
+const MAX_BIBLE_CALLS: usize = 6;
 
 const BIBLE_SYSTEM: &str = "You are the director of Loam, a text adventure generated from the \
 player's seed prompt. Build the hidden world bible with write_bible: a tone, a handful of \
 regions, factions with goals in tension, key NPCs and secrets worth uncovering. Be concrete \
-and specific to the seed; keep each entry to a sentence or two. Rooms are generated later, \
-as the player explores. Reply with nothing but the tool call.";
+and specific to the seed; keep each entry to a sentence or two. Then write the player's stat \
+sheet with write_stats: a few stats that fit the seed, each with thresholds that bring \
+setbacks (never the end of the game) and an advancement charter giving the player reasons \
+to grow. Rooms are generated later, as the player explores. Reply with nothing but the \
+tool calls.";
 
 const DIRECTOR_SYSTEM: &str = "You are the director of Loam, a text adventure. The player may \
 try anything. Each turn: decide what the input means in this world, make the real \
@@ -61,7 +65,10 @@ clear to the player, reveal_goal with the entities it concerns; escalate_quest t
 stakes. A judge decides when a quest is done. The engine remembers rulings as rules and replays them without you: when you rule on an \
 action that could recur, mint_rule at the generality you judge right (conditions on kind \
 and props make it general) and give apply_to so the rule itself is this turn's ruling; \
-one-off story events need no rule. Use glossary terms for props (lookup_terms) and define \
+one-off story events need no rule. When an action's outcome is uncertain, roll check \
+against the fitting stat and honour the result; a rule can embed the check. Stats change \
+only through adjust_stat with a reason; raise them by their advancement rules, and build \
+quests around the charter. Use glossary terms for props (lookup_terms) and define \
 new ones (define_terms). When a note says rules conflict or misfire, fix them with \
 amend_rule or retire_rule and, where you can, turn the contradiction into story. Write no \
 text until your tool calls are done. Your final message is shown to the player verbatim: \
@@ -78,6 +85,8 @@ pub enum GameError {
     Store(#[from] StoreError),
     #[error("the director did not write a world bible")]
     NoBible,
+    #[error("the director did not write a stat sheet")]
+    NoStats,
     #[error("the world has no bible yet; start it from a seed")]
     NotStarted,
 }
@@ -109,14 +118,30 @@ struct Turn<'a> {
 pub struct Game {
     world: World,
     inventory: Inventory,
+    /// Seeds the dice when the stat sheet is written; random when `None`.
+    dice_seed: Option<u64>,
 }
 
 impl Game {
     pub fn new(world: World) -> Self {
         Game {
             world,
-            inventory: Inventory::default(),
+            // The player's carry limit follows the sheet's capacity rule.
+            inventory: Inventory::new(DEFAULT_SLOTS, stats::carry_limit),
+            dice_seed: None,
         }
+    }
+
+    /// Fix the seed the dice get when the stat sheet is written, so a game
+    /// rolls the same every time. Has no effect once the sheet exists: the
+    /// seed is then part of the world.
+    pub fn set_dice_seed(&mut self, seed: u64) {
+        self.dice_seed = Some(seed);
+    }
+
+    /// The player's stats, by name (empty before the sheet is written).
+    pub fn stats(&self) -> Result<Vec<stats::Stat>, GameError> {
+        Ok(stats::sheet(&self.world)?.into_values().collect())
     }
 
     pub fn world(&self) -> &World {
@@ -145,7 +170,7 @@ impl Game {
         })
     }
 
-    /// Build the world bible from a seed prompt.
+    /// Build the world bible and the stat sheet from a seed prompt.
     pub fn create_bible(&mut self, client: &dyn LlmClient, seed: &str) -> Result<(), GameError> {
         self.world
             .log_event(EventKind::Input, &json!({"text": seed, "seed": true}))?;
@@ -163,6 +188,9 @@ impl Game {
         )?;
         if !self.has_bible()? {
             return Err(GameError::NoBible);
+        }
+        if stats::sheet(&self.world)?.is_empty() {
+            return Err(GameError::NoStats);
         }
         Ok(())
     }
@@ -316,6 +344,7 @@ impl Game {
     ) -> Result<crate::llm::ToolLoopOutcome, GameError> {
         let world = &mut self.world;
         let inventory = &self.inventory;
+        let dice_seed = self.dice_seed.unwrap_or_else(entropy);
         let mut fatal: Option<StoreError> = None;
         let outcome = run_tool_loop(client, request, max_calls, on_text, &mut |call| {
             if fatal.is_some() {
@@ -324,7 +353,7 @@ impl Game {
             if let Some(f) = observe.as_mut() {
                 f(world, call, None);
             }
-            let output = match tools::dispatch(world, inventory, phase, call) {
+            let output = match tools::dispatch(world, inventory, dice_seed, phase, call) {
                 Ok(o) => o,
                 Err(e) => {
                     fatal = Some(e);
@@ -382,6 +411,14 @@ impl Game {
             .unwrap_or_default();
         Ok(format!("{}\n{description}", room.name))
     }
+}
+
+/// A fresh dice seed from the clock and the process id.
+fn entropy() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 /// Watches tool calls in [`Game::run`].

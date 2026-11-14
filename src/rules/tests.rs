@@ -74,9 +74,7 @@ fn bind_target(id: EntityId) -> Bindings {
 #[test]
 fn a_general_rule_applies_to_every_matching_entity_the_same_way() {
     let mut f = fixture();
-    let (rule, _) = mint(&mut f.world, kick_rule(), RuleClass::World, "")
-        .unwrap()
-        .unwrap();
+    let (rule, _) = mint(&mut f.world, kick_rule(), "").unwrap().unwrap();
     let app = apply(
         &mut f.world,
         &rule.def,
@@ -277,9 +275,7 @@ fn invalid_definitions_are_refused() {
 #[test]
 fn amendments_and_retirement_are_versioned_in_the_log() {
     let mut f = fixture();
-    let (rule, terms) = mint(&mut f.world, kick_rule(), RuleClass::World, "")
-        .unwrap()
-        .unwrap();
+    let (rule, terms) = mint(&mut f.world, kick_rule(), "").unwrap().unwrap();
     assert!(
         terms.contains(&"rotten".to_owned()) && terms.contains(&"broken".to_owned()),
         "{terms:?}"
@@ -356,9 +352,11 @@ fn amendments_and_retirement_are_versioned_in_the_log() {
 #[test]
 fn stat_rules_never_change() {
     let mut f = fixture();
-    let (rule, _) = mint(&mut f.world, kick_rule(), RuleClass::Stat, "")
-        .unwrap()
-        .unwrap();
+    let hook = crate::stats::StatHook::Advancement {
+        stat: "nerve".into(),
+        step: 1,
+    };
+    let rule = mint_stat(&mut f.world, kick_rule(), hook, "").unwrap();
     let err = amend(&mut f.world, rule.id, Amendment::default(), "")
         .unwrap()
         .unwrap_err();

@@ -174,3 +174,32 @@ fn world_tick_advances_off_screen() {
     }
     println!("\n{}", loam::game::local_slice(game.world()).unwrap());
 }
+
+/// The live director writes a stat sheet with the bible, every stat with
+/// its advancement charter. Prints the sheet and its rules.
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn seed_builds_a_stat_sheet() {
+    use loam::game::Game;
+    use loam::world::World;
+
+    let client = AnthropicClient::from_env().expect("set ANTHROPIC_API_KEY to run live tests");
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.create_bible(
+        &client,
+        "A haunted salt mine under a dying town. Slow dread, small hopes.",
+    )
+    .unwrap();
+    let stats = game.stats().unwrap();
+    assert!(!stats.is_empty());
+    for line in loam::stats::slice_lines(game.world()).unwrap() {
+        println!("{line}");
+    }
+    let rules = loam::stats::stat_rules(game.world()).unwrap();
+    for s in &stats {
+        assert!(rules.iter().any(|r| matches!(
+            &r.hook,
+            Some(loam::stats::StatHook::Advancement { stat, .. }) if stat == &s.name
+        )));
+    }
+}

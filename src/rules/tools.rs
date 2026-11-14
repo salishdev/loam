@@ -31,6 +31,30 @@ fn effects_schema() -> Value {
     })
 }
 
+fn adjust_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Stat changes after the effects; a world rule may only lower stats (by < 0).",
+        "items": {"type": "object", "properties": {"stat": {"type": "string"}, "by": {"type": "integer"}},
+                  "required": ["stat", "by"]}
+    })
+}
+
+fn check_schema() -> Value {
+    let branch = json!({"type": "object", "properties": {
+        "outcome": {"type": "string"}, "effects": effects_schema(), "adjust": adjust_schema()
+    }});
+    json!({
+        "type": "object",
+        "description": "Optional check(stat, difficulty) rolled each time the rule applies. effects, adjust \
+                        and outcome above are the success; partial and failure say what happens otherwise \
+                        (nothing when absent).",
+        "properties": {"stat": {"type": "string"}, "difficulty": {"type": "integer"},
+                       "partial": branch.clone(), "failure": branch},
+        "required": ["stat", "difficulty"]
+    })
+}
+
 fn roles_schema() -> Value {
     json!({
         "type": "object",
@@ -44,14 +68,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new(
             "list_rules",
-            "List the world's rules (id, name, trigger, roles, conditions, version). Active only \
-             unless include_retired; text filters names and triggers; id shows one rule in full.",
+            "List the world's rules (id, name, trigger, roles, conditions, version). Active world \
+             rules only unless include_retired or include_stat (the fixed stat rules: bounds, \
+             thresholds, capacity, advancement); text filters names and triggers; id shows one \
+             rule in full.",
             json!({
                 "type": "object",
                 "properties": {
                     "text": {"type": "string"},
                     "id": {"type": "integer"},
-                    "include_retired": {"type": "boolean"}
+                    "include_retired": {"type": "boolean"},
+                    "include_stat": {"type": "boolean"}
                 }
             }),
         ),
@@ -71,6 +98,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "conditions": condition_schema(),
                     "effects": effects_schema(),
                     "outcome": {"type": "string", "description": "What happens, for the narrator."},
+                    "adjust": adjust_schema(),
+                    "check": check_schema(),
                     "apply_to": {"type": "object", "additionalProperties": {"type": "integer"}}
                 },
                 "required": ["name", "trigger", "roles", "conditions", "effects", "outcome"]
@@ -90,7 +119,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "roles": roles_schema(),
                     "conditions": condition_schema(),
                     "effects": effects_schema(),
-                    "outcome": {"type": "string"}
+                    "outcome": {"type": "string"},
+                    "adjust": adjust_schema(),
+                    "check": check_schema()
                 },
                 "required": ["id", "reason"]
             }),
@@ -150,6 +181,8 @@ struct ListInput {
     id: Option<RuleId>,
     #[serde(default)]
     include_retired: bool,
+    #[serde(default)]
+    include_stat: bool,
 }
 
 fn list(world: &World, input: ListInput) -> Result<ToolOutput, StoreError> {
@@ -167,6 +200,7 @@ fn list(world: &World, input: ListInput) -> Result<ToolOutput, StoreError> {
     let rules: Vec<Value> = super::all(world)?
         .into_iter()
         .filter(|r| input.include_retired || r.is_active())
+        .filter(|r| input.include_stat || r.class == RuleClass::World)
         .filter(|r| {
             text.as_ref().is_none_or(|t| {
                 r.def.name.to_lowercase().contains(t) || r.def.trigger.to_lowercase().contains(t)
@@ -198,6 +232,9 @@ fn mint(
     if let Err(r) = super::validate(&input.def) {
         return refuse(r);
     }
+    if let Err(r) = super::validate_world(world, &input.def)? {
+        return refuse(r);
+    }
     // Apply first, so a rule is stored only if it really is this turn's ruling.
     let mut result = json!({});
     let mut new_terms = Vec::new();
@@ -209,12 +246,22 @@ fn mint(
             Ok(app) => {
                 result["applied"] =
                     json!({"bindings": app.bindings, "created": app.applied.created});
+                if let Some(roll) = &app.roll {
+                    result["applied"]["check"] = json!({
+                        "stat": roll.stat, "die": roll.die, "total": roll.total,
+                        "difficulty": roll.difficulty, "result": roll.result,
+                    });
+                    result["applied"]["outcome"] = json!(app.outcome);
+                }
+                if !app.stats.is_empty() {
+                    result["applied"]["stats"] = crate::stats::tools::changes_json(&app.stats);
+                }
                 new_terms = app.new_terms;
             }
             Err(refusal) => return refuse(format!("rule not minted: {refusal}")),
         }
     }
-    match super::mint(world, input.def, RuleClass::World, "")? {
+    match super::mint(world, input.def, "")? {
         Ok((rule, more)) => {
             for t in more {
                 if !new_terms.contains(&t) {
