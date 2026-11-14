@@ -11,7 +11,13 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{EntityId, StoreError, World};
+use super::{EntityId, ROOM_KIND, StoreError, World};
+
+/// The relation joining two rooms: a passage from the subject room to the
+/// object room, with props `{dir, label}`. A two-way passage is two rows.
+/// The validator requires both ends to be rooms and a `dir` no other exit
+/// from the subject uses.
+pub const EXIT_REL: &str = "exit";
 
 /// One relation row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,4 +102,48 @@ fn select(
         })
     })?;
     rows.collect()
+}
+
+/// Why relating `subject -exit-> object` with `props` is invalid, if it is:
+/// both ends must be rooms, `dir` a non-empty string, and no other exit
+/// from `subject` may already use that `dir`.
+pub(super) fn bad_exit(
+    conn: &Connection,
+    subject: EntityId,
+    object: EntityId,
+    props: &Map<String, Value>,
+) -> rusqlite::Result<Option<String>> {
+    for (end, id) in [("subject", subject), ("object", object)] {
+        let kind: String =
+            conn.query_row("SELECT kind FROM entities WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?;
+        if kind != ROOM_KIND {
+            return Ok(Some(format!(
+                "an {EXIT_REL:?} joins two rooms, but its {end} #{id} is a {kind:?}"
+            )));
+        }
+    }
+    let Some(dir) = props
+        .get("dir")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+    else {
+        return Ok(Some(format!(
+            "an {EXIT_REL:?} needs props {{dir, label}} with a non-empty string dir"
+        )));
+    };
+    for other in select(
+        conn,
+        &format!("{COLUMNS} WHERE subject = ?1 AND rel = ?2 AND object != ?3"),
+        params![subject, EXIT_REL, object],
+    )? {
+        if other.props.get("dir").and_then(Value::as_str) == Some(dir) {
+            return Ok(Some(format!(
+                "#{subject} already has an exit {dir:?} (to #{})",
+                other.object
+            )));
+        }
+    }
+    Ok(None)
 }

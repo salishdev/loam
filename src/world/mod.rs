@@ -14,7 +14,7 @@ pub use component::Component;
 pub(crate) use component::{prop, remove_op, set_op};
 pub use log::{Event, EventKind};
 pub use patch::{EntityId, EntityRef, Op, Patch};
-pub use relation::Relation;
+pub use relation::{EXIT_REL, Relation};
 pub use replay::{ReplayError, WorldState};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -107,7 +107,7 @@ pub enum StoreError {
 /// Version of the store layout, recorded in `meta` as `schema_version`.
 /// Stores with another version (or none, from before versioning) can't be
 /// opened: saves are not migrated.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Result of an applied patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +119,10 @@ pub struct Applied {
     /// Ids assigned to handles used in the patch.
     pub handles: BTreeMap<String, EntityId>,
 }
+
+/// Kind of rooms. The validator checks that both ends of an
+/// [`EXIT_REL`] relation have it.
+pub const ROOM_KIND: &str = "room";
 
 /// Prop keys starting with this are engine-owned: director patches can't
 /// set or remove them.
@@ -643,6 +647,11 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
                 let s = resolve!(subject);
                 let o = resolve!(object);
                 if let Some(reason) = bad_rel_name(rel, guarded) {
+                    return reject(reason);
+                }
+                if rel == EXIT_REL
+                    && let Some(reason) = relation::bad_exit(tx, s, o, props)?
+                {
                     return reject(reason);
                 }
                 tx.execute(

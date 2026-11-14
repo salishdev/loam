@@ -810,3 +810,86 @@ fn relation_ops_touch_both_ends() {
     let touches = event.patch_touches().unwrap();
     assert_eq!(touches[0].1, vec![chest, cellar]);
 }
+
+fn exit(subject: impl Into<EntityRef>, object: impl Into<EntityRef>, props: Value) -> Op {
+    let Value::Object(props) = props else {
+        panic!("props must be an object")
+    };
+    Op::Relate {
+        subject: subject.into(),
+        rel: EXIT_REL.into(),
+        object: object.into(),
+        props,
+    }
+}
+
+#[test]
+fn exits_join_two_rooms_with_distinct_dirs() {
+    let (mut w, cellar, chest, _) = seeded();
+    let a = w
+        .apply_patch(&Patch::new(vec![
+            create("hall", "Hall", ROOM_KIND, None),
+            create("yard", "Yard", ROOM_KIND, None),
+            exit(cellar, "hall", json!({"dir": "up", "label": "Hall"})),
+            exit("hall", cellar, json!({"dir": "down", "label": "Cellar"})),
+        ]))
+        .unwrap();
+    let (hall, yard) = (a.handles["hall"], a.handles["yard"]);
+
+    // Both ends must be rooms.
+    let r = rejected(
+        &mut w,
+        vec![exit(cellar, chest, json!({"dir": "in", "label": "x"}))],
+    );
+    assert!(
+        r.reason.contains("joins two rooms") && r.reason.contains("object"),
+        "{r}"
+    );
+    let r = rejected(
+        &mut w,
+        vec![exit(chest, cellar, json!({"dir": "out", "label": "x"}))],
+    );
+    assert!(r.reason.contains("subject"), "{r}");
+    // A dir is required.
+    for props in [
+        json!({"label": "x"}),
+        json!({"dir": " ", "label": "x"}),
+        json!({"dir": 3}),
+    ] {
+        let r = rejected(&mut w, vec![exit(cellar, yard, props)]);
+        assert!(r.reason.contains("dir"), "{r}");
+    }
+    // No two exits from one room share a dir, for the engine too.
+    let r = rejected(
+        &mut w,
+        vec![exit(cellar, yard, json!({"dir": "up", "label": "Yard"}))],
+    );
+    assert!(r.reason.contains("already has an exit \"up\""), "{r}");
+    match w.apply_engine_patch(&Patch::new(vec![exit(
+        cellar,
+        yard,
+        json!({"dir": "up", "label": "Yard"}),
+    )])) {
+        Err(ApplyError::Rejected(r)) => assert!(r.reason.contains("already"), "{r}"),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+    // Relabelling (or re-dirring) the same exit is an upsert, not a clash.
+    w.apply_patch(&Patch::new(vec![exit(
+        cellar,
+        hall,
+        json!({"dir": "up", "label": "Great hall"}),
+    )]))
+    .unwrap();
+    assert_eq!(
+        w.relations_from(cellar, Some(EXIT_REL)).unwrap()[0].props["label"],
+        json!("Great hall")
+    );
+    // A different dir to another room is fine.
+    w.apply_patch(&Patch::new(vec![exit(
+        cellar,
+        yard,
+        json!({"dir": "east", "label": "Yard"}),
+    )]))
+    .unwrap();
+    assert_eq!(w.relations_from(cellar, Some(EXIT_REL)).unwrap().len(), 2);
+}

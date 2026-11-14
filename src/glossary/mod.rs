@@ -92,8 +92,10 @@ pub fn builtin_terms() -> BTreeMap<String, Term> {
         ("description".into(), free("lasting physical description")),
         ("region".into(), free("the bible region a room belongs to")),
         (
-            "exits".into(),
-            free("a room's exits: {direction: {label, to?}}"),
+            "exit".into(),
+            free(
+                "relation room -> room: a passage, props {dir, label}; a two-way passage is two exits",
+            ),
         ),
     ])
 }

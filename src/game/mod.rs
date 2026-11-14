@@ -6,6 +6,7 @@
 //! enters them and persist in the world store from then on.
 
 mod context;
+mod exits;
 mod fast_path;
 mod npcs;
 mod tick;
@@ -36,7 +37,7 @@ pub const BIBLE_KIND: &str = "bible";
 /// Kind of the player entity.
 pub const PLAYER_KIND: &str = "player";
 /// Kind of generated rooms.
-pub const ROOM_KIND: &str = "room";
+pub use crate::world::ROOM_KIND;
 /// The bible's sections, in the order the director writes them.
 pub const BIBLE_SECTIONS: [&str; 5] = ["tone", "regions", "factions", "npcs", "secrets"];
 
@@ -59,7 +60,8 @@ try anything. Each turn: decide what the input means in this world, make the rea
 consequences happen with tools, then narrate. The engine's state is the truth: look things \
 up (query_entity, read_bible, search_events) rather than inventing facts that may already \
 exist, and never change the world only in prose. When the player goes through an \
-unexplored exit, generate the room with create_room, furnished to fit the bible. If a tool \
+unexplored exit, generate the room with create_room, furnished to fit the bible; through an \
+explored one, move_player. Exits are exit relations between rooms. If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \

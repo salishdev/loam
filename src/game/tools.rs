@@ -16,9 +16,11 @@ use crate::quest;
 use crate::rules::{self, RULE_KIND};
 use crate::stats;
 use crate::world::{
-    self, ApplyError, Carrier, Entity, EntityId, EntityRef, EventKind, Op, Patch, StoreError, World,
+    self, ApplyError, Carrier, ENGINE_PROP_PREFIX, Entity, EntityId, EntityRef, EventKind, Op,
+    Patch, StoreError, World,
 };
 
+use super::exits::{self, Unexplored};
 use super::{BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, player_id, scope};
 
 /// Which tools a director call gets.
@@ -460,7 +462,8 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
     };
     let here = world.entity(player)?.and_then(|p| p.location);
 
-    // Where the player comes from, and the exit being explored.
+    // Where the player comes from: the room, the exit being explored, the
+    // way back and the stub that exit leads to.
     let origin = match (&input.via_exit, here) {
         (None, None) => None,
         (None, Some(_)) => {
@@ -471,23 +474,18 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
         (Some(_), None) => {
             return refuse("the player is nowhere yet: omit via_exit for the opening room");
         }
-        (Some(exit), Some(here)) => {
+        (Some(dir), Some(here)) => {
             let room = world.entity(here)?.expect("player location exists");
-            let exits = exits_of(&room);
-            match exits.get(exit) {
-                None => {
-                    return refuse(format!(
-                        "{} has no exit {exit:?}; exits: {}",
-                        room.name,
-                        names(&exits)
-                    ));
-                }
-                Some(e) if e.get("to").is_some() => {
-                    return refuse(format!(
-                        "exit {exit:?} is already explored: use move_player"
-                    ));
-                }
-                Some(_) => {}
+            let all = exits::exits(world, here)?;
+            let Some(exit) = all.iter().find(|e| e.dir == *dir) else {
+                return refuse(format!(
+                    "{} has no exit {dir:?}; exits: {}",
+                    room.name,
+                    exits::dir_names(&all)
+                ));
+            };
+            if !exit.unexplored {
+                return refuse(format!("exit {dir:?} is already explored: use move_player"));
             }
             let Some(back) = input.back_exit.as_deref().filter(|b| !b.trim().is_empty()) else {
                 return refuse("back_exit is required with via_exit");
@@ -495,44 +493,77 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
             if input.exits.contains_key(back) {
                 return refuse(format!("back_exit {back:?} is also listed in exits"));
             }
-            Some((room, exit.clone(), back.to_owned()))
+            Some((room, dir.clone(), back.to_owned(), exit.to))
         }
     };
-
-    let mut exits = Map::new();
+    let mut further = Vec::new();
     for (dir, hint) in input.exits {
-        let label = match hint {
+        if dir.trim().is_empty() {
+            return refuse("exit directions must not be empty");
+        }
+        let hint = match hint {
             Value::String(s) => s,
             other => other.to_string(),
         };
-        exits.insert(dir, json!({"label": label}));
-    }
-    if let Some((room, _, back)) = &origin {
-        exits.insert(back.clone(), json!({"label": room.name, "to": room.id}));
+        further.push((dir, hint));
     }
 
-    let mut props = Map::new();
-    props.insert("description".into(), input.description.into());
-    props.insert("region".into(), input.region.into());
-    props.insert("exits".into(), Value::Object(exits));
-    let mut ops = vec![Op::Create {
-        handle: Some(ROOM_HANDLE.into()),
-        name: input.name.clone(),
-        kind: ROOM_KIND.into(),
-        location: None,
-        props,
-    }];
+    // The room's own content: a new room, or the stub filled in.
+    let mut ops = Vec::new();
+    let room_ref = match &origin {
+        None => {
+            ops.push(Op::Create {
+                handle: Some(ROOM_HANDLE.into()),
+                name: input.name.clone(),
+                kind: ROOM_KIND.into(),
+                location: None,
+                props: Map::from_iter([
+                    ("description".into(), input.description.into()),
+                    ("region".into(), input.region.into()),
+                ]),
+            });
+            EntityRef::Handle(ROOM_HANDLE.into())
+        }
+        Some((_, _, _, stub)) => {
+            ops.push(Op::Rename {
+                entity: (*stub).into(),
+                name: input.name.clone(),
+            });
+            for (key, value) in [("description", input.description), ("region", input.region)] {
+                ops.push(Op::SetProp {
+                    entity: (*stub).into(),
+                    key: key.into(),
+                    value: value.into(),
+                });
+            }
+            EntityRef::Id(*stub)
+        }
+    };
     let mut handles = BTreeSet::new();
     for c in input.contents {
         if let Some(h) = &c.handle
-            && (h == ROOM_HANDLE || !handles.insert(h.clone()))
+            && (h == ROOM_HANDLE || h.starts_with(STUB_HANDLE))
+        {
+            return refuse(format!("content handle {h:?} is reserved; pick another"));
+        }
+        if let Some(h) = &c.handle
+            && !handles.insert(h.clone())
         {
             return refuse(format!("content handle {h:?} is used twice"));
+        }
+        // Applied below as one engine patch, so the director's guard on
+        // engine-owned props is checked here.
+        if let Some(key) = c.props.keys().find(|k| k.starts_with(ENGINE_PROP_PREFIX)) {
+            return refuse(format!(
+                "{}: prop {key:?} is engine-owned (keys starting with \
+                 '{ENGINE_PROP_PREFIX}'); only the engine's tools change it",
+                c.name
+            ));
         }
         let location = match c.inside {
             Some(h) if handles.contains(&h) => EntityRef::Handle(h),
             Some(h) => return refuse(format!("inside {h:?}: no earlier content has that handle")),
-            None => EntityRef::Handle(ROOM_HANDLE.into()),
+            None => room_ref.clone(),
         };
         ops.push(Op::Create {
             handle: c.handle,
@@ -542,36 +573,43 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
             props: c.props,
         });
     }
-    let patch = Patch::new(ops);
-    let applied = match try_apply(world, &patch, As::Director)? {
-        Ok(a) => a,
-        Err(reason) => return refuse(reason),
-    };
-    let new_terms = glossary::register_patch(world, &patch)?;
-    let room_id = applied.handles[ROOM_HANDLE];
+    let content = Patch::new(ops.clone());
 
-    // Link the explored exit and move the player in.
-    let mut ops = Vec::new();
-    if let Some((room, exit, _)) = &origin {
-        let mut exits = exits_of(room);
-        exits.insert(exit.clone(), json!({"label": input.name, "to": room_id}));
-        ops.push(Op::SetProp {
-            entity: room.id.into(),
-            key: "exits".into(),
-            value: Value::Object(exits),
-        });
+    // Engine part: exits (stubs for the unexplored ones), then the player.
+    if let Some((room, via, back, stub)) = &origin {
+        ops.push(world::remove_op::<Unexplored>(*stub));
+        ops.push(exits::relate_op(room.id, *stub, via, &input.name));
+        ops.push(exits::relate_op(*stub, room.id, back, &room.name));
+    }
+    for (i, (dir, hint)) in further.iter().enumerate() {
+        let handle = format!("{STUB_HANDLE}{i}");
+        ops.push(exits::stub_op(handle.clone(), hint));
+        ops.push(exits::relate_op(
+            room_ref.clone(),
+            EntityRef::Handle(handle),
+            dir,
+            hint,
+        ));
     }
     ops.push(Op::Move {
         entity: player.into(),
-        to: Some(room_id.into()),
+        to: Some(room_ref.clone()),
     });
-    if let Err(reason) = try_apply(world, &Patch::new(ops), As::Engine)? {
-        return refuse(reason);
-    }
+    let applied = match try_apply(world, &Patch::new(ops), As::Engine)? {
+        Ok(a) => a,
+        Err(reason) => return refuse(reason),
+    };
+    let new_terms = glossary::register_patch(world, &content)?;
+    let room_id = match &origin {
+        None => applied.handles[ROOM_HANDLE],
+        Some((_, _, _, stub)) => *stub,
+    };
 
     let mut contents = Vec::new();
-    for id in &applied.created[1..] {
-        if let Some(e) = world.entity(*id)? {
+    for id in world.contents(Some(room_id))? {
+        if id != player
+            && let Some(e) = world.entity(id)?
+        {
             contents.push(brief(&e));
         }
     }
@@ -581,32 +619,19 @@ fn create_room(world: &mut World, input: CreateRoomInput) -> Result<ToolOutput, 
     ))
 }
 
-pub(crate) fn exits_of(room: &Entity) -> Map<String, Value> {
-    room.props
-        .get("exits")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn names(exits: &Map<String, Value>) -> String {
-    if exits.is_empty() {
-        "none".into()
-    } else {
-        exits.keys().cloned().collect::<Vec<_>>().join(", ")
-    }
-}
+/// Prefix of the handles create_room gives the stubs it makes.
+const STUB_HANDLE: &str = "@stub";
 
 // ---- move_player -----------------------------------------------------------
 
 fn move_player_def() -> ToolDefinition {
     ToolDefinition::new(
         "move_player",
-        "Move the player through an explored exit of the current room. An unexplored exit \
-         needs create_room instead.",
+        "Move the player through an explored exit of the current room (an exit relation, by \
+         its dir). An unexplored exit needs create_room instead.",
         json!({
             "type": "object",
-            "properties": {"exit": {"type": "string"}},
+            "properties": {"exit": {"type": "string", "description": "The exit's dir."}},
             "required": ["exit"]
         }),
     )
@@ -625,21 +650,22 @@ fn move_player(world: &mut World, input: MovePlayerInput) -> Result<ToolOutput, 
         return refuse("the player is nowhere yet: create the opening room");
     };
     let room = world.entity(here)?.expect("player location exists");
-    let exits = exits_of(&room);
-    let Some(exit) = exits.get(&input.exit) else {
+    let all = exits::exits(world, here)?;
+    let Some(exit) = all.iter().find(|e| e.dir == input.exit) else {
         return refuse(format!(
             "{} has no exit {:?}; exits: {}",
             room.name,
             input.exit,
-            names(&exits)
+            exits::dir_names(&all)
         ));
     };
-    let Some(to) = exit.get("to").and_then(Value::as_i64) else {
+    if exit.unexplored {
         return refuse(format!(
-            "exit {:?} is unexplored: call create_room with via_exit {:?}",
+            "exit {:?} is unexplored: use create_room with via_exit {:?}",
             input.exit, input.exit
         ));
-    };
+    }
+    let to = exit.to;
     let patch = Patch::new(vec![Op::Move {
         entity: player.into(),
         to: Some(to.into()),
@@ -663,7 +689,9 @@ fn apply_patch_def() -> ToolDefinition {
          relate {subject, rel, object, props?} (a directional fact such as \"guards\" or \
          \"owns\"; replaces props if it already holds; a symmetric fact is two relates), \
          unrelate {subject, rel, object} (must hold). Relation names are glossary terms; \
-         names starting with _ are engine-owned.",
+         names starting with _ are engine-owned. Exits are \"exit\" relations from room to \
+         room with props {dir, label}: relating one opens a passage move_player can use, \
+         unrelating it closes it; a two-way passage is two exits.",
         patch_schema(),
     )
 }
@@ -773,8 +801,8 @@ pub(crate) fn op_refs(op: &Op) -> Vec<&EntityRef> {
     }
 }
 
-/// Why a tick patch may not apply: it creates a room, or touches the
-/// player, the player's room or anything inside either. An entity created
+/// Why a tick patch may not apply: it creates a room, touches a stub
+/// room, or touches the player, the player's room or anything inside either. An entity created
 /// earlier in the same patch is checked through the op that placed it.
 fn on_screen_refusal(world: &World, patch: &Patch) -> Result<Option<String>, StoreError> {
     let Some(player) = player_id(world)? else {
@@ -791,6 +819,13 @@ fn on_screen_refusal(world: &World, patch: &Patch) -> Result<Option<String>, Sto
             )));
         }
         for r in op_refs(op) {
+            if let EntityRef::Id(id) = r
+                && exits::is_stub(world, *id)?
+            {
+                return Ok(Some(format!(
+                    "op {i}: #{id} is unexplored; it is generated when the player explores"
+                )));
+            }
             if let EntityRef::Id(id) = r
                 && is_on_screen(world, *id, player, room)?
             {

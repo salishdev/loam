@@ -16,9 +16,10 @@ use serde_json::{Value, json};
 use crate::llm::{Effort, LlmClient, Message, Model, Request, ToolOutput, ToolUse};
 use crate::world::{EntityId, EntityRef, Event, EventKind, Patch, StoreError, World};
 
+use super::exits::explored_rooms;
 use super::npcs::{enclosing_room, npcs, player_room};
 use super::tools::{Phase, definitions, op_refs};
-use super::{Game, GameError, ROOM_KIND, bible_id};
+use super::{Game, GameError, bible_id};
 
 /// A tick is due after this many player turns without one.
 pub const TICK_EVERY: usize = 5;
@@ -75,7 +76,7 @@ impl Game {
         let reference = match &last {
             Some(e) => e.payload.get("room").and_then(Value::as_i64),
             // Before the first tick: the opening room.
-            None => world.entities_of_kind(ROOM_KIND)?.first().copied(),
+            None => explored_rooms(world)?.first().copied(),
         };
         Ok(turns >= TICK_EVERY || (Some(room) != reference && turns >= ROOM_CHANGE_GAP))
     }
@@ -276,8 +277,7 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         None => writeln!(out, "The player is nowhere yet.").unwrap(),
     }
 
-    let rooms: Vec<String> = world
-        .entities_of_kind(ROOM_KIND)?
+    let rooms: Vec<String> = explored_rooms(world)?
         .into_iter()
         .filter(|id| Some(*id) != here)
         .filter_map(|id| world.entity(id).transpose())

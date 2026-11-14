@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::world::{Entity, EntityId, StoreError, World};
 
+use super::exits::is_stub_entity;
 use super::{ROOM_KIND, bible_id, player_id};
 
 /// The entity kind NPCs are created with.
@@ -63,7 +64,8 @@ pub fn bible_npc_names(world: &World) -> Result<Vec<String>, StoreError> {
         .collect())
 }
 
-/// The room an entity is in, walking out through whatever holds it.
+/// The room an entity is in, walking out through whatever holds it;
+/// `None` inside a stub room.
 pub(super) fn enclosing_room(world: &World, id: EntityId) -> Result<Option<EntityId>, StoreError> {
     let mut at = Some(id);
     while let Some(here) = at {
@@ -71,7 +73,8 @@ pub(super) fn enclosing_room(world: &World, id: EntityId) -> Result<Option<Entit
             return Ok(None);
         };
         if e.kind == ROOM_KIND {
-            return Ok(Some(e.id));
+            // A stub isn't a place yet.
+            return Ok((!is_stub_entity(&e)?).then_some(e.id));
         }
         at = e.location;
     }

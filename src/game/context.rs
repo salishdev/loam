@@ -11,11 +11,13 @@ use std::fmt::Write;
 use serde_json::Value;
 
 use crate::stats;
-use crate::world::{ENGINE_PROP_PREFIX, Entity, EntityId, EventKind, Relation, StoreError, World};
+use crate::world::{
+    ENGINE_PROP_PREFIX, EXIT_REL, Entity, EntityId, EventKind, Relation, StoreError, World,
+};
 use crate::{glossary, rules};
 
+use super::exits;
 use super::tick::notes_for_room;
-use super::tools::exits_of;
 use super::{bible_id, player_id};
 
 /// How many recent inputs and narrations the slice shows.
@@ -146,23 +148,23 @@ fn room_view(
     let other: serde_json::Map<String, Value> = room
         .props
         .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "description" | "region" | "exits"))
+        .filter(|(k, _)| !matches!(k.as_str(), "description" | "region"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     if !other.is_empty() {
         writeln!(out, "Room props: {}", Value::Object(other)).unwrap();
     }
-    let exits = exits_of(room);
+    let exits = exits::exits(world, room.id)?;
     if exits.is_empty() {
         writeln!(out, "Exits: none").unwrap();
     } else {
         let list: Vec<String> = exits
             .iter()
-            .map(|(dir, e)| {
-                let label = e.get("label").and_then(Value::as_str).unwrap_or("");
-                match e.get("to").and_then(Value::as_i64) {
-                    Some(to) => format!("{dir} -> #{to} {label}"),
-                    None => format!("{dir} -> unexplored ({label})"),
+            .map(|e| {
+                if e.unexplored {
+                    format!("{} -> unexplored ({})", e.dir, e.label)
+                } else {
+                    format!("{} -> #{} {}", e.dir, e.to, e.label)
                 }
             })
             .collect();
@@ -198,7 +200,8 @@ fn room_view(
 
 /// Every director-visible relation either end of which is the room or
 /// something inside it (at any depth, the player included), in key order.
-/// Engine-owned (`_`) relations are left to their own modules.
+/// Engine-owned (`_`) relations are left to their own modules, and exits
+/// are shown on their own line.
 fn room_relations(world: &World, room: EntityId) -> Result<Vec<Relation>, StoreError> {
     let mut found = BTreeMap::new();
     let mut stack = vec![room];
@@ -208,7 +211,7 @@ fn room_relations(world: &World, room: EntityId) -> Result<Vec<Relation>, StoreE
             .into_iter()
             .chain(world.relations_to(id, None)?);
         for r in both {
-            if !r.rel.starts_with(ENGINE_PROP_PREFIX) {
+            if !r.rel.starts_with(ENGINE_PROP_PREFIX) && r.rel != EXIT_REL {
                 found.insert((r.subject, r.rel.clone(), r.object), r);
             }
         }

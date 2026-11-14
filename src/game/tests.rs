@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 
+use super::exits;
 use super::*;
 use crate::llm::{ContentBlock, Response, ScriptedClient};
 
@@ -313,7 +314,7 @@ fn rooms_are_generated_on_arrival_and_the_same_on_return() {
 
     // No room was generated twice.
     assert_eq!(
-        game.world().entities_of_kind(ROOM_KIND).unwrap(),
+        exits::explored_rooms(game.world()).unwrap(),
         vec![chapel, tower]
     );
 }
@@ -1545,4 +1546,327 @@ fn director_relations_show_in_query_entity_slice_and_glossary() {
         }]))
         .unwrap();
     assert!(!local_slice(game.world()).unwrap().contains("_pins"));
+}
+
+// ---- exits and stub rooms ---------------------------------------------------
+
+/// The exits of `room` as `(dir, label, to, unexplored)`.
+fn exit_rows(game: &Game, room: i64) -> Vec<(String, String, i64, bool)> {
+    exits::exits(game.world(), room)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.dir, e.label, e.to, e.unexplored))
+        .collect()
+}
+
+#[test]
+fn unexplored_exits_lead_to_stub_rooms_that_create_room_fills_in() {
+    let (mut game, client) = begun();
+    let chapel = player_room(&game);
+    let rows = exit_rows(&game, chapel);
+    assert_eq!(rows.len(), 1);
+    let (dir, label, stub, unexplored) = rows[0].clone();
+    assert_eq!(
+        (dir.as_str(), label.as_str(), unexplored),
+        ("north", "a reed path toward the bell tower", true)
+    );
+    let s = game.world().entity(stub).unwrap().unwrap();
+    assert_eq!(s.kind, ROOM_KIND);
+    assert_eq!(s.name, "a reed path toward the bell tower");
+    assert_eq!(s.location, None);
+    assert!(exits::is_stub(game.world(), stub).unwrap());
+    // No exits prop anywhere: exits are relations.
+    assert!(!s.props.contains_key("exits"));
+    assert!(
+        !game
+            .world()
+            .entity(chapel)
+            .unwrap()
+            .unwrap()
+            .props
+            .contains_key("exits")
+    );
+
+    client.push(Response::canned_tool_use(
+        "r2",
+        "create_room",
+        json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
+               "description": "A leaning tower.", "exits": {"up": "rotten stairs", "east": "a causeway"},
+               "contents": [{"name": "crow", "kind": "npc", "props": {"mood": "wary"}}]}),
+    ));
+    client.push(Response::canned_text("The tower."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+
+    // The stub became the room: same id, filled in, marker gone.
+    let tower = player_room(&game);
+    assert_eq!(tower, stub);
+    let t = game.world().entity(tower).unwrap().unwrap();
+    assert_eq!(t.name, "Bell Tower");
+    assert_eq!(t.props["description"], json!("A leaning tower."));
+    assert_eq!(t.props["region"], json!("Saltmarsh"));
+    assert!(!t.props.contains_key("_unexplored"));
+    let crow = game.world().entities_of_kind("npc").unwrap()[0];
+    assert_eq!(
+        game.world().entity(crow).unwrap().unwrap().location,
+        Some(tower)
+    );
+    let v: Value = serde_json::from_str(&msg).unwrap();
+    assert_eq!(v["room"], json!(tower));
+    assert_eq!(v["contents"][0]["name"], json!("crow"));
+
+    // Both ways are explored now; the further exits lead to new stubs.
+    assert_eq!(
+        exit_rows(&game, chapel),
+        vec![("north".into(), "Bell Tower".into(), tower, false)]
+    );
+    let rows = exit_rows(&game, tower);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[1],
+        ("south".into(), "Drowned Chapel".into(), chapel, false)
+    );
+    for (i, (dir, hint)) in [(0, ("east", "a causeway")), (2, ("up", "rotten stairs"))] {
+        let (d, l, to, unexplored) = &rows[i];
+        assert_eq!((d.as_str(), l.as_str(), *unexplored), (dir, hint, true));
+        assert_eq!(game.world().entity(*to).unwrap().unwrap().name, hint);
+    }
+    assert_eq!(
+        exits::explored_rooms(game.world()).unwrap(),
+        vec![chapel, tower]
+    );
+
+    // The slice shows exits on their own line, not as relations.
+    let slice = local_slice(game.world()).unwrap();
+    assert!(
+        slice.contains(&format!(
+            "Exits: east -> unexplored (a causeway); south -> #{chapel} Drowned Chapel; \
+             up -> unexplored (rotten stairs)"
+        )),
+        "{slice}"
+    );
+    assert!(!slice.contains("-exit->"), "{slice}");
+
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn create_room_refuses_bad_exits_and_engine_props() {
+    let (mut game, client) = begun();
+    let chapel = player_room(&game);
+    let before = game.world().state().unwrap();
+    let tries = [
+        (
+            json!({"via_exit": "west", "back_exit": "east", "name": "X", "region": "Saltmarsh",
+                "description": "", "exits": {}, "contents": []}),
+            "no exit \"west\"",
+        ),
+        (
+            json!({"via_exit": "north", "name": "X", "region": "Saltmarsh",
+                "description": "", "exits": {}, "contents": []}),
+            "back_exit is required",
+        ),
+        (
+            json!({"via_exit": "north", "back_exit": "south", "name": "X", "region": "Saltmarsh",
+                "description": "", "exits": {"south": "again"}, "contents": []}),
+            "also listed",
+        ),
+        (
+            json!({"via_exit": "north", "back_exit": "south", "name": "X", "region": "Saltmarsh",
+                "description": "", "exits": {}, "contents": [{"name": "y", "kind": "item", "props": {"_carrier": true}}]}),
+            "engine-owned",
+        ),
+    ];
+    for (i, (input, why)) in tries.into_iter().enumerate() {
+        client.push(Response::canned_tool_use(
+            format!("r{i}"),
+            "create_room",
+            input,
+        ));
+        client.push(Response::canned_text("x"));
+        game.turn(&client, "go north", &mut |_| {}).unwrap();
+        let (msg, is_error) = last_tool_result(&client);
+        assert!(is_error && msg.contains(why), "{why}: {msg}");
+        assert_eq!(player_room(&game), chapel);
+    }
+    // Nothing changed but the log.
+    assert_eq!(game.world().state().unwrap().entities, before.entities);
+    assert_eq!(game.world().state().unwrap().relations, before.relations);
+}
+
+#[test]
+fn a_rule_effect_that_relates_an_exit_makes_it_walkable() {
+    let (mut game, client) = begun();
+    let chapel = player_room(&game);
+    let w = game.world_mut();
+    let a = w
+        .apply_patch(&crate::world::Patch::new(
+            serde_json::from_value(json!([
+                {"op": "create", "handle": "crypt", "name": "Crypt", "kind": "room",
+                 "props": {"description": "Bones.", "region": "Saltmarsh"}},
+                {"op": "create", "handle": "lever", "name": "lever", "kind": "feature", "location": chapel}
+            ]))
+            .unwrap(),
+        ))
+        .unwrap();
+    let (crypt, lever) = (a.handles["crypt"], a.handles["lever"]);
+
+    // No way down yet.
+    client.push(Response::canned_tool_use(
+        "m0",
+        "move_player",
+        json!({"exit": "down"}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "go down", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("no exit \"down\""), "{msg}");
+
+    client.push(Response::canned_tool_use(
+        "k1",
+        "mint_rule",
+        json!({
+            "name": "Pulling the chapel lever",
+            "trigger": "pull <target>",
+            "roles": {"target": "the lever"},
+            "conditions": [{"check": "kind", "role": "target", "is": "feature"}],
+            "effects": [
+                {"op": "relate", "subject": "room", "rel": "exit", "object": crypt,
+                 "props": {"dir": "down", "label": "Crypt"}},
+                {"op": "relate", "subject": crypt, "rel": "exit", "object": "room",
+                 "props": {"dir": "up", "label": "Drowned Chapel"}}
+            ],
+            "outcome": "A slab grinds aside, opening stairs down.",
+            "apply_to": {"target": lever}
+        }),
+    ));
+    client.push(Response::canned_text("A slab grinds aside."));
+    game.turn(&client, "pull the lever", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    assert_eq!(
+        exit_rows(&game, chapel)[0],
+        ("down".into(), "Crypt".into(), crypt, false)
+    );
+
+    client.push(interpret(json!([]), true));
+    client.push(Response::canned_tool_use(
+        "m1",
+        "move_player",
+        json!({"exit": "down"}),
+    ));
+    client.push(Response::canned_text("Down you go."));
+    game.turn(&client, "go down", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    assert_eq!(player_room(&game), crypt);
+    client.push(interpret(json!([]), true));
+    client.push(Response::canned_tool_use(
+        "m2",
+        "move_player",
+        json!({"exit": "up"}),
+    ));
+    client.push(Response::canned_text("Up."));
+    game.turn(&client, "go up", &mut |_| {}).unwrap();
+    assert_eq!(player_room(&game), chapel);
+
+    // An exit must join two rooms and can't reuse a dir.
+    for (i, (props_obj, why)) in [
+        (
+            json!({"subject": chapel, "object": lever, "props": {"dir": "in", "label": "x"}}),
+            "joins two rooms",
+        ),
+        (
+            json!({"subject": chapel, "object": crypt, "props": {"label": "x"}}),
+            "dir",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut op = props_obj;
+        op["op"] = json!("relate");
+        op["rel"] = json!("exit");
+        client.push(interpret(json!([]), true));
+        client.push(Response::canned_tool_use(
+            format!("p{i}"),
+            "apply_patch",
+            json!({"ops": [op]}),
+        ));
+        client.push(Response::canned_text("x"));
+        game.turn(&client, "dig", &mut |_| {}).unwrap();
+        let (msg, is_error) = last_tool_result(&client);
+        assert!(is_error && msg.contains(why), "{why}: {msg}");
+    }
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn destroying_a_room_removes_its_exits() {
+    let (mut game, client, _, tower, _, loft) = two_rooms(true);
+    let loft = loft.unwrap();
+    assert!(exit_rows(&game, tower).iter().any(|e| e.2 == loft));
+    client.push(Response::canned_tool_use(
+        "d",
+        "apply_patch",
+        json!({"ops": [{"op": "destroy", "entity": loft}]}),
+    ));
+    client.push(Response::canned_text("The loft collapses."));
+    game.turn(&client, "listen", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    assert!(game.world().relations_to(loft, None).unwrap().is_empty());
+    assert!(game.world().relations_from(loft, None).unwrap().is_empty());
+    assert!(exit_rows(&game, tower).iter().all(|e| e.0 != "up"));
+    let patch = game
+        .world()
+        .events()
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == EventKind::Patch)
+        .unwrap();
+    let cascaded = patch.payload["cascaded"].as_array().unwrap();
+    assert_eq!(cascaded.len(), 2, "{cascaded:?}");
+    assert!(cascaded.iter().all(|c| c["rel"] == json!("exit")));
+}
+
+#[test]
+fn ticks_and_npc_listings_skip_stub_rooms() {
+    let (mut game, client, _, tower, crow, _) = two_rooms(false);
+    let stub = exit_rows(&game, tower)
+        .into_iter()
+        .find(|e| e.0 == "up")
+        .unwrap()
+        .2;
+
+    // An NPC sent into a stub is nowhere yet.
+    game.world_mut()
+        .apply_patch(&crate::world::Patch::new(vec![crate::world::Op::Move {
+            entity: crow.into(),
+            to: Some(stub.into()),
+        }]))
+        .unwrap();
+    let sighting = npcs(game.world()).unwrap().remove(0);
+    assert_eq!(sighting.room, None);
+
+    // The tick lists only explored rooms and can't touch stubs.
+    client.push(Response::canned_tool_use(
+        "x",
+        "apply_patch",
+        json!({"ops": [{"op": "set_prop", "entity": stub, "key": "dank", "value": true}], "note": "n"}),
+    ));
+    client.push(Response::canned_text("Nothing."));
+    let before = client.requests().len();
+    game.tick(&client).unwrap();
+    let prompt = first_user_text(&client.requests()[before]);
+    assert!(prompt.contains("Bell Tower"), "{prompt}");
+    assert!(
+        !prompt.contains("rotten stairs (") && !prompt.contains(&format!("#{stub} ")),
+        "{prompt}"
+    );
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("unexplored"), "{msg}");
 }
