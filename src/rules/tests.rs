@@ -269,6 +269,14 @@ fn invalid_definitions_are_refused() {
         refused(json!({"effects": [{"op": "set_prop", "entity": "target", "key": "_carrier", "value": true}]}))
             .contains("engine-owned")
     );
+    assert!(
+        refused(json!({"effects": [{"op": "relate", "subject": "target", "rel": "_pins", "object": "room"}]}))
+            .contains("relation \"_pins\" is engine-owned")
+    );
+    assert!(
+        refused(json!({"effects": [{"op": "unrelate", "subject": "ghost", "rel": "guards", "object": "room"}]}))
+            .contains("neither a role")
+    );
     assert!(validate(&base).is_ok());
 }
 

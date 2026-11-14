@@ -454,3 +454,75 @@ fn npc_sightings_are_shared_with_the_tick() {
         ]
     );
 }
+
+#[test]
+fn relations_lists_both_directions_with_props() {
+    let mut f = fixture();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "relate", "subject": f.crowbar, "rel": "opens", "object": f.oak,
+         "props": {"noisily": true}},
+        {"op": "relate", "subject": f.iron, "rel": "faces", "object": f.crowbar},
+    ]))
+    .unwrap();
+    f.world.apply_patch(&Patch::new(ops)).unwrap();
+    let (bar, oak, iron) = (f.crowbar, f.oak, f.iron);
+    assert_eq!(
+        relations(&f.world, "crowbar").unwrap(),
+        format!(
+            "#{bar} crowbar (item)\n  -opens-> #{oak} oak door {{\"noisily\":true}}\n  \
+             <-faces- #{iron} iron door"
+        )
+    );
+    assert_eq!(
+        relations(&f.world, &format!("#{}", f.scope.room)).unwrap(),
+        format!("#{} Hall (room)\n  no relations", f.scope.room)
+    );
+    assert_eq!(
+        relations(&f.world, "").unwrap(),
+        "Usage: :relations <#id | name>"
+    );
+    assert!(
+        relations(&f.world, "door")
+            .unwrap()
+            .contains("matches several")
+    );
+}
+
+#[test]
+fn why_shows_relations_and_their_cascades() {
+    let mut f = fixture();
+    let (bar, oak) = (f.crowbar, f.oak);
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "relate", "subject": bar, "rel": "opens", "object": oak},
+    ]))
+    .unwrap();
+    f.world.apply_patch(&Patch::new(ops)).unwrap();
+    let out = why(&f.world, "oak door").unwrap();
+    assert!(
+        out.contains(&format!("  <-opens- #{bar} crowbar\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("patch by director: relate #{bar} opens #{oak}")),
+        "{out}"
+    );
+
+    f.world
+        .apply_patch(&Patch::new(vec![Op::Destroy { entity: bar.into() }]))
+        .unwrap();
+    let out = why(&f.world, "oak door").unwrap();
+    assert!(!out.contains("<-opens-"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "patch by director: cascade removed #{bar} opens #{oak}"
+        )),
+        "{out}"
+    );
+    let out = why(&f.world, &bar.to_string()).unwrap();
+    assert!(
+        out.contains(&format!(
+            "destroy #{bar}; cascade removed #{bar} opens #{oak}"
+        )),
+        "{out}"
+    );
+}

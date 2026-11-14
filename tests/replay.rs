@@ -44,7 +44,8 @@ fn patch_call(id: &str, ops: Value) -> Response {
 }
 
 /// Record a short session: world creation, a rejected patch, a dice roll
-/// and judgment, moves, prop changes and a destroy.
+/// and judgment, moves, prop changes, relations and a destroy that
+/// cascades one.
 fn record_session() -> World {
     let mut w = World::open_in_memory().unwrap();
     turn(
@@ -85,7 +86,11 @@ fn record_session() -> World {
                 json!([
                     {"op": "set_prop", "entity": 3, "key": "broken", "value": true},
                     {"op": "remove_prop", "entity": 3, "key": "rotten"},
-                    {"op": "create", "name": "Splinters", "kind": "scenery", "location": 1},
+                    {"op": "create", "handle": "sp", "name": "Splinters", "kind": "scenery",
+                     "location": 1},
+                    {"op": "relate", "subject": "sp", "rel": "broken_from", "object": 3,
+                     "props": {"pieces": 12}},
+                    {"op": "relate", "subject": 3, "rel": "guards", "object": 2},
                 ]),
             ),
             Response::canned_text("The door bursts."),
@@ -107,6 +112,8 @@ fn record_session() -> World {
                     {"op": "set_prop", "entity": 4, "key": "hp", "value": 8},
                     {"op": "destroy", "entity": 6},
                     {"op": "rename", "entity": 2, "name": "Flooded crypt"},
+                    {"op": "unrelate", "subject": 3, "rel": "guards", "object": 2},
+                    {"op": "relate", "subject": 4, "rel": "fears", "object": 2},
                 ]),
             ),
             Response::canned_text("You slip and fall."),
@@ -145,6 +152,94 @@ fn replay_rebuilds_identical_state_and_log() {
     assert_eq!(crypt.name, "Flooded crypt");
     assert_eq!(replayed.contents(Some(2)).unwrap(), vec![4]);
     assert!(replayed.entity(6).unwrap().is_none());
+    let relations: Vec<_> = replayed
+        .state()
+        .unwrap()
+        .relations
+        .iter()
+        .map(|r| (r.subject, r.rel.clone(), r.object))
+        .collect();
+    assert_eq!(relations, [(4, "fears".to_owned(), 2)]);
+}
+
+#[test]
+fn relations_and_cascades_replay_and_fork() {
+    let original = record_session();
+    let events = original.events().unwrap();
+    let patches: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Patch)
+        .collect();
+    let (kick, climb) = (patches[1], patches[2]);
+    assert!(kick.payload.get("cascaded").is_none());
+    assert_eq!(
+        climb.payload["cascaded"],
+        json!([{"op": 2, "subject": 6, "rel": "broken_from", "object": 3,
+                "props": {"pieces": 12}}])
+    );
+
+    // Right after the kick, both relations hold.
+    let state = state_at(kick.seq);
+    let relations: Vec<_> = state
+        .relations
+        .iter()
+        .map(|r| {
+            (
+                r.subject,
+                r.rel.as_str(),
+                r.object,
+                Value::Object(r.props.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        relations,
+        [
+            (3, "guards", 2, json!({})),
+            (6, "broken_from", 3, json!({"pieces": 12})),
+        ]
+    );
+    // Forking after the cascade matches the session's end exactly.
+    assert_eq!(state_at(climb.seq), original.state().unwrap());
+}
+
+#[test]
+fn a_tampered_cascade_list_is_divergence() {
+    let original = record_session();
+    let climb = original
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == EventKind::Patch)
+        .nth(2)
+        .unwrap();
+    let mut payload = climb.payload.clone();
+    payload["cascaded"] = json!([]);
+    let dir = std::env::temp_dir().join(format!("loam-tamper-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("tampered.db");
+    let _ = std::fs::remove_file(&target);
+    let copy = original
+        .fork(original.last_seq().unwrap(), &target)
+        .unwrap();
+    drop(copy);
+    let conn = rusqlite::Connection::open(&target).unwrap();
+    conn.execute_batch("DROP TRIGGER events_no_update").unwrap();
+    conn.execute(
+        "UPDATE events SET payload = ?1 WHERE seq = ?2",
+        rusqlite::params![payload.to_string(), climb.seq],
+    )
+    .unwrap();
+    drop(conn);
+    let tampered = World::open(&target).unwrap();
+    match tampered.replay_in_memory() {
+        Err(ReplayError::Diverged { seq, reason }) => {
+            assert_eq!(seq, climb.seq);
+            assert!(reason.contains("cascaded"), "{reason}");
+        }
+        other => panic!("expected divergence, got {:?}", other.map(|_| ())),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

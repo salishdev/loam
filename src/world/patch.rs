@@ -69,9 +69,25 @@ pub enum Op {
         entity: EntityRef,
         name: String,
     },
-    /// Remove an entity and its props. It must not contain anything.
+    /// Remove an entity, its props and every relation it is subject or
+    /// object of. It must not contain anything.
     Destroy {
         entity: EntityRef,
+    },
+    /// State that `subject` stands in relation `rel` to `object`
+    /// (directional). Replaces the props if the relation already holds.
+    Relate {
+        subject: EntityRef,
+        rel: String,
+        object: EntityRef,
+        #[serde(default, skip_serializing_if = "Map::is_empty")]
+        props: Map<String, Value>,
+    },
+    /// Remove a relation, which must hold.
+    Unrelate {
+        subject: EntityRef,
+        rel: String,
+        object: EntityRef,
     },
 }
 

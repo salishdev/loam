@@ -125,6 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":why" => show(cmd, inspect::why(world, arg)),
                 ":quests" => show(cmd, inspect::quests(world)),
                 ":npcs" => show(cmd, inspect::npcs(world)),
+                ":relations" => show(cmd, inspect::relations(world, arg)),
                 ":stats" => show(cmd, inspect::stats(world)),
                 ":fork" => fork(world, arg),
                 ":help" => println!("{HELP}"),
@@ -318,8 +319,8 @@ fn list_seeds(dirs: &[PathBuf]) -> Vec<String> {
     names
 }
 
-const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :quests, :npcs, :stats, \
-:fork <event> <path>, :tick, :quit";
+const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
+:quests, :npcs, :stats, :fork <event> <path>, :tick, :quit";
 
 /// Print an inspector report; a failure leaves the save usable.
 fn show(cmd: &str, report: Result<String, loam::world::StoreError>) {

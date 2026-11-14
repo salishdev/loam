@@ -11,7 +11,10 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
-use super::{Authority, Entity, EntityId, EventKind, Patch, StoreError, World, apply_ops};
+use super::{
+    Authority, Cascaded, Entity, EntityId, EventKind, Outcome, Patch, Relation, StoreError, World,
+    apply_ops,
+};
 
 /// Why a log could not be replayed or forked.
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +41,8 @@ impl From<rusqlite::Error> for ReplayError {
 pub struct WorldState {
     /// Every entity, in id order.
     pub entities: Vec<Entity>,
+    /// Every relation, in key order.
+    pub relations: Vec<Relation>,
     /// The id the next created entity will get.
     pub next_entity_id: EntityId,
 }
@@ -115,6 +120,7 @@ impl World {
             .optional()?;
         Ok(WorldState {
             entities,
+            relations: self.relations()?,
             next_entity_id: last_id.unwrap_or(0) + 1,
         })
     }
@@ -160,6 +166,7 @@ impl World {
         Ok(self.conn.query_row(
             "SELECT NOT EXISTS (SELECT 1 FROM events)
                 AND NOT EXISTS (SELECT 1 FROM entities)
+                AND NOT EXISTS (SELECT 1 FROM relations)
                 AND NOT EXISTS (SELECT 1 FROM meta WHERE key != 'schema_version')",
             [],
             |r| r.get(0),
@@ -226,6 +233,11 @@ fn replay_patch(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
         .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad created list: {e}")))?;
     let handles: BTreeMap<String, EntityId> = serde_json::from_value(payload["handles"].clone())
         .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad handles: {e}")))?;
+    let cascaded: Vec<Cascaded> = match payload.get("cascaded") {
+        Some(c) => serde_json::from_value(c.clone())
+            .map_err(|e| StoreError::Corrupt(format!("event {seq}: bad cascaded list: {e}")))?,
+        None => Vec::new(),
+    };
 
     // The whole replay is one transaction, so a rejection here aborts it
     // when the caller drops `tx`.
@@ -236,7 +248,11 @@ fn replay_patch(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
     } else {
         Authority::Director
     };
-    let (got_created, got_handles) = apply_ops(tx, &patch, by)?
+    let Outcome {
+        created: got_created,
+        handles: got_handles,
+        cascaded: got_cascaded,
+    } = apply_ops(tx, &patch, by)?
         .map_err(|r| diverged(format!("recorded patch is now rejected: {r}")))?;
     if got_created != created {
         return Err(diverged(format!(
@@ -246,6 +262,11 @@ fn replay_patch(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
     if got_handles != handles {
         return Err(diverged(format!(
             "patch assigned handles {got_handles:?}, log recorded {handles:?}"
+        )));
+    }
+    if got_cascaded != cascaded {
+        return Err(diverged(format!(
+            "patch cascaded {got_cascaded:?}, log recorded {cascaded:?}"
         )));
     }
     Ok(())

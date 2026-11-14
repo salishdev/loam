@@ -1,16 +1,17 @@
 //! The local slice: the little the director sees up front each turn.
 //!
 //! Current room and its exits, what is in it (one level down), what the
-//! player carries, what world ticks did in the room, the last few turns
-//! and the bible's section titles.
+//! player carries, the relations of everything in the room, what world
+//! ticks did in the room, the last few turns and the bible's section titles.
 //! Everything else is fetched through tools.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use serde_json::Value;
 
 use crate::stats;
-use crate::world::{Entity, EntityId, EventKind, StoreError, World};
+use crate::world::{ENGINE_PROP_PREFIX, Entity, EntityId, EventKind, Relation, StoreError, World};
 use crate::{glossary, rules};
 
 use super::tick::notes_for_room;
@@ -178,6 +179,13 @@ fn room_view(
         writeln!(out, "Here:").unwrap();
         tree(world, &here, 1, out)?;
     }
+    let relations = room_relations(world, room.id)?;
+    if !relations.is_empty() {
+        writeln!(out, "Relations here:").unwrap();
+        for r in relations {
+            writeln!(out, "- {}", relation_line(world, &r)?).unwrap();
+        }
+    }
     let notes = notes_for_room(world, room.id, ROOM_NOTES)?;
     if !notes.is_empty() {
         writeln!(out, "Happened here off-screen (world ticks, newest first):").unwrap();
@@ -186,6 +194,42 @@ fn room_view(
         }
     }
     Ok(())
+}
+
+/// Every director-visible relation either end of which is the room or
+/// something inside it (at any depth, the player included), in key order.
+/// Engine-owned (`_`) relations are left to their own modules.
+fn room_relations(world: &World, room: EntityId) -> Result<Vec<Relation>, StoreError> {
+    let mut found = BTreeMap::new();
+    let mut stack = vec![room];
+    while let Some(id) = stack.pop() {
+        let both = world
+            .relations_from(id, None)?
+            .into_iter()
+            .chain(world.relations_to(id, None)?);
+        for r in both {
+            if !r.rel.starts_with(ENGINE_PROP_PREFIX) {
+                found.insert((r.subject, r.rel.clone(), r.object), r);
+            }
+        }
+        stack.extend(world.contents(Some(id))?);
+    }
+    Ok(found.into_values().collect())
+}
+
+/// `#3 Hound -guards-> #4 Gate {props}`.
+fn relation_line(world: &World, r: &Relation) -> Result<String, StoreError> {
+    let name = |id: EntityId| -> Result<String, StoreError> {
+        Ok(match world.entity(id)? {
+            Some(e) => format!("#{id} {}", e.name),
+            None => format!("#{id}"),
+        })
+    };
+    let mut s = format!("{} -{}-> {}", name(r.subject)?, r.rel, name(r.object)?);
+    if !r.props.is_empty() {
+        write!(s, " {}", Value::Object(r.props.clone())).unwrap();
+    }
+    Ok(s)
 }
 
 /// List entities with props; their contents one level further down.

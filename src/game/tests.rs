@@ -1474,3 +1474,75 @@ fn a_checked_rule_rolls_on_the_fast_path() {
     let replayed = game.world().replay_in_memory().unwrap();
     assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
 }
+
+#[test]
+fn director_relations_show_in_query_entity_slice_and_glossary() {
+    let (mut game, client) = begun();
+    let chapel = player_room(&game);
+    let w = game.world();
+    let altar = w
+        .contents(Some(chapel))
+        .unwrap()
+        .into_iter()
+        .find(|id| w.entity(*id).unwrap().unwrap().name == "altar")
+        .unwrap();
+    client.push(Response::canned_tool_use(
+        "p",
+        "apply_patch",
+        json!({"ops": [
+            {"op": "create", "handle": "hound", "name": "Hound", "kind": "npc", "location": chapel},
+            {"op": "relate", "subject": "hound", "rel": "guards", "object": altar,
+             "props": {"since": "dawn"}},
+        ]}),
+    ));
+    client.push(Response::canned_tool_use(
+        "q",
+        "query_entity",
+        json!({"id": altar}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "whistle", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    let v: Value = serde_json::from_str(&msg).unwrap();
+    assert_eq!(v["relations"]["from"], json!([]));
+    assert_eq!(v["relations"]["to"][0]["rel"], json!("guards"));
+    assert_eq!(v["relations"]["to"][0]["subject"]["name"], json!("Hound"));
+    assert_eq!(v["relations"]["to"][0]["props"], json!({"since": "dawn"}));
+
+    // The director can't use engine-owned relation names.
+    client.push(Response::canned_tool_use(
+        "p2",
+        "apply_patch",
+        json!({"ops": [{"op": "relate", "subject": altar, "rel": "_pins", "object": chapel}]}),
+    ));
+    client.push(Response::canned_text("x"));
+    game.turn(&client, "cheat", &mut |_| {}).unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(is_error && msg.contains("engine-owned"), "{msg}");
+
+    assert!(
+        crate::glossary::terms(game.world())
+            .unwrap()
+            .contains_key("guards")
+    );
+    let slice = local_slice(game.world()).unwrap();
+    let hound = game.world().relations_to(altar, None).unwrap()[0].subject;
+    assert!(
+        slice.contains(&format!(
+            "Relations here:\n- #{hound} Hound -guards-> #{altar} altar {{\"since\":\"dawn\"}}"
+        )),
+        "{slice}"
+    );
+
+    // Engine-owned relations are left to their modules, not the slice.
+    game.world_mut()
+        .apply_engine_patch(&crate::world::Patch::new(vec![crate::world::Op::Relate {
+            subject: hound.into(),
+            rel: "_pins".into(),
+            object: altar.into(),
+            props: Default::default(),
+        }]))
+        .unwrap();
+    assert!(!local_slice(game.world()).unwrap().contains("_pins"));
+}

@@ -1,5 +1,5 @@
-//! The REPL inspector: `:rules`, `:glossary`, `:why`, `:quests`, `:npcs`,
-//! `:stats`.
+//! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
+//! `:quests`, `:npcs`, `:stats`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -17,7 +17,7 @@ use crate::glossary;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
 use crate::stats::{self, Capacity, Crossing, StatHook};
-use crate::world::{Entity, EntityId, Event, EventKind, Op, StoreError, World};
+use crate::world::{Cascaded, Entity, EntityId, Event, EventKind, Op, Relation, StoreError, World};
 
 /// Longest value shown inline before it is clipped.
 const VALUE_CHARS: usize = 100;
@@ -317,20 +317,9 @@ fn tally_list(counts: &BTreeMap<&str, usize>) -> String {
 /// it, grouped under the player input that led to each. `query` is `#12`,
 /// `12` or a name (exact, then a unique substring; case-insensitive).
 pub fn why(world: &World, query: &str) -> Result<String, StoreError> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Ok("Usage: :why <#id | name>".into());
-    }
-    let id = match find(world, query)? {
-        Found::One(id) => id,
-        Found::None => return Ok(format!("No entity matches {query:?}.")),
-        Found::Many(candidates) => {
-            let mut out = format!("{query:?} matches several entities; use an id:");
-            for e in candidates {
-                write!(out, "\n  #{} {} ({})", e.id, e.name, e.kind).unwrap();
-            }
-            return Ok(out);
-        }
+    let id = match pick(world, query, ":why")? {
+        Ok(id) => id,
+        Err(reply) => return Ok(reply),
     };
 
     let mut out = String::new();
@@ -346,6 +335,9 @@ pub fn why(world: &World, query: &str) -> Result<String, StoreError> {
             writeln!(out, "#{} {} ({}) {at}", e.id, e.name, e.kind).unwrap();
             for (k, v) in &e.props {
                 writeln!(out, "  {k} = {}", clip_value(v)).unwrap();
+            }
+            for line in relation_lines(world, id, "  ")? {
+                writeln!(out, "{line}").unwrap();
             }
         }
         None => writeln!(out, "#{id} no longer exists (or never did).").unwrap(),
@@ -396,6 +388,81 @@ pub fn why(world: &World, query: &str) -> Result<String, StoreError> {
     Ok(trim_end(out))
 }
 
+/// Every relation of an entity, both ways. `query` is as for [`why`].
+pub fn relations(world: &World, query: &str) -> Result<String, StoreError> {
+    let id = match pick(world, query, ":relations")? {
+        Ok(id) => id,
+        Err(reply) => return Ok(reply),
+    };
+    let Some(e) = world.entity(id)? else {
+        return Ok(format!("#{id} no longer exists (or never did)."));
+    };
+    let mut out = format!("#{} {} ({})", e.id, e.name, e.kind);
+    let lines = relation_lines(world, id, "  ")?;
+    if lines.is_empty() {
+        out.push_str("\n  no relations");
+    }
+    for line in lines {
+        write!(out, "\n{line}").unwrap();
+    }
+    Ok(out)
+}
+
+/// `id`'s relations, outgoing (`-rel-> #o name`) then incoming
+/// (`<-rel- #s name`), each with its props.
+fn relation_lines(world: &World, id: EntityId, indent: &str) -> Result<Vec<String>, StoreError> {
+    let name = |id: EntityId| -> Result<String, StoreError> {
+        Ok(match world.entity(id)? {
+            Some(e) => format!("#{id} {}", e.name),
+            None => format!("#{id}"),
+        })
+    };
+    let props = |r: &Relation| {
+        if r.props.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", clip_value(&Value::Object(r.props.clone())))
+        }
+    };
+    let mut lines = Vec::new();
+    for r in world.relations_from(id, None)? {
+        lines.push(format!(
+            "{indent}-{}-> {}{}",
+            r.rel,
+            name(r.object)?,
+            props(&r)
+        ));
+    }
+    for r in world.relations_to(id, None)? {
+        lines.push(format!(
+            "{indent}<-{}- {}{}",
+            r.rel,
+            name(r.subject)?,
+            props(&r)
+        ));
+    }
+    Ok(lines)
+}
+
+/// Resolve an inspector query to one id, or the reply explaining why not.
+fn pick(world: &World, query: &str, cmd: &str) -> Result<Result<EntityId, String>, StoreError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Err(format!("Usage: {cmd} <#id | name>")));
+    }
+    Ok(match find(world, query)? {
+        Found::One(id) => Ok(id),
+        Found::None => Err(format!("No entity matches {query:?}.")),
+        Found::Many(candidates) => {
+            let mut out = format!("{query:?} matches several entities; use an id:");
+            for e in candidates {
+                write!(out, "\n  #{} {} ({})", e.id, e.name, e.kind).unwrap();
+            }
+            Err(out)
+        }
+    })
+}
+
 enum Found {
     None,
     One(EntityId),
@@ -434,12 +501,25 @@ fn trail_line(e: &Event, id: EntityId) -> Result<Option<String>, StoreError> {
     Ok(match e.kind {
         EventKind::Patch | EventKind::PatchRejected => {
             let rule_id = p["rule"]["id"].as_i64();
-            let ops: Vec<String> = e
+            let mut ops: Vec<String> = e
                 .patch_touches()?
                 .iter()
                 .filter(|(_, ids)| ids.contains(&id))
                 .map(|(op, ids)| render_op(op, ids))
                 .collect();
+            let cascaded: Vec<Cascaded> = match p.get("cascaded") {
+                Some(c) => serde_json::from_value(c.clone()).map_err(|err| {
+                    StoreError::Corrupt(format!("event {seq}: bad cascaded list: {err}"))
+                })?,
+                None => Vec::new(),
+            };
+            ops.extend(
+                cascaded
+                    .iter()
+                    .map(|c| &c.relation)
+                    .filter(|r| r.subject == id || r.object == id)
+                    .map(|r| format!("cascade removed #{} {} #{}", r.subject, r.rel, r.object)),
+            );
             if ops.is_empty() && rule_id != Some(id) {
                 return Ok(None);
             }
@@ -578,6 +658,23 @@ fn render_op(op: &Op, ids: &[EntityId]) -> String {
         Op::RemoveProp { entity, key } => format!("remove {entity}.{key}"),
         Op::Rename { entity, name } => format!("rename {entity} to {name:?}"),
         Op::Destroy { entity } => format!("destroy {entity}"),
+        Op::Relate {
+            subject,
+            rel,
+            object,
+            props,
+        } => {
+            let mut s = format!("relate {subject} {rel} {object}");
+            if !props.is_empty() {
+                write!(s, " {}", clip_value(&Value::Object(props.clone()))).unwrap();
+            }
+            s
+        }
+        Op::Unrelate {
+            subject,
+            rel,
+            object,
+        } => format!("unrelate {subject} {rel} {object}"),
     }
 }
 

@@ -74,7 +74,9 @@ pub struct Event {
 impl Event {
     /// For a `patch` or `patch_rejected` event, each op with the entities it
     /// touched: created (and where), moved (and where to), given or stripped
-    /// of props, renamed or destroyed. A move's origin isn't logged, so it
+    /// of props, renamed or destroyed, or either end of a relation made or
+    /// removed. Relations a destroy cascaded are in the payload's
+    /// `cascaded` list, not here. A move's origin isn't logged, so it
     /// doesn't count. A rejected patch created nothing, so only ops naming
     /// existing ids count there. Other kinds of event touch nothing.
     pub fn patch_touches(&self) -> Result<Vec<(Op, Vec<EntityId>)>, StoreError> {
@@ -116,6 +118,12 @@ impl Event {
                     | Op::RemoveProp { entity, .. }
                     | Op::Rename { entity, .. }
                     | Op::Destroy { entity } => id_of(entity).into_iter().collect(),
+                    Op::Relate {
+                        subject, object, ..
+                    }
+                    | Op::Unrelate {
+                        subject, object, ..
+                    } => id_of(subject).into_iter().chain(id_of(object)).collect(),
                 };
                 (op, ids)
             })

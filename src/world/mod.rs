@@ -4,6 +4,7 @@
 mod component;
 mod log;
 mod patch;
+mod relation;
 mod replay;
 
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub use component::Component;
 pub(crate) use component::{prop, remove_op, set_op};
 pub use log::{Event, EventKind};
 pub use patch::{EntityId, EntityRef, Op, Patch};
+pub use relation::Relation;
 pub use replay::{ReplayError, WorldState};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -36,6 +38,15 @@ CREATE TABLE IF NOT EXISTS props (
     value     TEXT NOT NULL,
     PRIMARY KEY (entity_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS relations (
+    subject INTEGER NOT NULL REFERENCES entities(id),
+    rel     TEXT    NOT NULL,
+    object  INTEGER NOT NULL REFERENCES entities(id),
+    props   TEXT    NOT NULL DEFAULT '{}',
+    PRIMARY KEY (subject, rel, object)
+);
+CREATE INDEX IF NOT EXISTS relations_object ON relations(object, rel);
 
 CREATE TABLE IF NOT EXISTS events (
     seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +136,16 @@ pub(crate) struct Carrier(pub(crate) bool);
 
 impl Component for Carrier {
     const KEY: &'static str = CARRIER_PROP;
+}
+
+/// A relation a destroy removed, as recorded in the `patch` event's
+/// `cascaded` list.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Cascaded {
+    /// Index of the destroy op that removed it.
+    pub op: usize,
+    #[serde(flatten)]
+    pub relation: Relation,
 }
 
 /// Who is applying a patch.
@@ -220,7 +241,7 @@ impl World {
             for (k, v) in note.into_iter().flatten() {
                 if !matches!(
                     k.as_str(),
-                    "patch" | "created" | "handles" | "by" | "op" | "reason"
+                    "patch" | "created" | "handles" | "cascaded" | "by" | "op" | "reason"
                 ) {
                     payload[k] = v.clone();
                 }
@@ -228,12 +249,19 @@ impl World {
         };
         let tx = self.conn.transaction()?;
         match apply_ops(&tx, patch, by)? {
-            Ok((created, handles)) => {
+            Ok(Outcome {
+                created,
+                handles,
+                cascaded,
+            }) => {
                 let mut payload = json!({
                     "patch": patch,
                     "created": created,
                     "handles": handles,
                 });
+                if !cascaded.is_empty() {
+                    payload["cascaded"] = json!(cascaded);
+                }
                 annotate(&mut payload);
                 let event_seq = insert_event(&tx, EventKind::Patch, &payload)?;
                 tx.commit()?;
@@ -439,7 +467,18 @@ fn insert_event(conn: &Connection, kind: EventKind, payload: &Value) -> rusqlite
     Ok(conn.last_insert_rowid())
 }
 
-type OpsOutcome = Result<(Vec<EntityId>, BTreeMap<String, EntityId>), Rejection>;
+/// What an accepted patch did beyond its ops' own effects.
+#[derive(Debug, Default, PartialEq)]
+struct Outcome {
+    /// Ids of entities created, in op order.
+    created: Vec<EntityId>,
+    /// Ids assigned to handles.
+    handles: BTreeMap<String, EntityId>,
+    /// Relations removed by destroys, in op order.
+    cascaded: Vec<Cascaded>,
+}
+
+type OpsOutcome = Result<Outcome, Rejection>;
 
 /// Apply ops in order inside `tx`. The outer `Result` is a storage failure;
 /// the inner one is a validation verdict. The caller rolls back on rejection.
@@ -447,6 +486,7 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
     let guarded = by == Authority::Director;
     let mut handles: BTreeMap<String, EntityId> = BTreeMap::new();
     let mut created = Vec::new();
+    let mut cascaded = Vec::new();
     // Entities given a location by this patch, with the op that placed them.
     let mut placed: HashMap<EntityId, usize> = HashMap::new();
 
@@ -585,11 +625,59 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
                         if inside == 1 { "y" } else { "ies" }
                     ));
                 }
+                for relation in relation::touching(tx, id)? {
+                    cascaded.push(Cascaded { op: i, relation });
+                }
+                tx.execute(
+                    "DELETE FROM relations WHERE subject = ?1 OR object = ?1",
+                    [id],
+                )?;
                 tx.execute("DELETE FROM entities WHERE id = ?1", [id])?;
+            }
+            Op::Relate {
+                subject,
+                rel,
+                object,
+                props,
+            } => {
+                let s = resolve!(subject);
+                let o = resolve!(object);
+                if let Some(reason) = bad_rel_name(rel, guarded) {
+                    return reject(reason);
+                }
+                tx.execute(
+                    "INSERT INTO relations (subject, rel, object, props) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (subject, rel, object) DO UPDATE SET props = excluded.props",
+                    params![s, rel, o, Value::Object(props.clone()).to_string()],
+                )?;
+            }
+            Op::Unrelate {
+                subject,
+                rel,
+                object,
+            } => {
+                let s = resolve!(subject);
+                let o = resolve!(object);
+                if let Some(reason) = bad_rel_name(rel, guarded) {
+                    return reject(reason);
+                }
+                let removed = tx.execute(
+                    "DELETE FROM relations WHERE subject = ?1 AND rel = ?2 AND object = ?3",
+                    params![s, rel, o],
+                )?;
+                if removed == 0 {
+                    return reject(format!(
+                        "{subject} is not {rel:?} {object}: there is no such relation to remove"
+                    ));
+                }
             }
         }
     }
-    Ok(Ok((created, handles)))
+    Ok(Ok(Outcome {
+        created,
+        handles,
+        cascaded,
+    }))
 }
 
 /// Resolve a ref to an existing entity id, or explain why it's missing.
@@ -645,6 +733,19 @@ fn cycle(tx: &Transaction, id: EntityId, dest: EntityId) -> rusqlite::Result<Opt
 
 fn is_engine_prop(key: &str) -> bool {
     key.starts_with(ENGINE_PROP_PREFIX)
+}
+
+/// Why `rel` can't be used as a relation name here, if it can't.
+fn bad_rel_name(rel: &str, guarded: bool) -> Option<String> {
+    if rel.trim().is_empty() {
+        Some("a relation needs a name".into())
+    } else if guarded && is_engine_prop(rel) {
+        Some(format!(
+            "relation {rel:?} is engine-owned (names starting with '{ENGINE_PROP_PREFIX}'); only the engine's tools change it"
+        ))
+    } else {
+        None
+    }
 }
 
 fn engine_prop_reason(key: &str) -> String {

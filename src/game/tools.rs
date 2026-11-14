@@ -279,7 +279,8 @@ fn read_bible(world: &World, input: ReadBibleInput) -> Result<ToolOutput, StoreE
 fn query_entity_def() -> ToolDefinition {
     ToolDefinition::new(
         "query_entity",
-        "Look up an entity by id: name, kind, props, where it is and what it contains.",
+        "Look up an entity by id: name, kind, props, where it is, what it contains, and its \
+         relations both ways (from: it is the subject; to: it is the object).",
         json!({
             "type": "object",
             "properties": {"id": {"type": "integer"}},
@@ -313,6 +314,14 @@ fn query_entity(world: &World, input: QueryEntityInput) -> Result<ToolOutput, St
             contents.push(brief(&c));
         }
     }
+    let mut from = Vec::new();
+    for r in world.relations_from(e.id, None)? {
+        from.push(json!({"rel": r.rel, "object": other_end(world, r.object)?, "props": r.props}));
+    }
+    let mut to = Vec::new();
+    for r in world.relations_to(e.id, None)? {
+        to.push(json!({"rel": r.rel, "subject": other_end(world, r.subject)?, "props": r.props}));
+    }
     ok(json!({
         "id": e.id,
         "name": e.name,
@@ -320,7 +329,16 @@ fn query_entity(world: &World, input: QueryEntityInput) -> Result<ToolOutput, St
         "location": location,
         "props": e.props,
         "contents": contents,
+        "relations": {"from": from, "to": to},
     }))
+}
+
+/// The far end of a relation, briefly (just the id if it vanished).
+fn other_end(world: &World, id: EntityId) -> Result<Value, StoreError> {
+    Ok(match world.entity(id)? {
+        Some(e) => brief(&e),
+        None => json!({"id": id}),
+    })
 }
 
 fn brief(e: &Entity) -> Value {
@@ -641,7 +659,11 @@ fn apply_patch_def() -> ToolDefinition {
          applies and you get the reason. Use it for every real consequence of an action. \
          Ops: create {handle?, name, kind, location?, props?}, move {entity, to}, \
          set_prop {entity, key, value}, remove_prop {entity, key}, rename {entity, name}, \
-         destroy {entity} (must be empty).",
+         destroy {entity} (must be empty; also removes its relations), \
+         relate {subject, rel, object, props?} (a directional fact such as \"guards\" or \
+         \"owns\"; replaces props if it already holds; a symmetric fact is two relates), \
+         unrelate {subject, rel, object} (must hold). Relation names are glossary terms; \
+         names starting with _ are engine-owned.",
         patch_schema(),
     )
 }
@@ -660,7 +682,8 @@ fn tick_apply_patch_def() -> ToolDefinition {
         "Advance an off-screen arc: an atomic list of ops applied in order; if one fails \
          nothing applies and you get the reason. Ops: create {handle?, name, kind, location?, \
          props?}, move {entity, to}, set_prop {entity, key, value}, remove_prop {entity, key}, \
-         rename {entity, name}, destroy {entity} (must be empty). The player, the player's \
+         rename {entity, name}, destroy {entity} (must be empty; also removes its relations), \
+         relate {subject, rel, object, props?}, unrelate {subject, rel, object}. The player, the player's \
          room and everything in them are off-limits.",
         schema,
     )
@@ -673,11 +696,13 @@ fn patch_schema() -> Value {
         "properties": {"ops": {"type": "array", "minItems": 1, "items": {
             "type": "object",
             "properties": {
-                "op": {"type": "string", "enum": ["create", "move", "set_prop", "remove_prop", "rename", "destroy"]},
-                "entity": r, "to": r, "location": r,
+                "op": {"type": "string", "enum": ["create", "move", "set_prop", "remove_prop", "rename", "destroy", "relate", "unrelate"]},
+                "entity": r, "to": r, "location": r, "subject": r, "object": r,
+                "rel": {"type": "string", "description": "relate/unrelate only: relation name, e.g. guards, owns, loves"},
                 "handle": {"type": "string"}, "name": {"type": "string"},
                 "kind": {"type": "string", "description": "create only. Free-form, e.g. item, feature, container. Use npc for any being that can move, speak or act on its own (people, animals, monsters, spirits); put its role or species in props."},
-                "key": {"type": "string"}, "value": {}, "props": {"type": "object"}
+                "key": {"type": "string"}, "value": {},
+                "props": {"type": "object", "description": "create: the new entity's props; relate: the relation's props"}
             },
             "required": ["op"]
         }}},
@@ -739,6 +764,12 @@ pub(crate) fn op_refs(op: &Op) -> Vec<&EntityRef> {
         | Op::RemoveProp { entity, .. }
         | Op::Rename { entity, .. }
         | Op::Destroy { entity } => vec![entity],
+        Op::Relate {
+            subject, object, ..
+        }
+        | Op::Unrelate {
+            subject, object, ..
+        } => vec![subject, object],
     }
 }
 

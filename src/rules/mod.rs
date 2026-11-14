@@ -286,6 +286,11 @@ fn validate_effects(
             Op::SetProp { key, .. } | Op::RemoveProp { key, .. } => vec![key],
             _ => vec![],
         };
+        if let Op::Relate { rel, .. } | Op::Unrelate { rel, .. } = op
+            && rel.starts_with(ENGINE_PROP_PREFIX)
+        {
+            return Err(format!("{what} {i}: relation {rel:?} is engine-owned"));
+        }
         if let Some(k) = keys.iter().find(|k| k.starts_with(ENGINE_PROP_PREFIX)) {
             return Err(format!("{what} {i}: prop {k:?} is engine-owned"));
         }
@@ -345,6 +350,12 @@ fn op_refs(op: &Op) -> Vec<&EntityRef> {
         | Op::RemoveProp { entity, .. }
         | Op::Rename { entity, .. }
         | Op::Destroy { entity } => vec![entity],
+        Op::Relate {
+            subject, object, ..
+        }
+        | Op::Unrelate {
+            subject, object, ..
+        } => vec![subject, object],
     }
 }
 
@@ -356,6 +367,12 @@ fn op_refs_mut(op: &mut Op) -> Vec<&mut EntityRef> {
         | Op::RemoveProp { entity, .. }
         | Op::Rename { entity, .. }
         | Op::Destroy { entity } => vec![entity],
+        Op::Relate {
+            subject, object, ..
+        }
+        | Op::Unrelate {
+            subject, object, ..
+        } => vec![subject, object],
     }
 }
 

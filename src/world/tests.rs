@@ -582,3 +582,231 @@ fn stores_from_other_schema_versions_are_refused() {
     }
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+// ---- relations ----
+
+fn relate(subject: impl Into<EntityRef>, rel: &str, object: impl Into<EntityRef>) -> Op {
+    Op::Relate {
+        subject: subject.into(),
+        rel: rel.into(),
+        object: object.into(),
+        props: Map::new(),
+    }
+}
+
+fn unrelate(subject: impl Into<EntityRef>, rel: &str, object: impl Into<EntityRef>) -> Op {
+    Op::Unrelate {
+        subject: subject.into(),
+        rel: rel.into(),
+        object: object.into(),
+    }
+}
+
+fn row(subject: EntityId, rel: &str, object: EntityId, props: Value) -> Relation {
+    Relation {
+        subject,
+        rel: rel.into(),
+        object,
+        props: props.as_object().unwrap().clone(),
+    }
+}
+
+#[test]
+fn relate_upserts_and_reads_both_ways_with_filters() {
+    let (mut w, cellar, chest, key) = seeded();
+    w.apply_patch(&Patch::new(vec![
+        relate(key, "opens", chest),
+        Op::Relate {
+            subject: chest.into(),
+            rel: "guards".into(),
+            object: cellar.into(),
+            props: json!({"since": "dawn"}).as_object().unwrap().clone(),
+        },
+    ]))
+    .unwrap();
+    assert_eq!(
+        w.relations_from(key, None).unwrap(),
+        vec![row(key, "opens", chest, json!({}))]
+    );
+    assert_eq!(
+        w.relations_to(chest, Some("opens")).unwrap(),
+        vec![row(key, "opens", chest, json!({}))]
+    );
+    assert!(w.relations_to(chest, Some("guards")).unwrap().is_empty());
+
+    // Relating again replaces the props; it doesn't add a second row.
+    w.apply_patch(&Patch::new(vec![Op::Relate {
+        subject: chest.into(),
+        rel: "guards".into(),
+        object: cellar.into(),
+        props: json!({"since": "dusk"}).as_object().unwrap().clone(),
+    }]))
+    .unwrap();
+    assert_eq!(
+        w.relations_from(chest, None).unwrap(),
+        vec![row(chest, "guards", cellar, json!({"since": "dusk"}))]
+    );
+    assert_eq!(w.relations().unwrap().len(), 2);
+
+    // Directional: the reverse fact doesn't hold.
+    let r = rejected(&mut w, vec![unrelate(cellar, "guards", chest)]);
+    assert!(r.reason.contains("no such relation"), "{}", r.reason);
+
+    w.apply_patch(&Patch::new(vec![unrelate(chest, "guards", cellar)]))
+        .unwrap();
+    assert!(w.relations_from(chest, None).unwrap().is_empty());
+}
+
+#[test]
+fn relate_takes_handles_from_earlier_creates() {
+    let (mut w, cellar, _, _) = seeded();
+    let a = w
+        .apply_patch(&Patch::new(vec![
+            create("hound", "Hound", "npc", Some(cellar.into())),
+            relate("hound", "guards", cellar),
+        ]))
+        .unwrap();
+    let hound = a.handles["hound"];
+    assert_eq!(
+        w.relations_from(hound, None).unwrap(),
+        vec![row(hound, "guards", cellar, json!({}))]
+    );
+}
+
+#[test]
+fn relation_ops_are_validated() {
+    let (mut w, cellar, chest, _) = seeded();
+    let before = w.state().unwrap();
+    for (ops, want) in [
+        (vec![relate(99, "guards", chest)], "#99 does not exist"),
+        (vec![relate(chest, "guards", 99)], "#99 does not exist"),
+        (vec![relate("nope", "guards", chest)], "unknown handle"),
+        (vec![relate(chest, "  ", cellar)], "needs a name"),
+        (vec![unrelate(chest, "guards", cellar)], "no such relation"),
+        // An earlier op's relation is rolled back with the patch.
+        (
+            vec![
+                relate(chest, "guards", cellar),
+                unrelate(chest, "owns", cellar),
+            ],
+            "no such relation",
+        ),
+    ] {
+        let r = rejected(&mut w, ops);
+        assert!(r.reason.contains(want), "{} !~ {want}", r.reason);
+    }
+    assert_eq!(w.state().unwrap(), before);
+}
+
+#[test]
+fn engine_owned_relation_names_are_refused_for_the_director_only() {
+    let (mut w, cellar, chest, _) = seeded();
+    let r = rejected(&mut w, vec![relate(chest, "_pins", cellar)]);
+    assert!(r.reason.contains("engine-owned"), "{}", r.reason);
+    w.apply_engine_patch(&Patch::new(vec![relate(chest, "_pins", cellar)]))
+        .unwrap();
+    let r = rejected(&mut w, vec![unrelate(chest, "_pins", cellar)]);
+    assert!(r.reason.contains("engine-owned"), "{}", r.reason);
+    w.apply_engine_patch(&Patch::new(vec![unrelate(chest, "_pins", cellar)]))
+        .unwrap();
+    assert!(w.relations().unwrap().is_empty());
+}
+
+#[test]
+fn destroy_cascades_relations_both_ways_and_logs_them() {
+    let (mut w, cellar, chest, key) = seeded();
+    let hall = w
+        .apply_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .unwrap()
+        .created[0];
+    w.apply_patch(&Patch::new(vec![
+        relate(key, "opens", chest),
+        Op::Relate {
+            subject: hall.into(),
+            rel: "beside".into(),
+            object: key.into(),
+            props: json!({"far": false}).as_object().unwrap().clone(),
+        },
+        relate(hall, "beside", cellar),
+    ]))
+    .unwrap();
+
+    let applied = w
+        .apply_patch(&Patch::new(vec![
+            Op::SetProp {
+                entity: chest.into(),
+                key: "x".into(),
+                value: json!(1),
+            },
+            Op::Destroy { entity: key.into() },
+        ]))
+        .unwrap();
+    assert_eq!(
+        w.relations().unwrap(),
+        vec![row(hall, "beside", cellar, json!({}))]
+    );
+    let event = w.events().unwrap().pop().unwrap();
+    assert_eq!(event.seq, applied.event_seq);
+    assert_eq!(
+        event.payload["cascaded"],
+        json!([
+            {"op": 1, "subject": key, "rel": "opens", "object": chest, "props": {}},
+            {"op": 1, "subject": hall, "rel": "beside", "object": key, "props": {"far": false}},
+        ])
+    );
+
+    // A destroy with nothing to cascade records no list.
+    let applied = w
+        .apply_patch(&Patch::new(vec![Op::Destroy {
+            entity: chest.into(),
+        }]))
+        .unwrap();
+    let event = w.events().unwrap().pop().unwrap();
+    assert_eq!(event.seq, applied.event_seq);
+    assert!(event.payload.get("cascaded").is_none());
+}
+
+#[test]
+fn destroy_still_refuses_a_non_empty_container_and_keeps_its_relations() {
+    let (mut w, cellar, chest, key) = seeded();
+    w.apply_patch(&Patch::new(vec![relate(chest, "in", cellar)]))
+        .unwrap();
+    let r = rejected(
+        &mut w,
+        vec![Op::Destroy {
+            entity: chest.into(),
+        }],
+    );
+    assert!(r.reason.contains("still contains"), "{}", r.reason);
+    assert_eq!(w.relations().unwrap().len(), 1);
+    assert!(w.entity(key).unwrap().is_some());
+}
+
+#[test]
+fn a_note_cannot_override_the_cascaded_list() {
+    let (mut w, cellar, chest, key) = seeded();
+    w.apply_patch(&Patch::new(vec![relate(key, "opens", chest)]))
+        .unwrap();
+    let note = json!({"cascaded": [], "rule": {"id": 1}});
+    w.apply_patch_noted(
+        &Patch::new(vec![
+            mv(key, Some(cellar.into())),
+            Op::Destroy { entity: key.into() },
+        ]),
+        note.as_object().unwrap(),
+    )
+    .unwrap();
+    let event = w.events().unwrap().pop().unwrap();
+    assert_eq!(event.payload["cascaded"].as_array().unwrap().len(), 1);
+    assert_eq!(event.payload["rule"]["id"], 1);
+}
+
+#[test]
+fn relation_ops_touch_both_ends() {
+    let (mut w, cellar, chest, _) = seeded();
+    w.apply_patch(&Patch::new(vec![relate(chest, "guards", cellar)]))
+        .unwrap();
+    let event = w.events().unwrap().pop().unwrap();
+    let touches = event.patch_touches().unwrap();
+    assert_eq!(touches[0].1, vec![chest, cellar]);
+}

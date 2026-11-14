@@ -1,5 +1,6 @@
-//! The glossary: every prop name (and enum-like value) the director has
-//! introduced, with a one-line meaning, so rules keep matching the world's
+//! The glossary: every prop name (and enum-like value) and relation name
+//! the director has introduced, with a one-line meaning (a term may name a
+//! prop, a relation, or both), so rules keep matching the world's
 //! vocabulary (`rotten` doesn't quietly become `decayed`).
 //!
 //! It is one engine-owned entity of kind [`GLOSSARY_KIND`] holding the terms
@@ -41,7 +42,7 @@ impl Component for Terms {
     const KEY: &'static str = "_terms";
 }
 
-/// One registered prop name.
+/// One registered prop or relation name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Term {
     /// What the prop means; empty until the director defines it.
@@ -130,7 +131,8 @@ pub fn index(world: &World) -> Result<String, StoreError> {
     Ok(names.join(", "))
 }
 
-/// Record the prop names and enum-like values that `patch` introduces.
+/// Record the prop names, enum-like values and relation names that
+/// `patch` introduces.
 /// Returns the new entries (`name` or `name=value`) so the director can be
 /// asked to define them.
 pub fn register_patch(world: &mut World, patch: &Patch) -> Result<Vec<String>, StoreError> {
@@ -142,6 +144,7 @@ pub fn register_patch(world: &mut World, patch: &Patch) -> Result<Vec<String>, S
             }
             Op::SetProp { key, value, .. } => seen.push((key, Some(value))),
             Op::RemoveProp { key, .. } => seen.push((key, None)),
+            Op::Relate { rel, .. } => seen.push((rel, None)),
             _ => {}
         }
     }
