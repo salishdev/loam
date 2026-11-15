@@ -5,6 +5,7 @@
 //! longer than the width. A wrapped line's continuation keeps the leading
 //! indentation of the line it came from, so indented lists stay aligned.
 //! Existing newlines are kept; trailing spaces before a break are dropped.
+//! A wrapper can also put a left margin before every line that has text.
 
 /// The widest text the REPL prints, in columns, however wide the terminal.
 pub const MAX_WIDTH: usize = 80;
@@ -25,9 +26,27 @@ pub fn output_width() -> usize {
         .map_or(MAX_WIDTH, |w| w.min(MAX_WIDTH))
 }
 
+/// The REPL's left margin in columns when `LOAM_MARGIN` isn't set.
+pub const DEFAULT_MARGIN: usize = 2;
+
+/// The left margin for REPL output: `LOAM_MARGIN` if set to a number, else
+/// [`DEFAULT_MARGIN`]. The prompt sits in this margin, so input and output
+/// start in different columns.
+pub fn output_margin() -> usize {
+    std::env::var("LOAM_MARGIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MARGIN)
+}
+
 /// Wraps a whole text at `width` columns.
 pub fn wrap(text: &str, width: usize) -> String {
-    let mut w = Wrapper::new(width);
+    wrap_with_margin(text, width, 0)
+}
+
+/// Wraps a whole text at `width` columns, `margin` of which are a left margin.
+pub fn wrap_with_margin(text: &str, width: usize, margin: usize) -> String {
+    let mut w = Wrapper::with_margin(width, margin);
     let mut out = w.push(text);
     out.push_str(&w.finish());
     out
@@ -38,8 +57,13 @@ pub fn wrap(text: &str, width: usize) -> String {
 /// A word split across chunks is held back until it is complete.
 #[derive(Debug)]
 pub struct Wrapper {
+    /// Width of the text, not counting the margin.
     width: usize,
-    /// Column the next character lands in.
+    /// Spaces put before each line that has text; blank lines stay empty.
+    margin: String,
+    /// The margin has been printed on the current line.
+    margined: bool,
+    /// Column the next character lands in, not counting the margin.
     col: usize,
     /// The current line's leading whitespace, repeated on continuations.
     indent: String,
@@ -54,8 +78,16 @@ pub struct Wrapper {
 
 impl Wrapper {
     pub fn new(width: usize) -> Self {
+        Self::with_margin(width, 0)
+    }
+
+    /// A wrapper whose lines start with `margin` spaces; the text wraps in
+    /// the `width - margin` columns that are left.
+    pub fn with_margin(width: usize, margin: usize) -> Self {
         Wrapper {
-            width: width.max(1),
+            width: width.saturating_sub(margin).max(1),
+            margin: " ".repeat(margin),
+            margined: false,
             col: 0,
             indent: String::new(),
             at_line_start: true,
@@ -72,12 +104,14 @@ impl Wrapper {
                 '\n' => {
                     self.place_word(&mut out);
                     out.push('\n');
+                    self.margined = false;
                     self.col = 0;
                     self.spaces = 0;
                     self.indent.clear();
                     self.at_line_start = true;
                 }
                 ' ' | '\t' if self.at_line_start => {
+                    self.put_margin(&mut out);
                     out.push(c);
                     self.indent.push(c);
                     self.col += if c == '\t' { 8 - self.col % 8 } else { 1 };
@@ -103,6 +137,14 @@ impl Wrapper {
         out
     }
 
+    /// Prints the margin if this line doesn't have it yet.
+    fn put_margin(&mut self, out: &mut String) {
+        if !self.margined {
+            out.push_str(&self.margin);
+            self.margined = true;
+        }
+    }
+
     fn indent_width(&self) -> usize {
         self.indent
             .chars()
@@ -114,10 +156,12 @@ impl Wrapper {
         if self.word.is_empty() {
             return;
         }
+        self.put_margin(out);
         let len = self.word.chars().count();
         let indent = self.indent_width();
         if self.col > indent && self.col + self.spaces + len > self.width {
             out.push('\n');
+            out.push_str(&self.margin);
             out.push_str(&self.indent);
             self.col = indent;
         } else {
@@ -182,6 +226,35 @@ mod tests {
             assert_eq!(out, wrap(text, 20), "chunk size {size}");
         }
         assert!(wrap(text, 20).lines().all(|l| l.chars().count() <= 20));
+    }
+
+    #[test]
+    fn a_margin_starts_every_line_with_text_and_narrows_the_width() {
+        assert_eq!(
+            wrap_with_margin("the quick brown fox\n\n  jumps over it", 12, 2),
+            "  the quick\n  brown fox\n\n    jumps\n    over it"
+        );
+        let text = "The mill wheel groans. Water pours through the sluice.";
+        assert!(
+            wrap_with_margin(text, 20, 3)
+                .lines()
+                .all(|l| l.starts_with("   ") && l.chars().count() <= 20)
+        );
+    }
+
+    #[test]
+    fn a_streamed_margin_matches_the_whole_text() {
+        let text = "one two three four five\nsix seven eight";
+        for size in 1..8 {
+            let mut w = Wrapper::with_margin(12, 2);
+            let chars: Vec<char> = text.chars().collect();
+            let mut out = String::new();
+            for chunk in chars.chunks(size) {
+                out.push_str(&w.push(&chunk.iter().collect::<String>()));
+            }
+            out.push_str(&w.finish());
+            assert_eq!(out, wrap_with_margin(text, 12, 2), "chunk size {size}");
+        }
     }
 
     #[test]

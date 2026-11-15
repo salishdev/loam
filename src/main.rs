@@ -11,6 +11,11 @@
 //! commands (`:help` lists them); the inspector commands read only the
 //! store and its log, never the LLM.
 //!
+//! Output sits behind a left margin (`LOAM_MARGIN`, default 2) and the prompt
+//! sits in it, so your lines start further left than the game's. On a
+//! terminal the prompt is coloured, typed input is bold and the engine's
+//! bracketed notices are dim; `NO_COLOR` turns colour off.
+//!
 //! Variables such as `ANTHROPIC_API_KEY` can live in a `.env` file, read from
 //! the current directory and then the repo root; real environment variables
 //! win.
@@ -24,7 +29,7 @@ use loam::inspect;
 use loam::llm::AnthropicClient;
 use loam::quest::Verdict;
 use loam::world::World;
-use loam::wrap::{Wrapper, output_width, wrap};
+use loam::wrap::{Wrapper, output_margin, output_width, wrap_with_margin};
 
 fn main() -> ExitCode {
     match run() {
@@ -65,20 +70,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let client = AnthropicClient::from_env()?;
     let mut game = Game::new(World::open(&path)?);
     if seed_file.is_some() && game.has_bible()? {
-        eprintln!("[{path} already has a world; the seed is ignored]");
+        note(&format!(
+            "[{path} already has a world; the seed is ignored]"
+        ));
     }
     let mut editor = LineEditor::new()?;
 
     if !game.has_bible()? {
         let mut seed = String::new();
         if let Some(found) = &seed_file {
-            println!("New world in {path}, seeded from {}.", found.source);
+            say(&format!(
+                "New world in {path}, seeded from {}.",
+                found.source
+            ));
             seed.push_str(&found.text);
         } else if let Some(found) = choose_seed(&path, &mut editor)? {
-            println!("Seeded from {}.", found.source);
+            say(&format!("Seeded from {}.", found.source));
             seed.push_str(&found.text);
         } else {
-            println!("Describe the world's plot, tone and setting; end with a blank line.");
+            say("Describe the world's plot, tone and setting; end with a blank line.");
             while let Some(line) = editor.read_line("")? {
                 if line.trim().is_empty() && !seed.trim().is_empty() {
                     break;
@@ -90,7 +100,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if seed.trim().is_empty() {
             return Err("no seed prompt given".into());
         }
-        println!("Building the world…");
+        say("Building the world…");
         game.create_bible(&client, seed.trim())?;
     }
     if !game.has_begun()? {
@@ -102,7 +112,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         println!();
-        let Some(line) = editor.read_line("> ")? else {
+        let Some(line) = editor.read_line(PROMPT)? else {
             break;
         };
         let input = line.trim();
@@ -136,10 +146,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         match narrate(|stream| game.turn(&client, input, stream)) {
             Ok(outcome) => {
                 if let Some(reason) = outcome.stop_reason {
-                    eprintln!("\n[stopped early: {reason:?}]");
+                    note(&format!("\n[stopped early: {reason:?}]"));
                 }
                 if let Some(rule) = outcome.fast_path {
-                    eprintln!("\n[fast path: rule #{rule}]");
+                    note(&format!("\n[fast path: rule #{rule}]"));
                 }
                 println!();
                 for j in &outcome.judgments {
@@ -156,7 +166,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             // A failed turn is reported; the save stays usable.
-            Err(e) => eprintln!("\n[turn failed: {e}]"),
+            Err(e) => note(&format!("\n[turn failed: {e}]")),
         }
     }
     Ok(())
@@ -397,21 +407,21 @@ fn choose_seed(
 ) -> Result<Option<Seed>, Box<dyn std::error::Error>> {
     let dirs = seed_dirs();
     let names = list_seeds(&dirs);
-    println!("New world in {path}. Pick a seed:");
+    say(&format!("New world in {path}. Pick a seed:"));
     for (i, name) in names.iter().enumerate() {
         let teaser =
             resolve_seed(name, &dirs).map_or_else(|_| String::new(), |s| seed_teaser(&s.text));
-        println!("  {}. {name} — {teaser}", i + 1);
+        say(&format!("  {}. {name} — {teaser}", i + 1));
     }
-    println!("  {}. Write your own", names.len() + 1);
+    say(&format!("  {}. Write your own", names.len() + 1));
     loop {
-        let Some(answer) = input.read_line("> ")? else {
+        let Some(answer) = input.read_line(PROMPT)? else {
             return Err("no seed chosen".into());
         };
         match parse_seed_choice(&answer, &names) {
             Some(SeedChoice::Named(name)) => return Ok(Some(resolve_seed(&name, &dirs)?)),
             Some(SeedChoice::Own) => return Ok(None),
-            None => println!("Type a number from 1 to {}.", names.len() + 1),
+            None => say(&format!("Type a number from 1 to {}.", names.len() + 1)),
         }
     }
 }
@@ -419,11 +429,21 @@ fn choose_seed(
 /// Reads input lines through a line editor, so the arrow keys move the caret
 /// and recall earlier lines instead of typing escape codes. Piped input is
 /// read line by line as before.
-struct LineEditor(rustyline::DefaultEditor);
+struct LineEditor(rustyline::Editor<InputStyle, rustyline::history::DefaultHistory>);
 
 impl LineEditor {
     fn new() -> rustyline::Result<Self> {
-        Ok(Self(rustyline::DefaultEditor::new()?))
+        use rustyline::config::{ColorMode, Config};
+        // rustyline already skips colour when stdout isn't a terminal.
+        let colour = if colour_on(&io::stdout()) {
+            ColorMode::Enabled
+        } else {
+            ColorMode::Disabled
+        };
+        let mut editor =
+            rustyline::Editor::with_config(Config::builder().color_mode(colour).build())?;
+        editor.set_helper(Some(InputStyle));
+        Ok(Self(editor))
     }
 
     /// Shows `prompt` and reads one line, keeping it in the history when it
@@ -443,18 +463,92 @@ impl LineEditor {
     }
 }
 
+/// The REPL prompt. It is as wide as the default margin, so typed text
+/// lines up with the output while the glyph sits in the margin.
+const PROMPT: &str = "› ";
+
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+/// Styles the line being typed: an accent-coloured prompt and bold input, so
+/// your lines stand out from the game's in scrollback. rustyline only calls
+/// it when colour is on.
+struct InputStyle;
+
+impl rustyline::highlight::Highlighter for InputStyle {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        if line.is_empty() {
+            line.into()
+        } else {
+            format!("\x1b[1m{line}{RESET}").into()
+        }
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        if prompt.is_empty() {
+            prompt.into()
+        } else {
+            format!("\x1b[1;36m{prompt}{RESET}").into()
+        }
+    }
+
+    /// Restyle on every keystroke, so typed characters are bold too.
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        true
+    }
+}
+
+impl rustyline::completion::Completer for InputStyle {
+    type Candidate = String;
+}
+impl rustyline::hint::Hinter for InputStyle {
+    type Hint = String;
+}
+impl rustyline::validate::Validator for InputStyle {}
+impl rustyline::Helper for InputStyle {}
+
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs, :stats, :time, :pressures, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
 
-/// Prints text word-wrapped to the output width, then a newline.
+/// Prints text word-wrapped to the output width behind the margin, then a
+/// newline.
 fn say(text: &str) {
-    println!("{}", wrap(text, output_width()));
+    println!(
+        "{}",
+        wrap_with_margin(text, output_width(), output_margin())
+    );
+}
+
+/// Prints an engine notice (`[world tick: …]`, failures) on stderr like
+/// [`say`], dimmed when stderr is a colour terminal.
+fn note(text: &str) {
+    let text = wrap_with_margin(text, output_width(), output_margin());
+    if colour_on(&io::stderr()) {
+        eprintln!("{DIM}{text}{RESET}");
+    } else {
+        eprintln!("{text}");
+    }
+}
+
+/// Whether to colour what goes to `stream`: it's a terminal and `NO_COLOR`
+/// isn't set to something (see no-color.org).
+fn colour_on(stream: &impl io::IsTerminal) -> bool {
+    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
 }
 
 /// Streams narration to stdout, word-wrapped to the output width, while `f`
 /// runs; `f` gets the callback to pass to the game.
 fn narrate<T>(f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
-    let mut wrapper = Wrapper::new(output_width());
+    let mut wrapper = Wrapper::with_margin(output_width(), output_margin());
     let mut out = io::stdout();
     let result = f(&mut |t: &str| {
         let _ = write!(out, "{}", wrapper.push(t));
@@ -469,7 +563,7 @@ fn narrate<T>(f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
 fn show(cmd: &str, report: Result<String, loam::world::StoreError>) {
     match report {
         Ok(text) => say(&text),
-        Err(e) => eprintln!("[{cmd} unavailable: {e}]"),
+        Err(e) => note(&format!("[{cmd} unavailable: {e}]")),
     }
 }
 
@@ -483,32 +577,34 @@ fn fork(world: &World, arg: &str) {
         parts.next(),
         parts.next(),
     ) else {
-        println!("Usage: :fork <event> <path>");
+        say("Usage: :fork <event> <path>");
         return;
     };
     // Checked first so a bad event number doesn't leave an empty save behind.
     match world.last_seq() {
         Ok(last) if (0..=last).contains(&at) => {}
         Ok(last) => {
-            println!("No event #{at}: the log ends at #{last}.");
+            say(&format!("No event #{at}: the log ends at #{last}."));
             return;
         }
         Err(e) => {
-            eprintln!("[fork failed: {e}]");
+            note(&format!("[fork failed: {e}]"));
             return;
         }
     }
     match world.fork(at, path) {
-        Ok(_) => println!("Forked at event #{at} into {path}; run `loam {path}` to play it."),
-        Err(e) => eprintln!("[fork failed: {e}]"),
+        Ok(_) => say(&format!(
+            "Forked at event #{at} into {path}; run `loam {path}` to play it."
+        )),
+        Err(e) => note(&format!("[fork failed: {e}]")),
     }
 }
 
 /// A terse builder's line on stderr; the player sees nothing of the tick.
 fn report_tick(result: Result<TickOutcome, GameError>) {
     match result {
-        Ok(t) => eprintln!("[world tick: {} change(s)]", t.changes.len()),
-        Err(e) => eprintln!("[world tick failed: {e}]"),
+        Ok(t) => note(&format!("[world tick: {} change(s)]", t.changes.len())),
+        Err(e) => note(&format!("[world tick failed: {e}]")),
     }
 }
 
