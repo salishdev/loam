@@ -531,3 +531,115 @@ fn why_shows_relations_and_their_cascades() {
         "{out}"
     );
 }
+
+#[test]
+fn log_lists_recent_events_one_line_each() {
+    let mut f = fixture();
+    kick_turn(&mut f);
+    let out = log(&f.world, "").unwrap();
+    assert!(out.starts_with("#1 input: seed: a damp keep\n"), "{out}");
+    assert!(out.contains("input: > kick the oak door"), "{out}");
+    assert!(
+        out.contains("rule_change: rule #") && out.contains("\"Kicking a rotten door\" minted v1"),
+        "{out}"
+    );
+    assert!(
+        out.contains("patch: by rule #") && out.contains(&format!("set #{}.broken = true", f.oak)),
+        "{out}"
+    );
+    assert!(out.lines().all(|l| l.starts_with('#')), "{out}");
+
+    let last = f.world.last_seq().unwrap();
+    let two = log(&f.world, "2").unwrap();
+    assert_eq!(two.lines().count(), 3, "{two}");
+    assert!(
+        two.starts_with(&format!("({} earlier event(s) not shown", last - 2)),
+        "{two}"
+    );
+    assert!(
+        two.lines()
+            .last()
+            .unwrap()
+            .starts_with(&format!("#{last} ")),
+        "{two}"
+    );
+    assert_eq!(log(&f.world, "all").unwrap().lines().count() as i64, last);
+}
+
+#[test]
+fn log_filters_by_kind_and_caps_at_twenty() {
+    let f = fixture();
+    for i in 0..25 {
+        f.world
+            .log_event(
+                EventKind::Roll,
+                &json!({"stat": "craft", "die": i, "value": 2,
+                "total": i + 2, "difficulty": 10, "result": "failure", "reason": "prying"}),
+            )
+            .unwrap();
+    }
+    let rolls = log(&f.world, "roll").unwrap();
+    assert!(
+        rolls.starts_with("(5 earlier event(s) not shown"),
+        "{rolls}"
+    );
+    assert_eq!(rolls.lines().count(), 21, "{rolls}");
+    assert!(
+        rolls.ends_with("roll: craft d20 24 + 2 = 26 vs 10: failure (prying)"),
+        "{rolls}"
+    );
+    let inputs = log(&f.world, "input patch").unwrap();
+    assert_eq!(inputs.lines().count(), 2, "{inputs}");
+    assert_eq!(log(&f.world, "tick").unwrap(), "No events logged.");
+    assert!(
+        log(&f.world, "bogus")
+            .unwrap()
+            .starts_with("Unknown :log word \"bogus\"")
+    );
+}
+
+#[test]
+fn log_shows_one_event_in_full() {
+    let f = fixture();
+    let seq = f
+        .world
+        .log_event(
+            EventKind::Narration,
+            &json!({"text": "Dust.\n\nMore dust."}),
+        )
+        .unwrap();
+    let out = log(&f.world, &format!("#{seq}")).unwrap();
+    let (head, rest) = out.split_once('\n').unwrap();
+    assert!(head.starts_with(&format!("#{seq} narration at ")), "{out}");
+    assert_eq!(rest, "Dust.\n\nMore dust.");
+
+    let out = log(&f.world, "#2").unwrap();
+    assert!(out.contains("by engine: create #"), "{out}");
+    assert!(out.contains("\n{\n  \"by\": \"engine\""), "{out}");
+    assert_eq!(log(&f.world, "#999").unwrap(), "No event #999.");
+    assert!(log(&f.world, "#x").unwrap().starts_with("Usage: :log"));
+}
+
+#[test]
+fn rejected_creates_show_no_created_id() {
+    let mut f = fixture();
+    let bad = Patch::new(vec![
+        serde_json::from_value(json!({"op": "create", "name": "pebble", "kind": "item",
+            "location": f.scope.room}))
+        .unwrap(),
+        Op::Destroy {
+            entity: 9999.into(),
+        },
+    ]);
+    assert!(f.world.apply_patch(&bad).is_err());
+    let out = log(&f.world, "patch_rejected").unwrap();
+    assert!(
+        out.contains(&format!("create \"pebble\" (item) in #{}", f.scope.room)),
+        "{out}"
+    );
+    let hall = why(&f.world, "Hall").unwrap();
+    assert!(
+        hall.contains(&format!("create \"pebble\" (item) in #{}", f.scope.room)),
+        "{hall}"
+    );
+}

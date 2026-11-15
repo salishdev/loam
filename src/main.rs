@@ -125,6 +125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":npcs" => show(cmd, inspect::npcs(world)),
                 ":relations" => show(cmd, inspect::relations(world, arg)),
                 ":stats" => show(cmd, inspect::stats(world)),
+                ":log" => show(cmd, inspect::log(world, arg)),
                 ":fork" => fork(world, arg),
                 ":help" => say(HELP),
                 _ => say(&format!("Unknown command {cmd}. {HELP}")),
@@ -418,7 +419,7 @@ fn choose_seed(
 }
 
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs, :stats, :fork <event> <path>, :tick, :quit";
+:quests, :npcs, :stats, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
 
 /// Prints text word-wrapped to the output width, then a newline.
 fn say(text: &str) {

@@ -34,7 +34,7 @@ loam x.db                     # resume (or pick a seed if the save is new)
 ```
 
 In the game, `:help` lists the inspector commands (`:rules`, `:quests`,
-`:stats`, `:why`, …).
+`:stats`, `:why`, `:log`, …).
 
 Text wraps at 80 columns, or the terminal width if that is narrower. Set
 `LOAM_WIDTH` to choose another width, or to `0` to turn wrapping off.

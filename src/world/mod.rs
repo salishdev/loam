@@ -377,6 +377,20 @@ impl World {
         Ok(changed)
     }
 
+    /// The event with sequence number `seq`, if there is one.
+    pub fn event(&self, seq: i64) -> Result<Option<Event>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, kind, payload, at FROM events WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(seq, kind, payload, at)| parse_event(seq, kind, payload, at))
+            .transpose()
+    }
+
     /// Events with `seq > after`, in order.
     pub fn events_since(&self, after: i64) -> Result<Vec<Event>, StoreError> {
         let mut stmt = self

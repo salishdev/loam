@@ -1,5 +1,5 @@
 //! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:npcs`, `:stats`.
+//! `:quests`, `:npcs`, `:stats`, `:log`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -23,6 +23,10 @@ use crate::world::{Cascaded, Entity, EntityId, Event, EventKind, Op, Relation, S
 const VALUE_CHARS: usize = 100;
 /// Most trail entries `:why` prints; older ones are counted, not shown.
 const MAX_TRAIL: usize = 60;
+/// Events `:log` lists when not given a count.
+const LOG_DEFAULT: usize = 20;
+/// Longest one-line summary `:log` prints for an event.
+const LOG_LINE_CHARS: usize = 160;
 
 /// Every rule in id order, retired ones marked.
 pub fn rules(world: &World) -> Result<String, StoreError> {
@@ -505,7 +509,7 @@ fn trail_line(e: &Event, id: EntityId) -> Result<Option<String>, StoreError> {
                 .patch_touches()?
                 .iter()
                 .filter(|(_, ids)| ids.contains(&id))
-                .map(|(op, ids)| render_op(op, ids))
+                .map(|(op, ids)| render_op(op, created_ids(e, ids)))
                 .collect();
             let cascaded: Vec<Cascaded> = match p.get("cascaded") {
                 Some(c) => serde_json::from_value(c.clone()).map_err(|err| {
@@ -523,23 +527,7 @@ fn trail_line(e: &Event, id: EntityId) -> Result<Option<String>, StoreError> {
             if ops.is_empty() && rule_id != Some(id) {
                 return Ok(None);
             }
-            let by = if p["by"] == "engine" {
-                "engine".to_owned()
-            } else if let Some(r) = rule_id {
-                let v = p["rule"]["version"].as_u64().unwrap_or(0);
-                let bindings = p["bindings"]
-                    .as_object()
-                    .map(|b| {
-                        b.iter()
-                            .map(|(role, v)| format!("{role}=#{v}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                format!("rule #{r} v{v} {bindings}").trim_end().to_owned()
-            } else {
-                "director".to_owned()
-            };
+            let by = patch_by(p);
             let what = if ops.is_empty() {
                 "applied (does not touch this entity)".to_owned()
             } else {
@@ -602,6 +590,208 @@ fn trail_line(e: &Event, id: EntityId) -> Result<Option<String>, StoreError> {
         }
         _ => None,
     })
+}
+
+/// The ids to hand [`render_op`] for an op of `e`: a rejected patch created
+/// nothing, so its creates get none (the first id there is the location).
+fn created_ids<'a>(e: &Event, ids: &'a [EntityId]) -> &'a [EntityId] {
+    if e.kind == EventKind::PatchRejected {
+        &[]
+    } else {
+        ids
+    }
+}
+
+/// Who applied a patch: the engine, a rule (with version and bindings) or
+/// the director.
+fn patch_by(p: &Value) -> String {
+    if p["by"] == "engine" {
+        "engine".to_owned()
+    } else if let Some(r) = p["rule"]["id"].as_i64() {
+        let v = p["rule"]["version"].as_u64().unwrap_or(0);
+        let bindings = p["bindings"]
+            .as_object()
+            .map(|b| {
+                b.iter()
+                    .map(|(role, v)| format!("{role}=#{v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        format!("rule #{r} v{v} {bindings}").trim_end().to_owned()
+    } else {
+        "director".to_owned()
+    }
+}
+
+/// `:log`: the event log.
+///
+/// - `:log` lists the last 20 events, one line each.
+/// - A number lists that many; `all` lists every one.
+/// - Kind names (`patch`, `roll`, `tool_call`, …) keep only those kinds.
+/// - `#<seq>` shows that one event in full.
+///
+/// Words combine in any order: `:log patch roll 50`.
+pub fn log(world: &World, arg: &str) -> Result<String, StoreError> {
+    let usage = || {
+        let kinds: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+        format!(
+            "Usage: :log [count | all] [kind…] or :log #<event>. Kinds: {}.",
+            kinds.join(", ")
+        )
+    };
+    if let Some(seq) = arg.strip_prefix('#') {
+        let Ok(seq) = seq.trim().parse::<i64>() else {
+            return Ok(usage());
+        };
+        return Ok(match world.event(seq)? {
+            Some(e) => event_detail(&e)?,
+            None => format!("No event #{seq}."),
+        });
+    }
+
+    let mut limit = Some(LOG_DEFAULT);
+    let mut kinds = Vec::new();
+    for word in arg.split_whitespace() {
+        if word == "all" {
+            limit = None;
+        } else if let Ok(n) = word.parse::<usize>() {
+            limit = Some(n);
+        } else if let Some(k) = EventKind::parse(word) {
+            kinds.push(k);
+        } else {
+            return Ok(format!("Unknown :log word {word:?}. {}", usage()));
+        }
+    }
+
+    let events: Vec<Event> = world
+        .events()?
+        .into_iter()
+        .filter(|e| kinds.is_empty() || kinds.contains(&e.kind))
+        .collect();
+    if events.is_empty() {
+        return Ok("No events logged.".into());
+    }
+    let skipped = limit.map_or(0, |n| events.len().saturating_sub(n));
+    let mut out = String::new();
+    if skipped > 0 {
+        writeln!(
+            out,
+            "({skipped} earlier event(s) not shown; :log all lists them)"
+        )
+        .unwrap();
+    }
+    for e in &events[skipped..] {
+        writeln!(out, "{}", event_line(e)?).unwrap();
+    }
+    Ok(trim_end(out))
+}
+
+/// One event on one line: its number, kind and a clipped summary.
+fn event_line(e: &Event) -> Result<String, StoreError> {
+    let summary = event_summary(e)?;
+    Ok(format!(
+        "#{} {}: {}",
+        e.seq,
+        e.kind.as_str(),
+        clip(&summary.replace('\n', " "), LOG_LINE_CHARS)
+    ))
+}
+
+/// What an event records, in words.
+fn event_summary(e: &Event) -> Result<String, StoreError> {
+    let p = &e.payload;
+    let text = |key: &str| p[key].as_str().unwrap_or_default().trim().to_owned();
+    Ok(match e.kind {
+        EventKind::Input if p.get("seed").is_some() => format!("seed: {}", text("text")),
+        EventKind::Input => format!("> {}", text("text")),
+        EventKind::Narration => text("text"),
+        EventKind::Patch | EventKind::PatchRejected => {
+            let ops: Vec<String> = e
+                .patch_touches()?
+                .iter()
+                .map(|(op, ids)| render_op(op, created_ids(e, ids)))
+                .collect();
+            if e.kind == EventKind::PatchRejected {
+                format!(
+                    "by {} (op {}: {}): {}",
+                    patch_by(p),
+                    p["op"],
+                    text("reason"),
+                    ops.join("; ")
+                )
+            } else {
+                format!("by {}: {}", patch_by(p), ops.join("; "))
+            }
+        }
+        EventKind::ToolCall => {
+            let mut s = format!("{} {}", text("name"), p["input"]);
+            if p["is_error"] == true {
+                write!(s, " ERROR: {}", text("result")).unwrap();
+            }
+            s
+        }
+        EventKind::RuleChange => {
+            let mut s = format!(
+                "rule #{} {:?} {} v{}",
+                p["id"],
+                p["rule"]["name"].as_str().unwrap_or("?"),
+                p["action"].as_str().unwrap_or("changed"),
+                p["version"]
+            );
+            if let Some(reason) = p["reason"].as_str() {
+                write!(s, ": {reason}").unwrap();
+            }
+            s
+        }
+        EventKind::Roll => format!(
+            "{} d20 {} + {} = {} vs {}: {} ({})",
+            text("stat"),
+            p["die"],
+            p["value"],
+            p["total"],
+            p["difficulty"],
+            text("result"),
+            text("reason")
+        ),
+        EventKind::Judgment if p["by"] == "interpreter" => {
+            let rule = p["rule"]["id"]
+                .as_i64()
+                .map(|r| format!(" rule #{r}"))
+                .unwrap_or_default();
+            format!("interpreter: {}{rule}", text("verdict"))
+        }
+        EventKind::Judgment => format!(
+            "quest #{} {}: {}",
+            p["quest"],
+            text("verdict"),
+            text("reason")
+        ),
+        EventKind::Tick => text("summary"),
+    })
+}
+
+/// One event in full: when it was logged, a summary (prose whole) and its
+/// payload.
+fn event_detail(e: &Event) -> Result<String, StoreError> {
+    let mut out = format!("#{} {} at {}\n", e.seq, e.kind.as_str(), e.at);
+    let mut payload = e.payload.clone();
+    if matches!(e.kind, EventKind::Input | EventKind::Narration) {
+        // Prose is shown whole, as written, and left out of the payload.
+        writeln!(out, "{}", event_summary(e)?).unwrap();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.remove("text");
+        }
+    } else {
+        // The payload has it all; the summary is only a reading aid.
+        let summary = event_summary(e)?.replace('\n', " ");
+        writeln!(out, "{}", clip(&summary, LOG_LINE_CHARS)).unwrap();
+    }
+    if payload.as_object().is_none_or(|o| !o.is_empty()) {
+        out.push('\n');
+        out.push_str(&serde_json::to_string_pretty(&payload).unwrap());
+    }
+    Ok(trim_end(out))
 }
 
 fn contains_id(v: &Value, id: EntityId) -> bool {
