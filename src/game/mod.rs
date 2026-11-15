@@ -30,6 +30,7 @@ use crate::llm::{
 use crate::quest::{self, Judgment, Quest};
 use crate::rules::{self, RuleId, Scope};
 use crate::stats;
+use crate::time;
 use crate::world::{EntityId, EventKind, StoreError, World};
 
 /// Kind of the single entity holding the world bible.
@@ -324,6 +325,14 @@ impl Game {
         let narration = response.text().trim().to_owned();
         self.world
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
+        // Every turn spends world time; the opening scene doesn't.
+        if turn.input.is_some() {
+            time::advance(
+                &mut self.world,
+                time::DEFAULT_MINUTES,
+                time::Source::Default,
+            )?;
+        }
         let judgments =
             quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
         Ok(TurnOutcome {
@@ -432,6 +441,18 @@ fn entropy() -> u64 {
 
 /// Watches tool calls in [`Game::run`].
 type Observer<'a> = &'a mut dyn FnMut(&World, &ToolUse, Option<&ToolOutput>);
+
+/// The bible's section names, comma-separated (engine props such as the
+/// clock left out).
+pub(crate) fn bible_sections(bible: &crate::world::Entity) -> String {
+    bible
+        .props
+        .keys()
+        .filter(|k| !k.starts_with(crate::world::ENGINE_PROP_PREFIX))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// The bible entity, if written.
 pub(crate) fn bible_id(world: &World) -> Result<Option<EntityId>, StoreError> {

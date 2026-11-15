@@ -214,7 +214,8 @@ fn replay_event(tx: &Transaction, event: &RawEvent) -> Result<(), ReplayError> {
         | EventKind::Roll
         | EventKind::Judgment
         | EventKind::Narration
-        | EventKind::Tick => {}
+        | EventKind::Tick
+        | EventKind::Time => {}
     }
 
     copy_event(tx, event)?;

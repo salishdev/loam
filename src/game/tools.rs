@@ -15,13 +15,16 @@ use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
 use crate::quest;
 use crate::rules::{self, RULE_KIND};
 use crate::stats;
+use crate::time;
 use crate::world::{
     self, ApplyError, Carrier, ENGINE_PROP_PREFIX, Entity, EntityId, EntityRef, EventKind, Op,
     Patch, StoreError, World,
 };
 
 use super::exits::{self, Unexplored};
-use super::{BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, player_id, scope};
+use super::{
+    BIBLE_KIND, BIBLE_SECTIONS, PLAYER_KIND, ROOM_KIND, bible_id, bible_sections, player_id, scope,
+};
 
 /// Which tools a director call gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +183,8 @@ fn write_bible_def() -> ToolDefinition {
                 "regions": list("Broad areas of the world; rooms are generated inside them."),
                 "factions": list("Groups with goals and tensions."),
                 "npcs": list("Key characters."),
-                "secrets": list("Hidden truths the player can uncover.")
+                "secrets": list("Hidden truths the player can uncover."),
+                "start": {"type": "string", "description": "Optional time of day the story opens, \"HH:MM\" (24-hour); default 08:00."}
             },
             "required": BIBLE_SECTIONS
         }),
@@ -194,6 +198,8 @@ struct BibleInput {
     factions: Vec<Value>,
     npcs: Vec<Value>,
     secrets: Vec<Value>,
+    #[serde(default)]
+    start: Option<String>,
 }
 
 fn write_bible(world: &mut World, input: BibleInput) -> Result<ToolOutput, StoreError> {
@@ -203,6 +209,13 @@ fn write_bible(world: &mut World, input: BibleInput) -> Result<ToolOutput, Store
     if input.tone.trim().is_empty() {
         return refuse("tone must not be empty");
     }
+    let start = match input.start.as_deref() {
+        None => time::DEFAULT_START,
+        Some(s) => match time::parse_hhmm(s) {
+            Some(m) => m,
+            None => return refuse(format!("start {s:?} is not a 24-hour \"HH:MM\" time")),
+        },
+    };
     let sections = [
         ("regions", input.regions),
         ("factions", input.factions),
@@ -217,6 +230,8 @@ fn write_bible(world: &mut World, input: BibleInput) -> Result<ToolOutput, Store
         }
         props.insert(name.into(), Value::Array(items));
     }
+    let (key, value) = time::start_prop(start);
+    props.insert(key, value);
     let patch = Patch::new(vec![
         Op::Create {
             handle: None,
@@ -267,11 +282,11 @@ fn read_bible(world: &World, input: ReadBibleInput) -> Result<ToolOutput, StoreE
         return refuse("there is no bible yet");
     };
     match bible.props.get(&input.section) {
-        Some(v) => ok(v.clone()),
-        None => refuse(format!(
+        Some(v) if !input.section.starts_with(ENGINE_PROP_PREFIX) => ok(v.clone()),
+        _ => refuse(format!(
             "no section {:?}; sections: {}",
             input.section,
-            bible.props.keys().cloned().collect::<Vec<_>>().join(", ")
+            bible_sections(&bible)
         )),
     }
 }

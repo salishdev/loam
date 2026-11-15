@@ -36,7 +36,7 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         .transpose()?
         .flatten()
     {
-        Some(bible) => bible.props.keys().cloned().collect::<Vec<_>>().join(", "),
+        Some(bible) => super::bible_sections(&bible),
         None => "(none)".into(),
     };
     writeln!(out, "Bible sections (read_bible): {sections}").unwrap();
@@ -46,6 +46,7 @@ pub fn local_slice(world: &World) -> Result<String, StoreError> {
         glossary::index(world)?
     )
     .unwrap();
+    writeln!(out, "{}", crate::time::slice_line(world)?).unwrap();
     let rules = rules::active_world(world)?.len();
     if rules > 0 {
         writeln!(out, "Rules: {rules} active (list_rules)").unwrap();

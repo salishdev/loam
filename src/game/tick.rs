@@ -270,7 +270,7 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         .transpose()?
         .flatten()
     {
-        Some(bible) => bible.props.keys().cloned().collect::<Vec<_>>().join(", "),
+        Some(bible) => super::bible_sections(&bible),
         None => "(none)".into(),
     };
     writeln!(out, "World tick. Bible sections (read_bible): {sections}").unwrap();

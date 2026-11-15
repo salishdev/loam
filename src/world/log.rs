@@ -30,10 +30,13 @@ pub enum EventKind {
     /// A world tick: off-screen arcs advanced between turns. Its patches
     /// are logged as ordinary `patch` events; this records the summary.
     Tick,
+    /// The world clock moved on: how far, who decided and the new time.
+    /// The clock itself changes through the `patch` before it.
+    Time,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 9] = [
+    pub const ALL: [EventKind; 10] = [
         EventKind::Input,
         EventKind::Patch,
         EventKind::PatchRejected,
@@ -43,6 +46,7 @@ impl EventKind {
         EventKind::Judgment,
         EventKind::Narration,
         EventKind::Tick,
+        EventKind::Time,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +60,7 @@ impl EventKind {
             EventKind::Judgment => "judgment",
             EventKind::Narration => "narration",
             EventKind::Tick => "tick",
+            EventKind::Time => "time",
         }
     }
 

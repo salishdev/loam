@@ -1,5 +1,5 @@
 //! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:npcs`, `:stats`, `:log`.
+//! `:quests`, `:npcs`, `:stats`, `:time`, `:log`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -17,6 +17,7 @@ use crate::glossary;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
 use crate::stats::{self, Capacity, Crossing, StatHook};
+use crate::time;
 use crate::world::{Cascaded, Entity, EntityId, Event, EventKind, Op, Relation, StoreError, World};
 
 /// Longest value shown inline before it is clipped.
@@ -632,6 +633,32 @@ fn patch_by(p: &Value) -> String {
 /// - `#<seq>` shows that one event in full.
 ///
 /// Words combine in any order: `:log patch roll 50`.
+/// Advances `:time` lists under the clock.
+const TIME_ADVANCES: usize = 8;
+
+/// `:time`: the world clock and its latest advances, newest first.
+pub fn time(world: &World) -> Result<String, StoreError> {
+    let mut out = format!("It is {}.\n", time::now(world)?);
+    let recent = time::recent(world, TIME_ADVANCES)?;
+    if recent.is_empty() {
+        out.push_str("No time has passed yet.\n");
+    } else {
+        out.push_str("Recent turns:\n");
+        for a in recent {
+            writeln!(
+                out,
+                "  #{} +{} ({}) -> {}",
+                a.seq,
+                time::span(a.minutes),
+                a.source,
+                a.to
+            )
+            .unwrap();
+        }
+    }
+    Ok(trim_end(out))
+}
+
 pub fn log(world: &World, arg: &str) -> Result<String, StoreError> {
     let usage = || {
         let kinds: Vec<&str> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
@@ -768,6 +795,12 @@ fn event_summary(e: &Event) -> Result<String, StoreError> {
             text("reason")
         ),
         EventKind::Tick => text("summary"),
+        EventKind::Time => format!(
+            "+{} ({}) -> {}",
+            time::span(p["minutes"].as_u64().unwrap_or(0)),
+            text("source"),
+            time::Moment(p["minute"].as_u64().unwrap_or(0))
+        ),
     })
 }
 

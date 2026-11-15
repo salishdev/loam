@@ -102,7 +102,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         println!();
-        let Some(line) = editor.read_line("> ")? else { break };
+        let Some(line) = editor.read_line("> ")? else {
+            break;
+        };
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -121,6 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":npcs" => show(cmd, inspect::npcs(world)),
                 ":relations" => show(cmd, inspect::relations(world, arg)),
                 ":stats" => show(cmd, inspect::stats(world)),
+                ":time" => show(cmd, inspect::time(world)),
                 ":log" => show(cmd, inspect::log(world, arg)),
                 ":fork" => fork(world, arg),
                 ":help" => say(HELP),
@@ -440,7 +443,7 @@ impl LineEditor {
 }
 
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs, :stats, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
+:quests, :npcs, :stats, :time, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
 
 /// Prints text word-wrapped to the output width, then a newline.
 fn say(text: &str) {

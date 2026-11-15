@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use super::exits;
 use super::*;
-use crate::llm::{ContentBlock, Response, ScriptedClient};
+use crate::llm::{ContentBlock, Response, ScriptedClient, ToolOutput, ToolUse};
 
 const SECRET: &str = "The abbot drowned the bell to hide the ledger";
 
@@ -77,6 +77,15 @@ fn first_user_text(req: &crate::llm::Request) -> String {
     }
 }
 
+/// Entities with the world clock left out, for "nothing changed" checks on
+/// turns that still spent time.
+fn without_clock(mut entities: Vec<crate::world::Entity>) -> Vec<crate::world::Entity> {
+    for e in &mut entities {
+        e.props.remove("_clock");
+    }
+    entities
+}
+
 fn player_room(game: &Game) -> i64 {
     let p = player_id(game.world()).unwrap().unwrap();
     game.world().entity(p).unwrap().unwrap().location.unwrap()
@@ -92,11 +101,21 @@ fn seed_builds_a_bible_readable_through_tools() {
         .entity(bible_id(game.world()).unwrap().unwrap())
         .unwrap()
         .unwrap();
-    let mut keys: Vec<_> = bible.props.keys().cloned().collect();
+    let mut keys: Vec<_> = bible
+        .props
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .cloned()
+        .collect();
     keys.sort();
     let mut want = BIBLE_SECTIONS.to_vec();
     want.sort();
     assert_eq!(keys, want);
+    // The clock starts at the default hour.
+    assert_eq!(
+        crate::time::now(game.world()).unwrap().to_string(),
+        "day 1, 08:00 (morning)"
+    );
     // The bible call offers write_bible and write_stats, and the seed is
     // the prompt.
     let req = &client.requests()[0];
@@ -656,16 +675,19 @@ fn a_ruled_action_repeats_on_the_fast_path_with_the_same_change() {
     assert!(narr.contains("Damp, melancholy folk horror."), "{narr}");
     assert_eq!(change_shape(&game, elm, &before), first_change);
 
-    // The log explains it: a judgment, a patch tagged with the rule, the narration.
+    // The log explains it: a judgment, a patch tagged with the rule, the
+    // narration, then the clock moving on.
     let events = game.world().events().unwrap();
-    let tail: Vec<_> = events.iter().rev().take(4).rev().collect();
+    let tail: Vec<_> = events.iter().rev().take(6).rev().collect();
     assert_eq!(
         tail.iter().map(|e| e.kind).collect::<Vec<_>>(),
         [
             EventKind::Input,
             EventKind::Judgment,
             EventKind::Patch,
-            EventKind::Narration
+            EventKind::Narration,
+            EventKind::Patch,
+            EventKind::Time
         ]
     );
     assert_eq!(tail[1].payload["verdict"], json!("fast_path"));
@@ -1693,7 +1715,10 @@ fn create_room_refuses_bad_exits_and_engine_props() {
         assert_eq!(player_room(&game), chapel);
     }
     // Nothing changed but the log.
-    assert_eq!(game.world().state().unwrap().entities, before.entities);
+    assert_eq!(
+        without_clock(game.world().state().unwrap().entities),
+        without_clock(before.entities)
+    );
     assert_eq!(game.world().state().unwrap().relations, before.relations);
 }
 
@@ -1827,7 +1852,7 @@ fn destroying_a_room_removes_its_exits() {
         .events()
         .unwrap()
         .into_iter()
-        .rfind(|e| e.kind == EventKind::Patch)
+        .rfind(|e| e.kind == EventKind::Patch && e.payload.get("cascaded").is_some())
         .unwrap();
     let cascaded = patch.payload["cascaded"].as_array().unwrap();
     assert_eq!(cascaded.len(), 2, "{cascaded:?}");
@@ -1979,7 +2004,10 @@ fn the_director_cannot_create_entities_of_reserved_kinds() {
     game.turn(&client, "go north", &mut |_| {}).unwrap();
     let (msg, is_error) = last_tool_result(&client);
     assert!(is_error && msg.contains("is reserved"), "{msg}");
-    assert_eq!(game.world().state().unwrap().entities, before.entities);
+    assert_eq!(
+        without_clock(game.world().state().unwrap().entities),
+        without_clock(before.entities)
+    );
     assert!(crate::quest::quests(game.world()).unwrap().is_empty());
 }
 
@@ -2029,4 +2057,79 @@ fn acts_beings_hold_items_and_npcs_are_found_by_acts() {
     game.turn(&client, "feed the heron", &mut |_| {}).unwrap();
     let (msg, is_error) = last_tool_result(&client);
     assert!(is_error && msg.contains("not a container"), "{msg}");
+}
+
+#[test]
+fn every_turn_spends_world_time_and_the_slice_shows_it() {
+    let (mut game, client) = begun();
+    // The opening costs nothing.
+    assert!(crate::time::recent(game.world(), 1).unwrap().is_empty());
+    let first = first_user_text(client.requests().last().unwrap());
+    assert!(first.contains("Time: day 1, 08:00 (morning)\n"), "{first}");
+
+    client.push(Response::canned_text("You wait."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    client.push(Response::canned_text("You wait more."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    assert_eq!(
+        crate::time::now(game.world()).unwrap().to_string(),
+        "day 1, 08:20 (morning)"
+    );
+    let text = first_user_text(client.requests().last().unwrap());
+    assert!(
+        text.contains("Time: day 1, 08:10 (morning); your last action took 10 min\n"),
+        "{text}"
+    );
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn the_bible_can_choose_the_opening_hour_and_hides_the_clock() {
+    let mut world = World::open_in_memory().unwrap();
+    let inventory = Inventory::new(DEFAULT_SLOTS, stats::carry_limit);
+    let call = |world: &mut World, phase, name: &str, input: Value| {
+        let call = ToolUse {
+            id: "c".into(),
+            name: name.into(),
+            input,
+        };
+        tools::dispatch(world, &inventory, 7, phase, &call).unwrap()
+    };
+    let bible = |start: &str| {
+        json!({
+            "tone": "t", "start": start,
+            "regions": [{"name": "r", "description": "d"}],
+            "factions": [{"name": "f", "description": "d"}],
+            "npcs": [{"name": "n", "description": "d"}],
+            "secrets": [{"name": "s", "description": "d"}]
+        })
+    };
+    match call(&mut world, Phase::Bible, "write_bible", bible("25:00")) {
+        ToolOutput::Err(e) => assert!(e.contains("not a 24-hour"), "{e}"),
+        ok => panic!("{ok:?}"),
+    }
+    assert!(matches!(
+        call(&mut world, Phase::Bible, "write_bible", bible("21:30")),
+        ToolOutput::Ok(_)
+    ));
+    assert_eq!(
+        crate::time::now(&world).unwrap().to_string(),
+        "day 1, 21:30 (evening)"
+    );
+    // The clock is no bible section: not listed, not readable.
+    match call(
+        &mut world,
+        Phase::Play,
+        "read_bible",
+        json!({"section": "_clock"}),
+    ) {
+        ToolOutput::Err(e) => assert!(
+            e.ends_with("sections: factions, npcs, regions, secrets, tone"),
+            "{e}"
+        ),
+        ok => panic!("{ok:?}"),
+    }
+    let slice = local_slice(&world).unwrap();
+    assert!(!slice.contains("_clock"), "{slice}");
 }

@@ -643,3 +643,34 @@ fn rejected_creates_show_no_created_id() {
         "{hall}"
     );
 }
+
+#[test]
+fn time_shows_the_clock_and_recent_advances() {
+    let mut world = World::open_in_memory().unwrap();
+    world
+        .apply_engine_patch(&Patch::new(vec![Op::Create {
+            handle: None,
+            name: "World bible".into(),
+            kind: game::BIBLE_KIND.into(),
+            location: None,
+            props: Default::default(),
+        }]))
+        .unwrap();
+    assert_eq!(
+        time(&world).unwrap(),
+        "It is day 1, 08:00 (morning).\nNo time has passed yet."
+    );
+    time::advance(&mut world, 10, time::Source::Default).unwrap();
+    time::advance(&mut world, 90, time::Source::Director).unwrap();
+    assert_eq!(
+        time(&world).unwrap(),
+        "It is day 1, 09:40 (morning).\nRecent turns:\n  \
+         #5 +1 h 30 min (director) -> day 1, 09:40 (morning)\n  \
+         #3 +10 min (default) -> day 1, 08:10 (morning)"
+    );
+    let log = log(&world, "time").unwrap();
+    assert!(
+        log.contains("+1 h 30 min (director) -> day 1, 09:40 (morning)"),
+        "{log}"
+    );
+}
