@@ -5,6 +5,7 @@ pub mod glossary;
 pub mod inspect;
 pub mod inventory;
 pub mod llm;
+pub mod pressure;
 pub mod quest;
 pub mod rules;
 pub mod stats;

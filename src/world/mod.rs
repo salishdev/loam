@@ -137,8 +137,15 @@ pub const PLAYER_KIND: &str = "player";
 /// Kinds the engine gives meaning to. The director can't create entities of
 /// these kinds (rooms come only from `create_room`); every other kind is a
 /// free descriptive label.
-pub const RESERVED_KINDS: [&str; 6] =
-    [ROOM_KIND, PLAYER_KIND, "bible", "rule", "quest", "glossary"];
+pub const RESERVED_KINDS: [&str; 7] = [
+    ROOM_KIND,
+    PLAYER_KIND,
+    "bible",
+    "rule",
+    "quest",
+    "glossary",
+    "pressure",
+];
 
 /// Marker prop: `acts: true` moves, speaks or acts on its own. NPCs are
 /// the entities carrying it, and it may hold things.

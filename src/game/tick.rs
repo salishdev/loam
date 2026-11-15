@@ -49,7 +49,9 @@ steps, as far as that much time would plausibly carry them. You have at most {MA
 tool calls. Make every change with apply_patch and a one-sentence note; leave traces the player \
 can find later (an NPC moved, a door barred, a letter left). You may create entities inside \
 off-screen rooms but not new rooms. The player, the player's room and everything in them are \
-off-limits. Doing nothing is fine when nothing would plausibly happen. When done, reply with a \
+off-limits. Pressures listed in the slice may be advanced, delayed or resolved \
+when they concern only off-screen things; an overdue one should move or be resolved, or your \
+summary should say why not. Doing nothing is fine when nothing would plausibly happen. When done, reply with a \
 one- to three-sentence summary of what moved, for the log; the player never sees it."
     )
 }
@@ -360,6 +362,28 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         .collect();
     if !npcs.is_empty() {
         writeln!(out, "NPCs: {}", npcs.join("; ")).unwrap();
+    }
+
+    let pressures = crate::pressure::slice_lines(world, |p| {
+        let Some(player) = super::player_id(world)? else {
+            return Ok(None);
+        };
+        for &id in &p.concerns {
+            if super::tools::is_on_screen(world, id, player, here)? {
+                return Ok(Some("on-screen: leave it to play".into()));
+            }
+        }
+        Ok(None)
+    })?;
+    if !pressures.is_empty() {
+        writeln!(
+            out,
+            "Pressures (nearest first; adjust_pressure, resolve_pressure):"
+        )
+        .unwrap();
+        for p in pressures {
+            writeln!(out, "{p}").unwrap();
+        }
     }
 
     let prior: Vec<String> = world

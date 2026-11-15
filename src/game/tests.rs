@@ -126,7 +126,7 @@ fn seed_builds_a_bible_readable_through_tools() {
             .iter()
             .map(|t| t.name.as_str())
             .collect::<Vec<_>>(),
-        ["write_bible", "write_stats"]
+        ["write_bible", "write_stats", "start_pressure"]
     );
     assert_eq!(game.stats().unwrap().len(), 2);
 
@@ -1275,7 +1275,15 @@ fn a_tick_changes_the_world_off_screen_and_the_change_is_found_on_return() {
     let names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
-        ["read_bible", "query_entity", "search_events", "apply_patch"]
+        [
+            "read_bible",
+            "query_entity",
+            "search_events",
+            "apply_patch",
+            "start_pressure",
+            "adjust_pressure",
+            "resolve_pressure"
+        ]
     );
     let slice = first_user_text(first);
     assert!(
@@ -2043,6 +2051,7 @@ fn reserved_kinds_name_the_engine_kinds() {
         crate::rules::RULE_KIND,
         crate::quest::QUEST_KIND,
         crate::glossary::GLOSSARY_KIND,
+        crate::pressure::PRESSURE_KIND,
     ] {
         assert!(RESERVED_KINDS.contains(&k), "{k}");
     }
@@ -2053,7 +2062,10 @@ fn the_director_cannot_create_entities_of_reserved_kinds() {
     let (mut game, client) = begun();
     let room = player_room(&game);
     let before = game.world().state().unwrap();
-    for (i, kind) in ["quest", "room", "player", "rule"].into_iter().enumerate() {
+    for (i, kind) in ["quest", "room", "player", "rule", "pressure"]
+        .into_iter()
+        .enumerate()
+    {
         client.push(Response::canned_tool_use(
             format!("p{i}"),
             "apply_patch",
@@ -2497,4 +2509,220 @@ fn the_director_and_narrator_are_asked_to_let_time_show() {
     let system = client.requests().last().unwrap().system.clone().unwrap();
     assert!(system.contains("never state clock times"), "{system}");
     assert!(fast_path::NARRATOR_SYSTEM.contains("without stating clock times"));
+}
+
+// ---- pressures ---------------------------------------------------------------
+
+#[test]
+fn pressures_reach_the_director_but_never_the_narrator_and_replay() {
+    let (mut game, client, oak, elm) = with_doors();
+    // A novel turn mints the kick rule and starts a pressure on the elm door.
+    client.push(kick_mint(oak));
+    client.push(Response::canned_tool_use(
+        "p1",
+        "start_pressure",
+        json!({"what": "The elm door's hinges rust through", "consequence": "it falls",
+               "due_in_minutes": 30, "concerns": [elm]}),
+    ));
+    client.push(Response::canned_text(
+        "The oak door bursts; the elm door creaks.",
+    ));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let (msg, is_error) = last_tool_result(&client);
+    assert!(!is_error, "{msg}");
+    let p = crate::pressure::active(game.world()).unwrap()[0].clone();
+    assert_eq!(p.concerns, vec![elm]);
+
+    // Next director turn: the pressure is listed, 20 min left, imminent.
+    // (With a rule minted, Haiku interprets every turn first; it matches
+    // nothing here.)
+    let nothing = || interpret(json!([]), true);
+    client.push(nothing());
+    client.push(Response::canned_text("You wait."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(
+        director.contains(&format!(
+            "Pressures (nearest first; adjust_pressure, resolve_pressure):\n- pressure #{} \
+             The elm door's hinges rust through [imminent] due day 1, 08:30 (morning) (in 20 min)",
+            p.id
+        )),
+        "{director}"
+    );
+    assert!(!director.contains("overdue:"), "{director}");
+    // The local slice (shared with the narrator and interpreter) has none of it.
+    assert!(!local_slice(game.world()).unwrap().contains("pressure"));
+
+    // A fast-path turn: neither Haiku nor the narrator hears of it.
+    let start = client.requests().len();
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
+    client.push(interpret(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        true,
+    ));
+    client.push(Response::canned_text("The elm door gives way."));
+    let out = game
+        .turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    assert_eq!(out.fast_path, Some(rule));
+    for req in &client.requests()[start..] {
+        let text = first_user_text(req);
+        assert!(!text.contains("hinges rust"), "{text}");
+    }
+
+    // Overdue now (08:30, its due time): the director is nudged.
+    client.push(nothing());
+    client.push(Response::canned_text("Nothing."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(
+        director.contains("[overdue]") && director.contains(crate::pressure::OVERDUE_NUDGE),
+        "{director}"
+    );
+    // The director resolves it.
+    client.push(nothing());
+    client.push(Response::canned_tool_use(
+        "p2",
+        "resolve_pressure",
+        json!({"id": p.id, "how": "the door was already broken down"}),
+    ));
+    client.push(Response::canned_text("Splinters."));
+    game.turn(&client, "look", &mut |_| {}).unwrap();
+    assert!(!last_tool_result(&client).1);
+    assert!(crate::pressure::active(game.world()).unwrap().is_empty());
+    client.push(nothing());
+    client.push(Response::canned_text("Quiet."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(!director.contains("Pressures"), "{director}");
+
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+    assert_eq!(
+        crate::pressure::pressures(&replayed).unwrap(),
+        crate::pressure::pressures(game.world()).unwrap()
+    );
+}
+
+#[test]
+fn a_tick_sees_pressures_and_touches_only_off_screen_ones() {
+    let (mut game, client, chapel, tower, crow, _) = two_rooms(false);
+    let altar = game.world().contents(Some(chapel)).unwrap()[0];
+    let world = game.world_mut();
+    let near =
+        crate::pressure::start(world, "The altar cracks", "relics spill", 5, &[altar]).unwrap();
+    let far = crate::pressure::start(
+        world,
+        "The crow flies off",
+        "the bell goes quiet",
+        600,
+        &[crow],
+    )
+    .unwrap();
+    crate::time::advance(world, 10, crate::time::Source::Default).unwrap();
+
+    let player = player_id(game.world()).unwrap().unwrap();
+    let calls = [
+        (
+            "adjust_pressure",
+            json!({"id": near, "minutes": 60, "reason": "x"}),
+        ),
+        ("resolve_pressure", json!({"id": near, "how": "x"})),
+        (
+            "start_pressure",
+            json!({"what": "w", "consequence": "c", "due_in_minutes": 60, "concerns": [player]}),
+        ),
+        (
+            "adjust_pressure",
+            json!({"id": far, "minutes": -60, "reason": "the bell rope frays"}),
+        ),
+        (
+            "start_pressure",
+            json!({"what": "Rooks gather", "consequence": "the tower fills", "due_in_minutes": 120, "concerns": [tower]}),
+        ),
+    ];
+    for (i, (name, input)) in calls.iter().enumerate() {
+        client.push(Response::canned_tool_use(
+            format!("t{i}"),
+            *name,
+            input.clone(),
+        ));
+    }
+    client.push(Response::canned_text("The crow frets."));
+    let before = client.requests().len();
+    game.tick(&client).unwrap();
+    let requests = client.requests()[before..].to_vec();
+
+    // The tick slice lists both, nearest first, marking the on-screen one
+    // and nudging the overdue one; the tick gets the pressure tools.
+    let slice = first_user_text(&requests[0]);
+    let lines: Vec<&str> = slice
+        .lines()
+        .filter(|l| l.starts_with("- pressure"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{slice}");
+    assert!(
+        lines[0].starts_with(&format!("- pressure #{near} The altar cracks [overdue]"))
+            && lines[0].contains("(on-screen: leave it to play)")
+            && lines[0].ends_with(crate::pressure::OVERDUE_NUDGE),
+        "{slice}"
+    );
+    assert!(
+        lines[1].starts_with(&format!("- pressure #{far} The crow flies off [low]"))
+            && !lines[1].contains("on-screen"),
+        "{slice}"
+    );
+    let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    for t in ["start_pressure", "adjust_pressure", "resolve_pressure"] {
+        assert!(tools.contains(&t), "{tools:?}");
+    }
+
+    // On-screen calls are refused; off-screen ones apply.
+    for (i, req) in requests[1..=calls.len()].iter().enumerate() {
+        let (content, is_error) = match req.messages.last().unwrap().content.first().unwrap() {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => (content.clone(), *is_error),
+            other => panic!("expected a tool result, got {other:?}"),
+        };
+        if i < 3 {
+            assert!(
+                is_error && content.contains("leaves pressures on"),
+                "{i}: {content}"
+            );
+        } else {
+            assert!(!is_error, "{i}: {content}");
+        }
+    }
+    let near = crate::pressure::pressure(game.world(), near)
+        .unwrap()
+        .unwrap();
+    assert_eq!(near.status, crate::pressure::Status::Active);
+    assert!(near.adjustments.is_empty());
+    let far = crate::pressure::pressure(game.world(), far)
+        .unwrap()
+        .unwrap();
+    assert_eq!(far.adjustments[0].minutes, -60);
+    assert_eq!(crate::pressure::active(game.world()).unwrap().len(), 3);
+
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn the_bible_can_open_under_pressure() {
+    let mut bible = bible_call();
+    bible.content.push(ContentBlock::ToolUse(ToolUse {
+        id: "s".into(),
+        name: "start_pressure".into(),
+        input: json!({"what": "The tide turns", "consequence": "the causeway floods",
+                      "due_in_minutes": 240}),
+    }));
+    let client = ScriptedClient::new([bible, Response::canned_text("")]);
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.create_bible(&client, "A tidal island.").unwrap();
+    let p = &crate::pressure::active(game.world()).unwrap()[0];
+    assert_eq!(p.what, "The tide turns");
+    assert_eq!(p.due.to_string(), "day 1, 12:00 (afternoon)");
 }

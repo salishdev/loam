@@ -674,3 +674,47 @@ fn time_shows_the_clock_and_recent_advances() {
         "{log}"
     );
 }
+
+#[test]
+fn pressures_lists_active_nearest_first_then_resolved() {
+    let mut world = World::open_in_memory().unwrap();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "create", "name": "World bible", "kind": "bible"},
+        {"op": "create", "handle": "mill", "name": "Mill", "kind": "room"}
+    ]))
+    .unwrap();
+    let mill = world.apply_engine_patch(&Patch::new(ops)).unwrap().handles["mill"];
+    assert_eq!(pressures(&world).unwrap(), "No pressures yet.");
+    let fair =
+        pressure::start(&mut world, "The fair ends", "the stalls pack up", 600, &[]).unwrap();
+    let sluice = pressure::start(
+        &mut world,
+        "The sluice gives way",
+        "the mill floods",
+        120,
+        &[mill],
+    )
+    .unwrap();
+    let bell = pressure::start(&mut world, "The bell rings", "the abbot wakes", 30, &[]).unwrap();
+    pressure::adjust(&mut world, sluice, 60, "shored up with planks").unwrap();
+    pressure::resolve(&mut world, bell, "the clapper was muffled").unwrap();
+    time::advance(&mut world, 150, time::Source::Default).unwrap();
+    assert_eq!(
+        pressures(&world).unwrap(),
+        format!(
+            "It is day 1, 10:30 (morning).\n\
+             #{sluice} The sluice gives way [imminent]\n  \
+             then: the mill floods\n  \
+             started day 1, 08:00 (morning), due day 1, 11:00 (morning) (in 30 min)\n  \
+             concerns #{mill} Mill\n  \
+             - day 1, 08:00 (morning) delayed 1 h: shored up with planks\n\
+             #{fair} The fair ends [low]\n  \
+             then: the stalls pack up\n  \
+             started day 1, 08:00 (morning), due day 1, 18:00 (dusk) (in 7 h 30 min)\n\
+             #{bell} The bell rings [resolved]\n  \
+             then: the abbot wakes\n  \
+             started day 1, 08:00 (morning), due day 1, 08:30 (morning) (2 h ago)\n  \
+             => the clapper was muffled"
+        )
+    );
+}

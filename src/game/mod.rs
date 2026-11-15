@@ -72,7 +72,10 @@ refuses, adapt; an impossible action is narrated as a non-change. What anyone ca
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
 clear to the player, reveal_goal with the entities it concerns; escalate_quest to raise the \
-stakes. A judge decides when a quest is done. The engine remembers rulings as rules and replays them without you: when you rule on an \
+stakes. A judge decides when a quest is done. Give the world momentum with pressures: \
+start_pressure for something that will happen unless someone acts, adjust_pressure when the \
+player (or the world) delays or hastens it, resolve_pressure once it happens or is defused. \
+When one is overdue, advance it in the story or resolve it; never use one to refuse an action. The engine remembers rulings as rules and replays them without you: when you rule on an \
 action that could recur, mint_rule at the generality you judge right (conditions on kind \
 and props make it general; related conditions make it hold only while a relation does) and give apply_to so the rule itself is this turn's ruling; \
 one-off story events need no rule. When an action's outcome is uncertain, roll check \
@@ -335,9 +338,12 @@ impl Game {
         turn: Turn,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, GameError> {
+        // Pressures go to the director only, never to the narrator or the
+        // interpreter, which share the slice.
+        let pressures = pressure_section(&self.world)?;
         let request = Request::new(
             Model::Sonnet,
-            vec![Message::user(format!("{slice}\n{instruction}"))],
+            vec![Message::user(format!("{slice}{pressures}\n{instruction}"))],
         )
         .system(DIRECTOR_SYSTEM)
         .effort(Effort::Medium)
@@ -531,6 +537,19 @@ fn entropy() -> u64 {
 
 /// Watches tool calls in [`Game::run`].
 type Observer<'a> = &'a mut dyn FnMut(&World, &ToolUse, Option<&ToolOutput>);
+
+/// The director's pressure lines under a heading, or nothing when nothing
+/// presses.
+fn pressure_section(world: &World) -> Result<String, StoreError> {
+    let lines = crate::pressure::slice_lines(world, |_| Ok(None))?;
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "Pressures (nearest first; adjust_pressure, resolve_pressure):\n{}\n",
+        lines.join("\n")
+    ))
+}
 
 /// The bible's section names, comma-separated (engine props such as the
 /// clock left out).

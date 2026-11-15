@@ -1,5 +1,5 @@
 //! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:npcs`, `:stats`, `:time`, `:log`.
+//! `:quests`, `:npcs`, `:stats`, `:time`, `:pressures`, `:log`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::game;
 use crate::glossary;
+use crate::pressure;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
 use crate::stats::{self, Capacity, Crossing, StatHook};
@@ -654,6 +655,63 @@ pub fn time(world: &World) -> Result<String, StoreError> {
                 a.to
             )
             .unwrap();
+        }
+    }
+    Ok(trim_end(out))
+}
+
+/// `:pressures`: active pressures nearest first, then resolved ones in
+/// the order started, each with its due time, urgency, concerns and
+/// history.
+pub fn pressures(world: &World) -> Result<String, StoreError> {
+    let all = pressure::pressures(world)?;
+    if all.is_empty() {
+        return Ok("No pressures yet.".into());
+    }
+    let now = time::now(world)?;
+    let mut out = format!("It is {now}.\n");
+    let active = pressure::active(world)?;
+    let resolved = all
+        .iter()
+        .filter(|p| p.status == pressure::Status::Resolved);
+    for p in active.iter().chain(resolved) {
+        let tag = match p.status {
+            pressure::Status::Active => p.urgency(now).as_str(),
+            pressure::Status::Resolved => "resolved",
+        };
+        writeln!(out, "#{} {} [{tag}]", p.id, p.what).unwrap();
+        writeln!(out, "  then: {}", p.consequence).unwrap();
+        writeln!(out, "  started {}, {}", p.started, p.due_text(now)).unwrap();
+        if !p.concerns.is_empty() {
+            let names: Vec<String> = p
+                .concerns
+                .iter()
+                .map(|&id| -> Result<String, StoreError> {
+                    Ok(match world.entity(id)? {
+                        Some(e) => format!("#{id} {}", e.name),
+                        None => format!("#{id}"),
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            writeln!(out, "  concerns {}", names.join(", ")).unwrap();
+        }
+        for a in &p.adjustments {
+            let way = if a.minutes >= 0 {
+                "delayed"
+            } else {
+                "hastened"
+            };
+            writeln!(
+                out,
+                "  - {} {way} {}: {}",
+                time::Moment(a.at),
+                time::span(a.minutes.unsigned_abs()),
+                a.reason
+            )
+            .unwrap();
+        }
+        if let Some(r) = &p.resolution {
+            writeln!(out, "  => {r}").unwrap();
         }
     }
     Ok(trim_end(out))

@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::glossary::{self, GLOSSARY_KIND};
 use crate::inventory::{self, Inventory};
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
+use crate::pressure;
 use crate::quest;
 use crate::rules::{self, RULE_KIND};
 use crate::stats;
@@ -39,7 +40,11 @@ pub enum Phase {
 
 pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
     match phase {
-        Phase::Bible => vec![write_bible_def(), stats::tools::sheet_tool_definition()],
+        Phase::Bible => vec![
+            write_bible_def(),
+            stats::tools::sheet_tool_definition(),
+            pressure::tools::start_definition(),
+        ],
         Phase::Play => vec![
             read_bible_def(),
             query_entity_def(),
@@ -55,13 +60,17 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         .chain(rules::tools::tool_definitions())
         .chain(glossary::tools::tool_definitions())
         .chain(stats::tools::tool_definitions())
+        .chain(pressure::tool_definitions())
         .collect(),
         Phase::Tick => vec![
             read_bible_def(),
             query_entity_def(),
             search_events_def(),
             tick_apply_patch_def(),
-        ],
+        ]
+        .into_iter()
+        .chain(pressure::tool_definitions())
+        .collect(),
     }
 }
 
@@ -84,6 +93,14 @@ pub fn dispatch(
         && let Some(output) = inventory.handle_tool(world, player, call)
     {
         return Ok(output);
+    }
+    if phase == Phase::Tick
+        && let Some(reason) = tick_pressure_refusal(world, call)?
+    {
+        return refuse(reason);
+    }
+    if let Some(result) = pressure::handle_tool(world, call) {
+        return result;
     }
     if let Some(result) = quest::handle_tool(world, call) {
         return result;
@@ -475,7 +492,7 @@ const ROOM_HANDLE: &str = "@room";
 
 /// What the `kind` field means, in the create_room and apply_patch schemas.
 const KIND_DESCRIPTION: &str = "A free descriptive label, e.g. sword, heron, door, chest. \
-    Not room, player, bible, rule, quest or glossary (reserved). Capabilities are marker \
+    Not room, player, bible, rule, quest, glossary or pressure (reserved). Capabilities are marker \
     props: acts: true for anything that moves, speaks or acts on its own (people, animals, \
     spirits, a talking sword); container: true for anything things can be put inside; \
     fixed: true for anything the player can't take.";
@@ -866,6 +883,27 @@ fn on_screen_refusal(world: &World, patch: &Patch) -> Result<Option<String>, Sto
                      only what happens off-screen"
                 )));
             }
+        }
+    }
+    Ok(None)
+}
+
+/// Why a world tick may not make a pressure call: the pressure concerns
+/// (or would concern) something on-screen, which is left to play.
+fn tick_pressure_refusal(world: &World, call: &ToolUse) -> Result<Option<String>, StoreError> {
+    let Some(concerns) = pressure::tools::call_concerns(world, call)? else {
+        return Ok(None);
+    };
+    let Some(player) = player_id(world)? else {
+        return Ok(None);
+    };
+    let room = world.entity(player)?.and_then(|p| p.location);
+    for id in concerns {
+        if is_on_screen(world, id, player, room)? {
+            return Ok(Some(format!(
+                "#{id} is where the player can see it; a world tick leaves pressures on \
+                 on-screen things to play"
+            )));
         }
     }
     Ok(None)
