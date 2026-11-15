@@ -210,6 +210,14 @@ pub fn recent(world: &World, limit: usize) -> Result<Vec<Advance>, StoreError> {
         .collect())
 }
 
+/// The first logged advance, if the clock has moved at all.
+pub fn first(world: &World) -> Result<Option<Advance>, StoreError> {
+    Ok(world
+        .first_event(EventKind::Time)?
+        .as_ref()
+        .map(Advance::from_event))
+}
+
 /// The slice's time line: `Time: day 1, 08:10 (morning); your last action
 /// took 10 min`.
 pub fn slice_line(world: &World) -> Result<String, StoreError> {

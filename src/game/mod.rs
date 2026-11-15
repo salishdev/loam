@@ -17,7 +17,7 @@ mod tests;
 
 pub use context::local_slice;
 pub use npcs::{NpcSighting, bible_npc_names, npcs};
-pub use tick::{ROOM_CHANGE_GAP, TICK_EVERY, TickChange, TickOutcome};
+pub use tick::{ROOM_CHANGE_MINUTES, TICK_MINUTES, TickChange, TickOutcome};
 pub use tools::Phase;
 
 use serde_json::json;

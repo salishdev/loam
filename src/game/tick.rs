@@ -2,11 +2,13 @@
 //! off-screen arcs (NPCs scheme, factions move) through ordinary patches.
 //!
 //! When a tick is due is worked out from the event log alone, so it
-//! survives saving and resuming: every [`TICK_EVERY`] player turns, or
-//! when the player has changed rooms since the last tick (at least
-//! [`ROOM_CHANGE_GAP`] turns after it). Each tick is recorded as a `tick`
-//! event listing its notes and the rooms they touched; the local slice
-//! shows a room's notes when the player is back in it.
+//! survives saving and resuming: once [`TICK_MINUTES`] of world time have
+//! passed since the last tick, or when the player has changed rooms since
+//! it and at least [`ROOM_CHANGE_MINUTES`] have passed. However long the
+//! gap (a night's sleep), one tick runs, told how much time passed. Each
+//! tick is recorded as a `tick` event with the clock's `minute`, listing
+//! its notes and the rooms they touched; the local slice shows a room's
+//! notes when the player is back in it.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -20,12 +22,13 @@ use super::exits::explored_rooms;
 use super::npcs::{enclosing_room, npcs, player_room};
 use super::tools::{Phase, definitions, op_refs};
 use super::{Game, GameError, bible_id};
+use crate::time;
 
-/// A tick is due after this many player turns without one.
-pub const TICK_EVERY: usize = 5;
-/// After a room change, a tick is due once this many turns have passed
+/// A tick is due after this many minutes of world time without one.
+pub const TICK_MINUTES: u64 = 60;
+/// After a room change, a tick is due once this many minutes have passed
 /// since the last one, so walking every turn doesn't tick every turn.
-pub const ROOM_CHANGE_GAP: usize = 2;
+pub const ROOM_CHANGE_MINUTES: u64 = 20;
 /// Most model calls one tick may make.
 const MAX_TICK_CALLS: usize = 10;
 /// Earlier tick summaries the tick slice shows, for continuity.
@@ -33,15 +36,23 @@ const PRIOR_TICKS: usize = 2;
 /// Recent player inputs the tick slice shows.
 const RECENT_INPUTS: usize = 6;
 
-const TICK_SYSTEM: &str = "You are the director of Loam, a text adventure, running a world \
-tick between turns. The world keeps moving while the player is elsewhere: advance one to \
-three off-screen arcs by a small, concrete step, following the bible's factions, NPCs and \
-secrets and reacting to what the player has done. Make every change with apply_patch and a \
-one-sentence note; leave traces the player can find later (an NPC moved, a door barred, a \
-letter left). You may create entities inside off-screen rooms but not new rooms. The player, \
-the player's room and everything in them are off-limits. Doing nothing is fine when nothing \
-would plausibly happen. When done, reply with a one- to three-sentence summary of what moved, \
-for the log; the player never sees it.";
+/// The tick's system prompt. The number of arcs scales with the world
+/// time that passed, bounded by the tick's call budget.
+fn tick_system() -> String {
+    format!(
+        "You are the director of Loam, a text adventure, running a world tick between turns. \
+The world keeps moving while the player is elsewhere: advance off-screen arcs by small, \
+concrete steps, following the bible's factions, NPCs and secrets and reacting to what the \
+player has done. Scale the work to the time that passed, which the slice states: one to three \
+arcs for about an hour; for long gaps (a night's sleep, a day's journey) more arcs and bigger \
+steps, as far as that much time would plausibly carry them. You have at most {MAX_TICK_CALLS} \
+tool calls. Make every change with apply_patch and a one-sentence note; leave traces the player \
+can find later (an NPC moved, a door barred, a letter left). You may create entities inside \
+off-screen rooms but not new rooms. The player, the player's room and everything in them are \
+off-limits. Doing nothing is fine when nothing would plausibly happen. When done, reply with a \
+one- to three-sentence summary of what moved, for the log; the player never sees it."
+    )
+}
 
 /// What one world tick did.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,14 +82,13 @@ impl Game {
             return Ok(false);
         };
         let last = last_tick(world)?;
-        let after = last.as_ref().map_or(0, |e| e.seq);
-        let turns = turns_since(world, after)?;
+        let elapsed = minutes_since_tick(world, last.as_ref())?;
         let reference = match &last {
             Some(e) => e.payload.get("room").and_then(Value::as_i64),
             // Before the first tick: the opening room.
             None => explored_rooms(world)?.first().copied(),
         };
-        Ok(turns >= TICK_EVERY || (Some(room) != reference && turns >= ROOM_CHANGE_GAP))
+        Ok(elapsed >= TICK_MINUTES || (Some(room) != reference && elapsed >= ROOM_CHANGE_MINUTES))
     }
 
     /// Run a world tick if one is due.
@@ -98,9 +108,10 @@ impl Game {
         }
         let room = player_room(&self.world)?;
         let turn = turns_since(&self.world, 0)?;
+        let minute = time::now(&self.world)?.0;
         let slice = tick_slice(&self.world)?;
         let request = Request::new(Model::Sonnet, vec![Message::user(slice)])
-            .system(TICK_SYSTEM)
+            .system(tick_system())
             .effort(Effort::Medium)
             .tools(definitions(Phase::Tick));
         let mut changes = Vec::new();
@@ -126,6 +137,7 @@ impl Game {
             EventKind::Tick,
             &json!({
                 "turn": turn,
+                "minute": minute,
                 "room": room,
                 "summary": summary,
                 "changes": changes.iter().map(|c| json!({"note": c.note, "rooms": c.rooms})).collect::<Vec<_>>(),
@@ -224,6 +236,25 @@ fn last_tick(world: &World) -> Result<Option<Event>, StoreError> {
         .next())
 }
 
+/// World minutes since the tick `last`, or before any tick since the
+/// clock's first advance began. A tick logged before ticks recorded the
+/// clock counts as minute 0.
+fn minutes_since_tick(world: &World, last: Option<&Event>) -> Result<u64, StoreError> {
+    let now = time::now(world)?.0;
+    let from = match last {
+        Some(tick) => tick
+            .payload
+            .get("minute")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        None => match time::first(world)? {
+            Some(first) => first.to.0.saturating_sub(first.minutes),
+            None => now,
+        },
+    };
+    Ok(now.saturating_sub(from))
+}
+
 /// Player turns (inputs other than the seed) logged after event `after`.
 fn turns_since(world: &World, after: i64) -> Result<usize, StoreError> {
     Ok(world
@@ -274,6 +305,19 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         None => "(none)".into(),
     };
     writeln!(out, "World tick. Bible sections (read_bible): {sections}").unwrap();
+    let last = last_tick(world)?;
+    let since = if last.is_some() {
+        "the last tick"
+    } else {
+        "the story began"
+    };
+    writeln!(
+        out,
+        "Time: {}. {} have passed since {since}.",
+        time::now(world)?,
+        time::span(minutes_since_tick(world, last.as_ref())?)
+    )
+    .unwrap();
 
     let here = player_room(world)?;
     match here.map(|id| world.entity(id)).transpose()?.flatten() {

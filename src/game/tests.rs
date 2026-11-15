@@ -1095,18 +1095,23 @@ fn look(game: &mut Game, client: &ScriptedClient) {
     game.turn(client, "look", &mut |_| {}).unwrap();
 }
 
+/// Looks, at the default 10 minutes each, that make up `minutes`.
+fn looks_for(minutes: u64) -> u64 {
+    minutes / crate::time::DEFAULT_MINUTES
+}
+
 #[test]
-fn a_tick_is_due_every_few_turns_in_the_same_room() {
+fn a_tick_is_due_after_an_hour_of_world_time_in_the_same_room() {
     let (mut game, client) = begun();
-    assert!(!game.tick_due().unwrap(), "no turns played yet");
-    for _ in 1..TICK_EVERY {
+    assert!(!game.tick_due().unwrap(), "no time has passed yet");
+    for _ in 1..looks_for(TICK_MINUTES) {
         look(&mut game, &client);
         assert!(!game.tick_due().unwrap());
     }
     look(&mut game, &client);
-    assert!(game.tick_due().unwrap());
+    assert!(game.tick_due().unwrap(), "an hour has passed");
 
-    // maybe_tick runs it and the count starts again.
+    // maybe_tick runs it and the hour starts again.
     client.push(Response::canned_text("Nothing stirs."));
     let tick = game.maybe_tick(&client).unwrap().expect("tick was due");
     assert_eq!(tick.summary, "Nothing stirs.");
@@ -1119,7 +1124,11 @@ fn a_tick_is_due_every_few_turns_in_the_same_room() {
         .search_events("", &[EventKind::Tick], 10)
         .unwrap();
     assert_eq!(ticks.len(), 1);
-    assert_eq!(ticks[0].payload["turn"], json!(TICK_EVERY));
+    assert_eq!(ticks[0].payload["turn"], json!(looks_for(TICK_MINUTES)));
+    assert_eq!(
+        ticks[0].payload["minute"],
+        json!(crate::time::DEFAULT_START + TICK_MINUTES)
+    );
 }
 
 #[test]
@@ -1133,17 +1142,82 @@ fn a_room_change_makes_a_tick_due_after_a_short_gap() {
     ));
     client.push(Response::canned_text("The tower."));
     game.turn(&client, "go north", &mut |_| {}).unwrap();
-    const { assert!(ROOM_CHANGE_GAP > 1) };
-    assert!(!game.tick_due().unwrap(), "moved, but only one turn in");
+    const { assert!(ROOM_CHANGE_MINUTES > crate::time::DEFAULT_MINUTES) };
+    assert!(!game.tick_due().unwrap(), "moved, but only ten minutes in");
     look(&mut game, &client);
     assert!(game.tick_due().unwrap(), "moved away from the opening room");
 
     // After a tick in the tower, staying put isn't a room change.
     quiet_tick(&mut game, &client);
-    for _ in 0..ROOM_CHANGE_GAP {
+    for _ in 0..looks_for(ROOM_CHANGE_MINUTES) {
         look(&mut game, &client);
     }
     assert!(!game.tick_due().unwrap());
+}
+
+#[test]
+fn a_long_sleep_makes_one_tick_that_reports_the_gap() {
+    let (mut game, client) = begun();
+    look(&mut game, &client);
+    quiet_tick(&mut game, &client);
+    // Sleep through the night: nine hours in one advance.
+    crate::time::advance(game.world_mut(), 9 * 60, crate::time::Source::Director).unwrap();
+    assert!(game.tick_due().unwrap());
+
+    client.push(Response::canned_text("The night passed."));
+    let before = client.requests().len();
+    game.maybe_tick(&client).unwrap().expect("tick was due");
+    let requests = client.requests()[before..].to_vec();
+    assert_eq!(requests.len(), 1, "one tick, one call");
+    let slice = match requests[0].messages[0].content.first().unwrap() {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected the slice, got {other:?}"),
+    };
+    assert!(
+        slice.contains("Time: day 1, 17:10 (dusk). 9 h have passed since the last tick."),
+        "{slice}"
+    );
+    let system = requests[0].system.as_deref().unwrap_or_default();
+    assert!(system.contains("long gaps"), "{system}");
+
+    // One tick covers the whole night: nothing more is due.
+    assert!(!game.tick_due().unwrap());
+    assert_eq!(game.maybe_tick(&client).unwrap(), None);
+}
+
+#[test]
+fn the_first_tick_slice_counts_from_the_start_of_the_story() {
+    let (mut game, client) = begun();
+    look(&mut game, &client);
+    look(&mut game, &client);
+    quiet_tick(&mut game, &client);
+    let slice = match client.requests().last().unwrap().messages[0]
+        .content
+        .first()
+        .unwrap()
+    {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected the slice, got {other:?}"),
+    };
+    assert!(
+        slice.contains("20 min have passed since the story began."),
+        "{slice}"
+    );
+}
+
+#[test]
+fn a_tick_logged_without_a_minute_counts_as_minute_zero() {
+    let (mut game, client) = begun();
+    look(&mut game, &client);
+    // A tick from before ticks recorded the clock, in the opening room.
+    let room = player_room(&game);
+    game.world()
+        .log_event(
+            EventKind::Tick,
+            &json!({"turn": 1, "room": room, "summary": "", "changes": []}),
+        )
+        .unwrap();
+    assert!(game.tick_due().unwrap(), "08:10 is long after minute 0");
 }
 
 #[test]

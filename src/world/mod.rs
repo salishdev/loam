@@ -391,6 +391,20 @@ impl World {
             .transpose()
     }
 
+    /// The earliest event of `kind`, if there is one.
+    pub fn first_event(&self, kind: EventKind) -> Result<Option<Event>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, kind, payload, at FROM events WHERE kind = ?1 ORDER BY seq LIMIT 1",
+                [kind.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(seq, kind, payload, at)| parse_event(seq, kind, payload, at))
+            .transpose()
+    }
+
     /// Events with `seq > after`, in order.
     pub fn events_since(&self, after: i64) -> Result<Vec<Event>, StoreError> {
         let mut stmt = self
