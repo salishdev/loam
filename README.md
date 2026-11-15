@@ -7,10 +7,13 @@ stay consistent. Uses the Claude API (Haiku and Sonnet).
 
 ## Install
 
-Download the archive for your platform from
-[Releases](https://github.com/salishdev/loam/releases) (macOS on Apple silicon,
-Linux x86_64), unpack it and put `loam` on your `PATH`. Or build from source
-with Rust:
+On macOS (Apple silicon), download the `.pkg` from
+[Releases](https://github.com/salishdev/loam/releases) and open it. It installs
+`loam` in `/usr/local/bin`. Then run `loam` in Terminal.
+
+On Linux x86_64, download the archive, unpack it and put `loam` on your `PATH`.
+
+Or build from source with Rust:
 
 ```bash
 cargo install --git https://github.com/salishdev/loam
@@ -50,7 +53,11 @@ Releases: bump `version` in `Cargo.toml`, then push a matching tag such as
 release. The macOS binary is signed and notarized when the signing secrets
 (`MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`,
 `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`) are set,
-and ships unsigned otherwise.
+and ships unsigned otherwise. With a Developer ID Installer certificate as well
+(`MACOS_INSTALLER_CERT_P12_BASE64`, `MACOS_INSTALLER_CERT_PASSWORD`,
+`MACOS_INSTALLER_IDENTITY`), the release also has a signed, notarized and
+stapled `.pkg`. `scripts/set-installer-secrets.sh` (run on a Mac) helps make
+that certificate and sets the three secrets.
 
 ## License
 
