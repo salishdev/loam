@@ -207,6 +207,11 @@ pub struct Usage {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Prompt tokens written to the cache this call (billed at 1.25×).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Prompt tokens served from the cache this call. `input_tokens` is only
+    /// the uncached remainder; the full prompt is the sum of all three.
     #[serde(default)]
     pub cache_read_input_tokens: u64,
 }

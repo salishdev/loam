@@ -92,16 +92,30 @@ impl LlmClient for AnthropicClient {
     }
 }
 
+/// The wire body. Caching: an explicit breakpoint on the system prompt
+/// (render order is tools → system → messages, so it caches both), plus
+/// top-level automatic caching, whose breakpoint follows the end of the
+/// conversation so each call in a tool loop reads back the turns before it.
+/// Prefixes under the model's minimum (512 tokens on the 5.5 models) silently
+/// don't cache.
 fn request_body(request: &Request) -> Value {
     let mut body = json!({
         "model": request.model.id(),
         "max_tokens": request.max_tokens,
         "stream": true,
+        "cache_control": { "type": "ephemeral" },
         "messages": request.messages,
     });
     let obj = body.as_object_mut().expect("object literal");
     if let Some(system) = &request.system {
-        obj.insert("system".into(), json!(system));
+        obj.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]),
+        );
     }
     if !request.tools.is_empty() {
         obj.insert("tools".into(), json!(request.tools));
@@ -303,10 +317,25 @@ fn handle_event(
                 );
             }
             if let Some(usage) = event.get("usage") {
+                // Counts here are cumulative; input and cache fields may be
+                // absent (zero), in which case message_start's stand.
                 let delta: Usage = serde_json::from_value(usage.clone()).unwrap_or_default();
-                resp.usage.output_tokens = delta.output_tokens;
-                if delta.input_tokens > 0 {
-                    resp.usage.input_tokens = delta.input_tokens;
+                let u = &mut resp.usage;
+                u.output_tokens = delta.output_tokens;
+                for (slot, new) in [
+                    (&mut u.input_tokens, delta.input_tokens),
+                    (
+                        &mut u.cache_creation_input_tokens,
+                        delta.cache_creation_input_tokens,
+                    ),
+                    (
+                        &mut u.cache_read_input_tokens,
+                        delta.cache_read_input_tokens,
+                    ),
+                ] {
+                    if new > 0 {
+                        *slot = new;
+                    }
                 }
             }
         }
@@ -488,7 +517,11 @@ mod tests {
         let body = request_body(&req);
         assert_eq!(body["model"], "claude-haiku-5-5");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "be terse");
+        assert_eq!(
+            body["system"],
+            json!([{"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}])
+        );
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(body["output_config"], json!({"effort": "low"}));
         assert_eq!(body["tools"][0]["name"], "look");
         assert_eq!(
@@ -500,6 +533,24 @@ mod tests {
         let sonnet = request_body(&Request::new(Model::Sonnet, vec![Message::user("hi")]));
         assert_eq!(sonnet["fallbacks"], "default");
         assert!(sonnet.get("tools").is_none() && sonnet.get("system").is_none());
+        assert_eq!(sonnet["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn cache_usage_is_parsed_and_merged() {
+        let events = vec![
+            json!({"type": "message_start", "message": {"id": "m", "model": "x", "usage": {
+                "input_tokens": 5, "output_tokens": 1,
+                "cache_creation_input_tokens": 30, "cache_read_input_tokens": 900}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
+                "output_tokens": 12, "cache_creation_input_tokens": 31}}),
+            json!({"type": "message_stop"}),
+        ];
+        let usage = parse(&events).0.unwrap().usage;
+        assert_eq!(usage.input_tokens, 5);
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(usage.cache_creation_input_tokens, 31);
+        assert_eq!(usage.cache_read_input_tokens, 900);
     }
 
     #[test]

@@ -203,3 +203,98 @@ fn seed_builds_a_stat_sheet() {
         )));
     }
 }
+
+/// Wraps the real client and keeps every call's usage.
+struct Recording {
+    inner: AnthropicClient,
+    usages: std::cell::RefCell<Vec<loam::llm::Usage>>,
+}
+
+impl loam::llm::LlmClient for Recording {
+    fn send(
+        &self,
+        request: &Request,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<loam::llm::Response, loam::llm::LlmError> {
+        let response = self.inner.send(request, on_text)?;
+        self.usages.borrow_mut().push(response.usage);
+        Ok(response)
+    }
+}
+
+/// A tool loop with a system prompt over the 512-token minimum: the first
+/// call writes the cache, every later call in the loop reads it back.
+fn cache_hits_in_tool_loop(model: Model) {
+    let client = Recording {
+        inner: AnthropicClient::from_env().expect("set ANTHROPIC_API_KEY to run live tests"),
+        usages: Default::default(),
+    };
+    let mut system = String::from(
+        "You are a careful assistant in a test harness. Follow the user's steps exactly.\n\n",
+    );
+    for i in 1..=60 {
+        system.push_str(&format!(
+            "House rule {i}: keep replies short, never invent tool results, and call tools \
+             one at a time, waiting for each result before the next call.\n"
+        ));
+    }
+    let request = Request::new(
+        model,
+        vec![Message::user(
+            "Call get_part with part 1. After its result, call get_part with part 2. \
+             Then reply with just the two parts joined, part 1 first.",
+        )],
+    )
+    .system(system)
+    .max_tokens(2_000)
+    .tools(vec![ToolDefinition::new(
+        "get_part",
+        "Returns one part of a code.",
+        json!({"type": "object", "properties": {"part": {"type": "integer"}},
+               "required": ["part"], "additionalProperties": false}),
+    )]);
+
+    let outcome =
+        run_tool_loop(
+            &client,
+            request,
+            6,
+            &mut |_| {},
+            &mut |call| match call.input["part"].as_i64() {
+                Some(1) => ToolOutput::Ok("48".into()),
+                Some(2) => ToolOutput::Ok("15".into()),
+                _ => ToolOutput::Err("part must be 1 or 2".into()),
+            },
+        )
+        .expect("tool loop should succeed");
+
+    let usages = client.usages.into_inner();
+    for (i, u) in usages.iter().enumerate() {
+        println!("call {}: {u:?}", i + 1);
+    }
+    assert!(outcome.final_response.text().contains("4815"));
+    assert!(usages.len() >= 2, "expected a multi-call loop");
+    assert!(
+        usages[0].cache_creation_input_tokens + usages[0].cache_read_input_tokens > 0,
+        "first call should write (or, on a rerun, read) the cache"
+    );
+    for (i, u) in usages.iter().enumerate().skip(1) {
+        assert!(
+            u.cache_read_input_tokens > 0,
+            "call {} read nothing from the cache",
+            i + 1
+        );
+    }
+}
+
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn haiku_tool_loop_reads_cache() {
+    cache_hits_in_tool_loop(Model::Haiku);
+}
+
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn sonnet_tool_loop_reads_cache() {
+    cache_hits_in_tool_loop(Model::Sonnet);
+}
