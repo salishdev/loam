@@ -15,7 +15,7 @@
 //! the current directory and then the repo root; real environment variables
 //! win.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -67,21 +67,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if seed_file.is_some() && game.has_bible()? {
         eprintln!("[{path} already has a world; the seed is ignored]");
     }
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    let mut editor = LineEditor::new()?;
 
     if !game.has_bible()? {
         let mut seed = String::new();
         if let Some(found) = &seed_file {
             println!("New world in {path}, seeded from {}.", found.source);
             seed.push_str(&found.text);
-        } else if let Some(found) = choose_seed(&path, &mut lines)? {
+        } else if let Some(found) = choose_seed(&path, &mut editor)? {
             println!("Seeded from {}.", found.source);
             seed.push_str(&found.text);
         } else {
             println!("Describe the world's plot, tone and setting; end with a blank line.");
-            for line in lines.by_ref() {
-                let line = line?;
+            while let Some(line) = editor.read_line("")? {
                 if line.trim().is_empty() && !seed.trim().is_empty() {
                     break;
                 }
@@ -103,11 +101,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop {
-        print!("\n> ");
-        io::stdout().flush()?;
-        let Some(line) = lines.next() else { break };
-        let input = line?;
-        let input = input.trim();
+        println!();
+        let Some(line) = editor.read_line("> ")? else { break };
+        let input = line.trim();
         if input.is_empty() {
             continue;
         }
@@ -393,7 +389,7 @@ fn seed_teaser(text: &str) -> String {
 /// game if input runs out before an answer.
 fn choose_seed(
     path: &str,
-    lines: &mut impl Iterator<Item = io::Result<String>>,
+    input: &mut LineEditor,
 ) -> Result<Option<Seed>, Box<dyn std::error::Error>> {
     let dirs = seed_dirs();
     let names = list_seeds(&dirs);
@@ -405,15 +401,40 @@ fn choose_seed(
     }
     println!("  {}. Write your own", names.len() + 1);
     loop {
-        print!("> ");
-        io::stdout().flush()?;
-        let Some(answer) = lines.next() else {
+        let Some(answer) = input.read_line("> ")? else {
             return Err("no seed chosen".into());
         };
-        match parse_seed_choice(&answer?, &names) {
+        match parse_seed_choice(&answer, &names) {
             Some(SeedChoice::Named(name)) => return Ok(Some(resolve_seed(&name, &dirs)?)),
             Some(SeedChoice::Own) => return Ok(None),
             None => println!("Type a number from 1 to {}.", names.len() + 1),
+        }
+    }
+}
+
+/// Reads input lines through a line editor, so the arrow keys move the caret
+/// and recall earlier lines instead of typing escape codes. Piped input is
+/// read line by line as before.
+struct LineEditor(rustyline::DefaultEditor);
+
+impl LineEditor {
+    fn new() -> rustyline::Result<Self> {
+        Ok(Self(rustyline::DefaultEditor::new()?))
+    }
+
+    /// Shows `prompt` and reads one line, keeping it in the history when it
+    /// isn't blank. `None` at end of input (Ctrl-D) or on Ctrl-C.
+    fn read_line(&mut self, prompt: &str) -> rustyline::Result<Option<String>> {
+        use rustyline::error::ReadlineError;
+        match self.0.readline(prompt) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    self.0.add_history_entry(line.as_str())?;
+                }
+                Ok(Some(line))
+            }
+            Err(ReadlineError::Eof | ReadlineError::Interrupted) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 }
