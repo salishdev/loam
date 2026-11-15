@@ -358,21 +358,7 @@ impl World {
     pub fn changed_since(&self, after: i64) -> Result<BTreeSet<EntityId>, StoreError> {
         let mut changed = BTreeSet::new();
         for event in self.events_since(after)? {
-            if event.kind != EventKind::Patch {
-                continue;
-            }
-            for (_, ids) in event.patch_touches()? {
-                changed.extend(ids);
-            }
-            if let Some(cascaded) = event.payload.get("cascaded") {
-                let cascaded: Vec<Cascaded> =
-                    serde_json::from_value(cascaded.clone()).map_err(|e| {
-                        StoreError::Corrupt(format!("event {}: bad cascaded list: {e}", event.seq))
-                    })?;
-                for c in cascaded {
-                    changed.extend([c.relation.subject, c.relation.object]);
-                }
-            }
+            changed.extend(event.changed()?);
         }
         Ok(changed)
     }

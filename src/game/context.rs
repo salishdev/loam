@@ -3,6 +3,7 @@
 //! Current room and its exits, what is in it (one level down), what the
 //! player carries, the relations of everything in the room, what world
 //! ticks did in the room, the last few turns and the bible's section titles.
+//! [`stall_hint`] tells the director when the scene has gone quiet.
 //! Everything else is fetched through tools.
 
 use std::collections::BTreeMap;
@@ -26,6 +27,47 @@ const RECENT_EVENTS: usize = 6;
 const ROOM_NOTES: usize = 3;
 /// Longest recent narration shown in full.
 const RECENT_CHARS: usize = 500;
+/// Quiet turns in a row after which the director hears the scene is
+/// stalling.
+pub const STALL_TURNS: usize = 4;
+/// What the director is told when the scene stalls.
+pub const STALL_HINT: &str = "The scene is stalling: the player's last few turns here \
+changed nothing. Let the world knock: bring in an NPC, a sound, or a consequence of something \
+moving off-screen. Still resolve the player's action as asked; never refuse or override it.";
+
+/// [`STALL_HINT`] when each of the last [`STALL_TURNS`] player turns
+/// changed nothing besides the bible (whose clock every turn advances).
+/// Moving to another room changes the player, so it counts as a change.
+///
+/// A turn runs from its input to its narration: that is where the director's
+/// and the fast path's patches land. World ticks run between turns and only
+/// change things off-screen, so they don't break a stall. Derived from the
+/// log alone, so a resumed or forked game stalls the same way.
+pub fn stall_hint(world: &World) -> Result<Option<&'static str>, StoreError> {
+    // The seed is logged as an input; it isn't a turn.
+    let inputs: Vec<_> = world
+        .search_events("", &[EventKind::Input], STALL_TURNS + 1)?
+        .into_iter()
+        .filter(|e| e.payload.get("seed").is_none())
+        .take(STALL_TURNS)
+        .collect();
+    let Some(oldest) = inputs.last().filter(|_| inputs.len() == STALL_TURNS) else {
+        return Ok(None);
+    };
+    let bible = bible_id(world)?;
+    let mut in_turn = false;
+    for event in world.events_since(oldest.seq - 1)? {
+        match event.kind {
+            EventKind::Input => in_turn = true,
+            EventKind::Narration => in_turn = false,
+            _ => {}
+        }
+        if in_turn && event.changed()?.iter().any(|id| Some(*id) != bible) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(STALL_HINT))
+}
 
 /// Render the local slice as compact text.
 pub fn local_slice(world: &World) -> Result<String, StoreError> {

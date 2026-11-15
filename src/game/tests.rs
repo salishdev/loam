@@ -2406,3 +2406,95 @@ fn an_untimed_rule_on_the_fast_path_spends_the_estimate() {
     assert_eq!(outcome.fast_path, Some(rule));
     assert_eq!(last_advance(&game), (60, "interpreter".into()));
 }
+
+/// Whether the director's latest request carried the stall hint.
+fn told_stalling(client: &ScriptedClient) -> bool {
+    first_user_text(client.requests().last().unwrap()).contains(STALL_HINT)
+}
+
+#[test]
+fn quiet_turns_in_one_room_add_the_stall_hint_and_a_patch_resets_it() {
+    let (mut game, client) = begun();
+    for n in 1..=STALL_TURNS {
+        look(&mut game, &client);
+        assert!(
+            !told_stalling(&client),
+            "turn {n} came after too few quiet turns"
+        );
+    }
+    assert_eq!(stall_hint(game.world()).unwrap(), Some(STALL_HINT));
+    // An off-screen tick between turns doesn't break the stall.
+    quiet_tick(&mut game, &client);
+    look(&mut game, &client);
+    assert!(told_stalling(&client));
+
+    // A turn that patches the world resets the count.
+    let candle = game
+        .world()
+        .state()
+        .unwrap()
+        .entities
+        .into_iter()
+        .find(|e| e.name == "tallow candle")
+        .unwrap()
+        .id;
+    client.push(Response::canned_tool_use(
+        "p1",
+        "apply_patch",
+        json!({"ops": [{"op": "set_prop", "entity": candle, "key": "lit", "value": true}]}),
+    ));
+    client.push(Response::canned_text("The candle catches."));
+    game.turn(&client, "light the candle", &mut |_| {}).unwrap();
+    // The patching turn itself was still told: the hint never refuses.
+    assert!(told_stalling(&client));
+    assert_eq!(stall_hint(game.world()).unwrap(), None);
+    for _ in 1..STALL_TURNS {
+        look(&mut game, &client);
+        assert!(!told_stalling(&client));
+    }
+    look(&mut game, &client);
+    assert!(
+        !told_stalling(&client),
+        "only three quiet turns since the patch"
+    );
+    look(&mut game, &client);
+    assert!(told_stalling(&client));
+}
+
+#[test]
+fn a_room_change_resets_the_stall_hint() {
+    let (mut game, client) = begun();
+    for _ in 0..STALL_TURNS {
+        look(&mut game, &client);
+    }
+    assert!(stall_hint(game.world()).unwrap().is_some());
+    client.push(Response::canned_tool_use(
+        "r2",
+        "create_room",
+        json!({"via_exit": "north", "back_exit": "south", "name": "Bell Tower", "region": "Saltmarsh",
+               "description": "A leaning tower.", "exits": {}, "contents": []}),
+    ));
+    client.push(Response::canned_text("The tower."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    assert_eq!(stall_hint(game.world()).unwrap(), None);
+    look(&mut game, &client);
+    assert!(!told_stalling(&client));
+}
+
+#[test]
+fn the_stall_hint_survives_a_fork() {
+    let (mut game, client) = begun();
+    for _ in 0..STALL_TURNS {
+        look(&mut game, &client);
+    }
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(stall_hint(&replayed).unwrap(), Some(STALL_HINT));
+}
+
+#[test]
+fn the_director_and_narrator_are_asked_to_let_time_show() {
+    let (_, client) = begun();
+    let system = client.requests().last().unwrap().system.clone().unwrap();
+    assert!(system.contains("never state clock times"), "{system}");
+    assert!(fast_path::NARRATOR_SYSTEM.contains("without stating clock times"));
+}

@@ -2,7 +2,9 @@
 
 use serde_json::{Map, Value};
 
-use super::{ENGINE_PROP_PREFIX, EntityId, EntityRef, Op, Patch, StoreError};
+use std::collections::BTreeSet;
+
+use super::{Cascaded, ENGINE_PROP_PREFIX, EntityId, EntityRef, Op, Patch, StoreError};
 
 fn is_engine_owned(rel: &str) -> bool {
     rel.starts_with(ENGINE_PROP_PREFIX)
@@ -81,6 +83,31 @@ pub struct Event {
 }
 
 impl Event {
+    /// What an applied `patch` event changed, as
+    /// [`World::changed_since`](super::World::changed_since) counts it: every
+    /// id in [`patch_touches`](Self::patch_touches) plus both ends of every
+    /// relation a destroy cascaded. Empty for any other event, rejected
+    /// patches included.
+    pub fn changed(&self) -> Result<BTreeSet<EntityId>, StoreError> {
+        let mut changed = BTreeSet::new();
+        if self.kind != EventKind::Patch {
+            return Ok(changed);
+        }
+        for (_, ids) in self.patch_touches()? {
+            changed.extend(ids);
+        }
+        if let Some(cascaded) = self.payload.get("cascaded") {
+            let cascaded: Vec<Cascaded> =
+                serde_json::from_value(cascaded.clone()).map_err(|e| {
+                    StoreError::Corrupt(format!("event {}: bad cascaded list: {e}", self.seq))
+                })?;
+            for c in cascaded {
+                changed.extend([c.relation.subject, c.relation.object]);
+            }
+        }
+        Ok(changed)
+    }
+
     /// For a `patch` or `patch_rejected` event, each op with the entities it
     /// touched: created (and where), moved (and where to), given or stripped
     /// of props, renamed or destroyed, or either end of a relation made or

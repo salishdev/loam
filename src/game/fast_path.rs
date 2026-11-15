@@ -23,11 +23,13 @@ time as duration: moment (a glance, a word), minutes (most actions), hour (a sea
 a short walk) or hours (a journey, a long task, a sleep). Reply with nothing but the \
 interpret tool call.";
 
-const NARRATOR_SYSTEM: &str = "You narrate a text adventure. The engine has already resolved \
-the player's action by a known rule; describe exactly that outcome, nothing more: don't \
-invent other changes to the world. If a check was rolled, the outcome given is the one its \
-result produced. Second person, present tense, in the world's tone, one \
-or two short paragraphs. Output only the prose.";
+pub(super) const NARRATOR_SYSTEM: &str = "You narrate a text adventure. The engine has \
+already resolved the player's action by a known rule; describe exactly that outcome, nothing \
+more: don't invent other changes to the world. If a check was rolled, the outcome given is \
+the one its result produced. Let the time of day and the time that has passed (the Time \
+line) show when it matters, such as in the light or the weather, without stating clock \
+times. Second person, present tense, in the world's tone, one or two short \
+paragraphs. Output only the prose.";
 
 /// Most tokens the interpreter may spend (thinking included).
 const INTERPRETER_MAX_TOKENS: u32 = 4_000;

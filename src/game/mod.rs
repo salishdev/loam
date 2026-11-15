@@ -15,7 +15,7 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
-pub use context::local_slice;
+pub use context::{STALL_HINT, STALL_TURNS, local_slice, stall_hint};
 pub use npcs::{NpcSighting, bible_npc_names, npcs};
 pub use tick::{ROOM_CHANGE_MINUTES, TICK_MINUTES, TickChange, TickOutcome};
 pub use tools::Phase;
@@ -84,8 +84,10 @@ amend_rule or retire_rule and, where you can, turn the contradiction into story.
 turn spends world time: the engine note gives the interpreter's estimate when there is one \
 (otherwise about 10 minutes). Call pass_time when the action took notably more or less, and \
 always for waiting or sleeping (work out \"until dawn\" from the slice's time); a rule minted \
-with apply_to keeps this turn's duration unless you give it minutes. Write no \
-text until your tool calls are done. Your final message is shown to the player verbatim: \
+with apply_to keeps this turn's duration unless you give it minutes. Let the time of day and \
+the time that has passed (the slice's Time line) show when it matters: light, weather, \
+hunger, an NPC's patience; never state clock times. Write no text until your tool calls are \
+done. Your final message is shown to the player verbatim: \
 second person, present tense, in the bible's tone, one to three short paragraphs.";
 
 const OPENING: &str = "The story begins. The player is nowhere yet: read the bible, create the \
@@ -252,6 +254,7 @@ impl Game {
         // The slice is taken before the input is logged, so "Recent" shows
         // earlier turns only.
         let slice = local_slice(&self.world)?;
+        let stall = context::stall_hint(&self.world)?;
         self.world
             .log_event(EventKind::Input, &json!({"text": input}))?;
         let mut turn = Turn {
@@ -309,11 +312,16 @@ impl Game {
                 bucket.as_str()
             ));
         }
-        let instruction = if note.is_empty() {
-            format!("Player input: {input}")
-        } else {
-            format!("Engine note: {note}\nPlayer input: {input}")
-        };
+        // The stall hint is for the director alone: the interpreter and the
+        // fast-path narrator never see it.
+        let mut instruction = String::new();
+        if let Some(hint) = stall {
+            instruction.push_str(&format!("Engine note: {hint}\n"));
+        }
+        if !note.is_empty() {
+            instruction.push_str(&format!("Engine note: {note}\n"));
+        }
+        instruction.push_str(&format!("Player input: {input}"));
         let mut outcome = self.director_turn(client, &slice, &instruction, turn, on_text)?;
         outcome.calls += calls;
         Ok(outcome)
