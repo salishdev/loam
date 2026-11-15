@@ -23,7 +23,7 @@ pub fn start_definition() -> ToolDefinition {
                 "what": {"type": "string", "description": "What is coming, a short phrase."},
                 "consequence": {"type": "string", "description": "What happens when it comes."},
                 "due_in_minutes": {"type": "integer", "minimum": 1, "description": "World minutes from now until it is due."},
-                "concerns": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the entities (or quest) it threatens."}
+                "concerns": {"type": "array", "items": {"type": "integer"}, "description": "Ids of the entities it threatens. Name a quest to give it a soft deadline: when overdue you are nudged to escalate the quest; it never fails by itself."}
             },
             "required": ["what", "consequence", "due_in_minutes"]
         }),

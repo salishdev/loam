@@ -364,7 +364,7 @@ fn tick_slice(world: &World) -> Result<String, StoreError> {
         writeln!(out, "NPCs: {}", npcs.join("; ")).unwrap();
     }
 
-    let pressures = crate::pressure::slice_lines(world, |p| {
+    let pressures = crate::pressure::slice_lines(world, crate::pressure::Audience::Tick, |p| {
         let Some(player) = super::player_id(world)? else {
             return Ok(None);
         };

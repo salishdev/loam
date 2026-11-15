@@ -541,7 +541,8 @@ type Observer<'a> = &'a mut dyn FnMut(&World, &ToolUse, Option<&ToolOutput>);
 /// The director's pressure lines under a heading, or nothing when nothing
 /// presses.
 fn pressure_section(world: &World) -> Result<String, StoreError> {
-    let lines = crate::pressure::slice_lines(world, |_| Ok(None))?;
+    let lines =
+        crate::pressure::slice_lines(world, crate::pressure::Audience::Director, |_| Ok(None))?;
     if lines.is_empty() {
         return Ok(String::new());
     }

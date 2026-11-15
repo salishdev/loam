@@ -197,9 +197,17 @@ fn slice_lists_active_pressures_nearest_first_with_a_nudge_when_overdue() {
     let near = st(&mut world, "The sluice gives way", 90, vec![sluice]);
     let done = st(&mut world, "The bell rings", 30, vec![]);
     resolve(&mut world, done, "rung").unwrap();
-    assert!(slice_lines(&world, |_| Ok(None)).unwrap().len() == 2);
+    assert!(
+        slice_lines(&world, Audience::Director, |_| Ok(None))
+            .unwrap()
+            .len()
+            == 2
+    );
     crate::time::advance(&mut world, 120, crate::time::Source::Default).unwrap();
-    let lines = slice_lines(&world, |p| Ok((p.id == near).then(|| "marked".to_owned()))).unwrap();
+    let lines = slice_lines(&world, Audience::Director, |p| {
+        Ok((p.id == near).then(|| "marked".to_owned()))
+    })
+    .unwrap();
     assert_eq!(
         lines,
         vec![
@@ -214,4 +222,53 @@ fn slice_lists_active_pressures_nearest_first_with_a_nudge_when_overdue() {
             ),
         ]
     );
+}
+
+#[test]
+fn an_overdue_pressure_on_a_quest_nudges_the_director_to_escalate_it() {
+    let (mut world, _, sluice) = world();
+    let open = crate::quest::spawn(&mut world, "Save the mill", "water rises", &[sluice]).unwrap();
+    let done = crate::quest::spawn(&mut world, "Find the miller", "gone", &[sluice]).unwrap();
+    // The judge alone resolves quests; write the state as it would.
+    let mut state = world.entity(done).unwrap().unwrap().props["_quest"].clone();
+    state["status"] = json!("complete");
+    let op = Op::SetProp {
+        entity: done.into(),
+        key: "_quest".into(),
+        value: state,
+    };
+    world.apply_engine_patch(&Patch::new(vec![op])).unwrap();
+    let p = start(
+        &mut world,
+        "The flood",
+        "the mill drowns",
+        60,
+        &[sluice, open, done],
+    )
+    .unwrap();
+
+    let nudge = quest_nudge(&crate::quest::quest(&world, open).unwrap().unwrap());
+    assert!(
+        nudge.contains(&format!("escalate_quest #{open}")),
+        "{nudge}"
+    );
+    // Not before it is due.
+    let lines = slice_lines(&world, Audience::Director, |_| Ok(None)).unwrap();
+    assert!(!lines[0].contains("escalate_quest"), "{}", lines[0]);
+
+    crate::time::advance(&mut world, 60, crate::time::Source::Default).unwrap();
+    let lines = slice_lines(&world, Audience::Director, |_| Ok(None)).unwrap();
+    assert_eq!(
+        lines,
+        vec![format!(
+            "- pressure #{p} The flood [overdue] due day 1, 09:00 (morning) (now); \
+             then: the mill drowns (concerns #{sluice} #{open} #{done}). {OVERDUE_NUDGE}. {nudge}"
+        )]
+    );
+    // The tick has no quest tools: it gets the plain nudge.
+    let lines = slice_lines(&world, Audience::Tick, |_| Ok(None)).unwrap();
+    assert!(lines[0].ends_with(OVERDUE_NUDGE), "{}", lines[0]);
+    // Missing the deadline fails nothing.
+    let q = crate::quest::quest(&world, open).unwrap().unwrap();
+    assert_eq!(q.status, crate::quest::Status::Open);
 }

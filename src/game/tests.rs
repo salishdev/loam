@@ -2726,3 +2726,33 @@ fn the_bible_can_open_under_pressure() {
     assert_eq!(p.what, "The tide turns");
     assert_eq!(p.due.to_string(), "day 1, 12:00 (afternoon)");
 }
+
+#[test]
+fn an_overdue_pressure_on_a_quest_puts_escalate_quest_in_the_director_slice() {
+    let (mut game, client) = begun();
+    let quest =
+        crate::quest::spawn(game.world_mut(), "Drain the chapel", "water rises", &[]).unwrap();
+    let p = crate::pressure::start(
+        game.world_mut(),
+        "The crypt floods",
+        "the relics are lost",
+        10,
+        &[quest],
+    )
+    .unwrap();
+    look(&mut game, &client);
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(!director.contains("escalate_quest"), "{director}");
+
+    // Due now: the director is told to escalate the quest, which stays open.
+    look(&mut game, &client);
+    let director = first_user_text(client.requests().last().unwrap());
+    let q = crate::quest::quest(game.world(), quest).unwrap().unwrap();
+    assert!(
+        director.contains(&format!("- pressure #{p} The crypt floods [overdue]"))
+            && director.contains(&crate::pressure::quest_nudge(&q))
+            && director.contains(&format!("escalate_quest #{quest}")),
+        "{director}"
+    );
+    assert_eq!(q.status, crate::quest::Status::Open);
+}

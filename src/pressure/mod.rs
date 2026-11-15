@@ -5,8 +5,10 @@
 //! tracks how close each one is and shows the active ones to the director
 //! and the world tick, nearest first. It never makes the consequence happen
 //! itself: when a pressure is overdue the slice nudges the director to
-//! advance or resolve it, and the director decides how. Nothing here ever
-//! refuses a player action.
+//! advance or resolve it, and the director decides how. A pressure that
+//! concerns a quest is that quest's soft deadline: overdue, it nudges the
+//! director to escalate the quest, which never fails by itself. Nothing here
+//! ever refuses a player action.
 //!
 //! A pressure is a top-level world entity of kind [`PRESSURE_KIND`], its
 //! state in the engine-owned `_pressure` component and the entities it
@@ -46,6 +48,26 @@ pub const IMMINENT_MINUTES: u64 = 60;
 /// The nudge an overdue pressure carries in the director and tick slices.
 pub const OVERDUE_NUDGE: &str =
     "overdue: advance or resolve it this turn, or say in the tick why not";
+
+/// Who reads the pressure lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// The director's turn message: overdue pressures on an unresolved
+    /// quest also suggest `escalate_quest`.
+    Director,
+    /// The world tick, which has no quest tools.
+    Tick,
+}
+
+/// The nudge an overdue pressure adds, for the director, for each
+/// unresolved quest it concerns. A missed deadline never fails a quest.
+pub fn quest_nudge(quest: &crate::quest::Quest) -> String {
+    format!(
+        "Quest #{} {:?} missed its deadline: escalate_quest #{} with what that brings; \
+         it doesn't fail by itself",
+        quest.id, quest.title, quest.id
+    )
+}
 
 /// A pressure's state: the `_pressure` component.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -399,9 +421,12 @@ pub fn resolve(world: &mut World, id: EntityId, how: &str) -> Result<Pressure> {
 
 /// One line per active pressure, nearest first, for the director's and the
 /// tick's slices. `mark` may append a note to a pressure's line (the tick
-/// marks on-screen ones). Empty when nothing presses.
+/// marks on-screen ones). For the director, an overdue pressure also nudges
+/// it to escalate each unresolved quest it concerns ([`quest_nudge`]).
+/// Empty when nothing presses.
 pub fn slice_lines(
     world: &World,
+    audience: Audience,
     mut mark: impl FnMut(&Pressure) -> Result<Option<String>, StoreError>,
 ) -> Result<Vec<String>, StoreError> {
     let now = time::now(world)?;
@@ -425,6 +450,15 @@ pub fn slice_lines(
         }
         if urgency == Urgency::Overdue {
             line.push_str(&format!(". {OVERDUE_NUDGE}"));
+            if audience == Audience::Director {
+                for &id in &p.concerns {
+                    if let Some(q) = crate::quest::quest(world, id)?
+                        && !q.status.is_resolved()
+                    {
+                        line.push_str(&format!(". {}", quest_nudge(&q)));
+                    }
+                }
+            }
         }
         lines.push(line);
     }
