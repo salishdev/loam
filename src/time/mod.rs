@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::llm::{ToolDefinition, ToolOutput};
 use crate::world::{
     self, ApplyError, Component, EntityId, Event, EventKind, Patch, StoreError, World,
 };
@@ -226,4 +227,87 @@ pub fn slice_line(world: &World) -> Result<String, StoreError> {
         line.push_str(&format!("; your last action took {}", span(last.minutes)));
     }
     Ok(line)
+}
+
+/// The interpreter's rough size for an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bucket {
+    /// A glance, a word: 1 min.
+    Moment,
+    /// Most actions: 10 min.
+    Minutes,
+    /// A search, a meal, a short walk: 1 h.
+    Hour,
+    /// A journey, a long task: 4 h.
+    Hours,
+}
+
+impl Bucket {
+    pub const ALL: [Bucket; 4] = [Bucket::Moment, Bucket::Minutes, Bucket::Hour, Bucket::Hours];
+
+    pub fn minutes(self) -> u64 {
+        match self {
+            Bucket::Moment => 1,
+            Bucket::Minutes => DEFAULT_MINUTES,
+            Bucket::Hour => 60,
+            Bucket::Hours => 240,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bucket::Moment => "moment",
+            Bucket::Minutes => "minutes",
+            Bucket::Hour => "hour",
+            Bucket::Hours => "hours",
+        }
+    }
+}
+
+/// The director's `pass_time` tool.
+pub fn pass_time_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        PASS_TIME,
+        "Set how long the player's action took this turn, in minutes (0 to 10080, a week); \
+         the last call wins. Use it when the action took notably more or less than the \
+         estimate, and always for waiting or sleeping.",
+        json!({
+            "type": "object",
+            "properties": {
+                "minutes": {"type": "integer", "minimum": 0, "maximum": MAX_ADVANCE},
+                "reason": {"type": "string"}
+            },
+            "required": ["minutes", "reason"]
+        }),
+    )
+}
+
+/// Name of the director's duration tool.
+pub const PASS_TIME: &str = "pass_time";
+
+#[derive(Deserialize)]
+struct PassTimeInput {
+    minutes: i64,
+    /// Required so the log says why; not otherwise used.
+    #[serde(rename = "reason")]
+    _reason: String,
+}
+
+/// Check a `pass_time` call. The duration takes effect when the turn ends
+/// (read back from the logged call), so nothing changes here.
+pub fn pass_time(input: &serde_json::Value) -> ToolOutput {
+    let input: PassTimeInput = match serde_json::from_value(input.clone()) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::Err(format!("bad input for pass_time: {e}")),
+    };
+    if !(0..=MAX_ADVANCE as i64).contains(&input.minutes) {
+        return ToolOutput::Err(format!(
+            "minutes must be 0 to {MAX_ADVANCE} (a week), not {}",
+            input.minutes
+        ));
+    }
+    ToolOutput::Ok(
+        json!({"minutes": input.minutes, "takes": span(input.minutes as u64)}).to_string(),
+    )
 }

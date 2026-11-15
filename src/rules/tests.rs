@@ -876,3 +876,43 @@ fn destroying_an_entity_an_effect_names_retires_the_rule() {
     let r = f.world.replay_in_memory().unwrap();
     assert_eq!(r.state().unwrap(), f.world.state().unwrap());
 }
+
+#[test]
+fn rule_minutes_are_optional_capped_and_set_once_by_the_minting_turn() {
+    let mut f = fixture();
+    // Rules stored before durations existed have none, and say nothing.
+    assert_eq!(kick_rule().minutes, None);
+    assert!(
+        serde_json::to_value(kick_rule())
+            .unwrap()
+            .get("minutes")
+            .is_none()
+    );
+
+    let mut long = kick_rule();
+    long.minutes = Some(7 * 24 * 60 + 1);
+    assert!(
+        mint(&mut f.world, long, "")
+            .unwrap()
+            .unwrap_err()
+            .contains("at most 10080")
+    );
+
+    let (rule, _) = mint(&mut f.world, kick_rule(), "").unwrap().unwrap();
+    let timed = set_minutes(&mut f.world, rule.id, 25).unwrap().unwrap();
+    assert_eq!((timed.def.minutes, timed.version), (Some(25), 1));
+    assert_eq!(
+        get(&f.world, rule.id).unwrap().unwrap().def.minutes,
+        Some(25)
+    );
+    assert_eq!(
+        get(&f.world, rule.id).unwrap().unwrap().summary()["minutes"],
+        json!(25)
+    );
+    // Already timed: left alone.
+    assert!(set_minutes(&mut f.world, rule.id, 60).unwrap().is_none());
+    assert_eq!(
+        get(&f.world, rule.id).unwrap().unwrap().def.minutes,
+        Some(25)
+    );
+}

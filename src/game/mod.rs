@@ -20,7 +20,7 @@ pub use npcs::{NpcSighting, bible_npc_names, npcs};
 pub use tick::{ROOM_CHANGE_MINUTES, TICK_MINUTES, TickChange, TickOutcome};
 pub use tools::Phase;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::inventory::{DEFAULT_SLOTS, Inventory};
 use crate::llm::ToolUse;
@@ -30,7 +30,7 @@ use crate::llm::{
 use crate::quest::{self, Judgment, Quest};
 use crate::rules::{self, RuleId, Scope};
 use crate::stats;
-use crate::time;
+use crate::time::{self, Bucket};
 use crate::world::{EntityId, EventKind, StoreError, World};
 
 /// Kind of the single entity holding the world bible.
@@ -80,7 +80,11 @@ against the fitting stat and honour the result; a rule can embed the check. Stat
 only through adjust_stat with a reason; raise them by their advancement rules, and build \
 quests around the charter. Use glossary terms for props (lookup_terms) and define \
 new ones (define_terms). When a note says rules conflict or misfire, fix them with \
-amend_rule or retire_rule and, where you can, turn the contradiction into story. Write no \
+amend_rule or retire_rule and, where you can, turn the contradiction into story. Every \
+turn spends world time: the engine note gives the interpreter's estimate when there is one \
+(otherwise about 10 minutes). Call pass_time when the action took notably more or less, and \
+always for waiting or sleeping (work out \"until dawn\" from the slice's time); a rule minted \
+with apply_to keeps this turn's duration unless you give it minutes. Write no \
 text until your tool calls are done. Your final message is shown to the player verbatim: \
 second person, present tense, in the bible's tone, one to three short paragraphs.";
 
@@ -117,11 +121,16 @@ pub struct TurnOutcome {
     pub fast_path: Option<RuleId>,
 }
 
-/// Where a turn's events start, and its input (none for the opening).
+/// Where a turn's events start, its input (none for the opening), and what
+/// the engine knows about its duration before the director runs.
 #[derive(Debug, Clone, Copy)]
 struct Turn<'a> {
     start: i64,
     input: Option<&'a str>,
+    /// The interpreter's estimate.
+    estimate: Option<Bucket>,
+    /// The minutes of the rule the fast path applied.
+    rule_minutes: Option<u32>,
 }
 
 /// A game session over a world store.
@@ -218,6 +227,8 @@ impl Game {
         let turn = Turn {
             start: self.world.last_seq()?,
             input: None,
+            estimate: None,
+            rule_minutes: None,
         };
         self.director_turn(client, &slice, OPENING, turn, on_text)
     }
@@ -243,17 +254,20 @@ impl Game {
         let slice = local_slice(&self.world)?;
         self.world
             .log_event(EventKind::Input, &json!({"text": input}))?;
-        let turn = Turn {
+        let mut turn = Turn {
             start: self.world.last_seq()?,
             input: Some(input),
+            estimate: None,
+            rule_minutes: None,
         };
 
         let mut note = String::new();
         let mut calls = 0;
         if let Some(scope) = scope(&self.world)? {
-            let (verdict, n) = fast_path::interpret(&self.world, client, scope, &slice, input)?;
-            calls += n;
-            match verdict {
+            let interpreted = fast_path::interpret(&self.world, client, scope, &slice, input)?;
+            calls += interpreted.calls;
+            turn.estimate = interpreted.duration;
+            match interpreted.verdict {
                 fast_path::Verdict::Apply { rule, bindings } => {
                     match rules::apply(
                         &mut self.world,
@@ -263,6 +277,7 @@ impl Game {
                         &bindings,
                     )? {
                         Ok(app) => {
+                            turn.rule_minutes = rule.def.minutes;
                             let response = fast_path::narrate(
                                 &self.world,
                                 client,
@@ -282,6 +297,17 @@ impl Game {
                 }
                 fast_path::Verdict::Escalate(why) => note = why,
             }
+        }
+        if let Some(bucket) = turn.estimate {
+            if !note.is_empty() {
+                note.push(' ');
+            }
+            note.push_str(&format!(
+                "The interpreter estimates this takes about {} ({}); call pass_time if it took \
+                 notably more or less.",
+                time::span(bucket.minutes()),
+                bucket.as_str()
+            ));
         }
         let instruction = if note.is_empty() {
             format!("Player input: {input}")
@@ -327,11 +353,12 @@ impl Game {
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
         // Every turn spends world time; the opening scene doesn't.
         if turn.input.is_some() {
-            time::advance(
-                &mut self.world,
-                time::DEFAULT_MINUTES,
-                time::Source::Default,
-            )?;
+            let calls = self.tool_calls_since(turn.start)?;
+            let (minutes, source) = duration(&turn, &calls);
+            time::advance(&mut self.world, minutes, source)?;
+            for id in untimed_mints(&calls) {
+                rules::set_minutes(&mut self.world, id, minutes as u32)?;
+            }
         }
         let judgments =
             quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
@@ -345,6 +372,29 @@ impl Game {
             judgments,
             fast_path: None,
         })
+    }
+
+    /// Tool calls the director made that succeeded, since `after`, as
+    /// (name, input, result) in order.
+    fn tool_calls_since(&self, after: i64) -> Result<Vec<(String, Value, Value)>, StoreError> {
+        Ok(self
+            .world
+            .events_since(after)?
+            .into_iter()
+            .filter(|e| e.kind == EventKind::ToolCall && e.payload["is_error"] != json!(true))
+            .map(|e| {
+                let p = e.payload;
+                let result = p["result"]
+                    .as_str()
+                    .and_then(|r| serde_json::from_str(r).ok())
+                    .unwrap_or(Value::Null);
+                (
+                    p["name"].as_str().unwrap_or_default().to_owned(),
+                    p["input"].clone(),
+                    result,
+                )
+            })
+            .collect())
     }
 
     /// Run a tool loop, logging every call. A storage failure inside a tool
@@ -429,6 +479,38 @@ impl Game {
             .unwrap_or_default();
         Ok(format!("{}\n{description}", room.name))
     }
+}
+
+/// How long a turn took and who decided: the director's last `pass_time`,
+/// else the applied rule's minutes, else the interpreter's estimate, else
+/// the default.
+fn duration(turn: &Turn, calls: &[(String, Value, Value)]) -> (u64, time::Source) {
+    let passed = calls
+        .iter()
+        .rev()
+        .find(|(name, ..)| name == time::PASS_TIME)
+        .and_then(|(_, input, _)| input["minutes"].as_u64());
+    if let Some(m) = passed {
+        (m, time::Source::Director)
+    } else if let Some(m) = turn.rule_minutes {
+        (m.into(), time::Source::Rule)
+    } else if let Some(b) = turn.estimate {
+        (b.minutes(), time::Source::Interpreter)
+    } else {
+        (time::DEFAULT_MINUTES, time::Source::Default)
+    }
+}
+
+/// Rules minted this turn with `apply_to` and no minutes of their own:
+/// they take the turn's duration.
+fn untimed_mints(calls: &[(String, Value, Value)]) -> Vec<RuleId> {
+    calls
+        .iter()
+        .filter(|(name, input, _)| {
+            name == "mint_rule" && !input["apply_to"].is_null() && input["minutes"].is_null()
+        })
+        .filter_map(|(.., result)| result["rule"].as_i64())
+        .collect()
 }
 
 /// A fresh dice seed from the clock and the process id.

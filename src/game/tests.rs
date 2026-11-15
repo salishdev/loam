@@ -553,26 +553,26 @@ fn with_doors() -> (Game, ScriptedClient, i64, i64) {
 }
 
 fn kick_mint(target: i64) -> Response {
-    Response::canned_tool_use(
-        "k1",
-        "mint_rule",
-        json!({
-            "name": "Kicking a rotten door",
-            "trigger": "kick, shoulder or force <target>",
-            "roles": {"target": "the door"},
-            "conditions": [
-                {"check": "kind", "role": "target", "is": "door"},
-                {"check": "prop", "role": "target", "prop": "rotten", "is": true},
-                {"check": "not_prop", "role": "target", "prop": "broken", "is": true}
-            ],
-            "effects": [
-                {"op": "set_prop", "entity": "target", "key": "broken", "value": true},
-                {"op": "create", "name": "splinters", "kind": "debris", "location": "room", "props": {"state": "damp"}}
-            ],
-            "outcome": "The door bursts inward in wet splinters.",
-            "apply_to": {"target": target}
-        }),
-    )
+    Response::canned_tool_use("k1", "mint_rule", kick_mint_input(target))
+}
+
+fn kick_mint_input(target: i64) -> Value {
+    json!({
+        "name": "Kicking a rotten door",
+        "trigger": "kick, shoulder or force <target>",
+        "roles": {"target": "the door"},
+        "conditions": [
+            {"check": "kind", "role": "target", "is": "door"},
+            {"check": "prop", "role": "target", "prop": "rotten", "is": true},
+            {"check": "not_prop", "role": "target", "prop": "broken", "is": true}
+        ],
+        "effects": [
+            {"op": "set_prop", "entity": "target", "key": "broken", "value": true},
+            {"op": "create", "name": "splinters", "kind": "debris", "location": "room", "props": {"state": "damp"}}
+        ],
+        "outcome": "The door bursts inward in wet splinters.",
+        "apply_to": {"target": target}
+    })
 }
 
 fn interpret(matches: Value, clean: bool) -> Response {
@@ -2206,4 +2206,203 @@ fn the_bible_can_choose_the_opening_hour_and_hides_the_clock() {
     }
     let slice = local_slice(&world).unwrap();
     assert!(!slice.contains("_clock"), "{slice}");
+}
+
+fn interpret_taking(matches: Value, clean: bool, duration: &str) -> Response {
+    Response::canned_tool_use(
+        "i",
+        "interpret",
+        json!({"matches": matches, "clean": clean, "duration": duration}),
+    )
+}
+
+fn pass_time(minutes: i64) -> Response {
+    Response::canned_tool_use(
+        "p",
+        "pass_time",
+        json!({"minutes": minutes, "reason": "test"}),
+    )
+}
+
+/// The last advance: minutes and source.
+fn last_advance(game: &Game) -> (u64, String) {
+    let a = crate::time::recent(game.world(), 1).unwrap().remove(0);
+    (a.minutes, a.source)
+}
+
+fn rule_minutes(game: &Game, id: i64) -> Option<u32> {
+    crate::rules::get(game.world(), id)
+        .unwrap()
+        .unwrap()
+        .def
+        .minutes
+}
+
+/// A kick rule minted without applying it, so it carries no duration.
+fn untimed_kick_rule(game: &mut Game, client: &ScriptedClient, oak: i64) -> i64 {
+    let mut input = kick_mint_input(oak);
+    input.as_object_mut().unwrap().remove("apply_to");
+    client.push(Response::canned_tool_use("k1", "mint_rule", input));
+    client.push(Response::canned_text("You study the door."));
+    game.turn(client, "study the oak door", &mut |_| {})
+        .unwrap();
+    let (msg, is_error) = last_tool_result(client);
+    assert!(!is_error, "{msg}");
+    serde_json::from_str::<Value>(&msg).unwrap()["rule"]
+        .as_i64()
+        .unwrap()
+}
+
+#[test]
+fn a_turn_with_nothing_to_go_on_spends_the_default() {
+    let (mut game, client) = begun();
+    client.push(Response::canned_text("You look about."));
+    game.turn(&client, "look", &mut |_| {}).unwrap();
+    assert_eq!(last_advance(&game), (10, "default".into()));
+}
+
+#[test]
+fn the_interpreter_estimate_times_a_director_turn_and_is_in_its_note() {
+    let (mut game, client, oak, _) = with_doors();
+    untimed_kick_rule(&mut game, &client, oak);
+    // The rule doesn't match a search: the director rules, told the estimate.
+    client.push(interpret_taking(json!([]), false, "hour"));
+    client.push(Response::canned_text("You search the pews."));
+    game.turn(&client, "search the pews", &mut |_| {}).unwrap();
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(
+        director.contains(
+            "Engine note: The interpreter estimates this takes about 1 h (hour); call \
+             pass_time if it took notably more or less.\nPlayer input: search the pews"
+        ),
+        "{director}"
+    );
+    assert_eq!(last_advance(&game), (60, "interpreter".into()));
+
+    // A malformed estimate is ignored, and the matches still count.
+    client.push(interpret_taking(json!([]), false, "fortnight"));
+    client.push(Response::canned_text("You wait."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    let director = first_user_text(client.requests().last().unwrap());
+    assert!(!director.contains("Engine note"), "{director}");
+    assert_eq!(last_advance(&game), (10, "default".into()));
+}
+
+#[test]
+fn pass_time_beats_the_estimate_and_the_last_call_wins() {
+    let (mut game, client, oak, _) = with_doors();
+    untimed_kick_rule(&mut game, &client, oak);
+    let before = crate::time::now(game.world()).unwrap();
+    client.push(interpret_taking(json!([]), false, "minutes"));
+    client.push(pass_time(30));
+    client.push(pass_time(480));
+    // Out of range: refused, and so ignored.
+    client.push(pass_time(20_000));
+    client.push(Response::canned_text("You sleep until dawn."));
+    game.turn(&client, "sleep", &mut |_| {}).unwrap();
+    assert_eq!(last_advance(&game), (480, "director".into()));
+    assert_eq!(crate::time::now(game.world()).unwrap().0, before.0 + 480);
+    let refused = game
+        .world()
+        .events()
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == EventKind::ToolCall)
+        .unwrap();
+    assert_eq!(refused.payload["is_error"], json!(true));
+    assert!(
+        refused.payload["result"]
+            .as_str()
+            .unwrap()
+            .contains("minutes must be 0 to 10080"),
+        "{}",
+        refused.payload
+    );
+}
+
+#[test]
+fn a_rule_minted_with_apply_to_keeps_the_turns_final_duration() {
+    let (mut game, client, oak, elm) = with_doors();
+    // pass_time after the mint still counts: the duration is the turn's final one.
+    client.push(kick_mint(oak));
+    client.push(pass_time(25));
+    client.push(Response::canned_text("The oak door bursts."));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    assert_eq!(last_advance(&game), (25, "director".into()));
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].clone();
+    assert_eq!(rule.def.minutes, Some(25));
+    assert_eq!(rule.version, 1, "timing a fresh rule is not an amendment");
+    let timed = game
+        .world()
+        .events()
+        .unwrap()
+        .into_iter()
+        .rfind(|e| e.kind == EventKind::RuleChange)
+        .unwrap();
+    assert_eq!(timed.payload["action"], json!("timed"));
+    assert_eq!(timed.payload["rule"]["minutes"], json!(25));
+
+    // The fast-path repeat costs exactly the rule's minutes, not the estimate.
+    let before = crate::time::now(game.world()).unwrap();
+    client.push(interpret_taking(
+        json!([{"rule": rule.id, "bindings": {"target": elm}}]),
+        true,
+        "moment",
+    ));
+    client.push(Response::canned_text("The elm door gives way too."));
+    let outcome = game
+        .turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    assert_eq!(outcome.fast_path, Some(rule.id));
+    assert_eq!(last_advance(&game), (25, "rule".into()));
+    assert_eq!(crate::time::now(game.world()).unwrap().0, before.0 + 25);
+
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+}
+
+#[test]
+fn a_rule_minted_with_its_own_minutes_keeps_them() {
+    let (mut game, client, oak, _) = with_doors();
+    let mut input = kick_mint_input(oak);
+    input["minutes"] = json!(3);
+    client.push(Response::canned_tool_use("k1", "mint_rule", input));
+    client.push(pass_time(50));
+    client.push(Response::canned_text("The oak door bursts."));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
+    assert_eq!(rule_minutes(&game, rule), Some(3));
+    assert_eq!(last_advance(&game), (50, "director".into()));
+
+    // amend_rule changes them.
+    client.push(interpret_taking(json!([]), false, "moment"));
+    client.push(Response::canned_tool_use(
+        "a",
+        "amend_rule",
+        json!({"id": rule, "reason": "slower", "minutes": 7}),
+    ));
+    client.push(Response::canned_text("Noted."));
+    game.turn(&client, "think", &mut |_| {}).unwrap();
+    assert_eq!(rule_minutes(&game, rule), Some(7));
+}
+
+#[test]
+fn an_untimed_rule_on_the_fast_path_spends_the_estimate() {
+    let (mut game, client, oak, elm) = with_doors();
+    let rule = untimed_kick_rule(&mut game, &client, oak);
+    assert_eq!(last_advance(&game), (10, "default".into()));
+    assert_eq!(rule_minutes(&game, rule), None, "minted without apply_to");
+    client.push(interpret_taking(
+        json!([{"rule": rule, "bindings": {"target": elm}}]),
+        true,
+        "hour",
+    ));
+    client.push(Response::canned_text("You batter the elm door down."));
+    let outcome = game
+        .turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    assert_eq!(outcome.fast_path, Some(rule));
+    assert_eq!(last_advance(&game), (60, "interpreter".into()));
 }

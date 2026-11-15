@@ -149,3 +149,28 @@ fn advances_are_capped_and_need_a_bible() {
     );
     assert!(empty.events().unwrap().is_empty());
 }
+
+#[test]
+fn buckets_and_pass_time() {
+    assert_eq!(
+        Bucket::ALL.map(Bucket::minutes),
+        [1, DEFAULT_MINUTES, 60, 240]
+    );
+    let bucket: Bucket = serde_json::from_value(json!("hour")).unwrap();
+    assert_eq!(bucket.as_str(), "hour");
+    assert_eq!(
+        pass_time(&json!({"minutes": 0, "reason": "a blink"})),
+        ToolOutput::Ok(json!({"minutes": 0, "takes": "0 min"}).to_string())
+    );
+    assert!(matches!(
+        pass_time(&json!({"minutes": MAX_ADVANCE, "reason": "a week asleep"})),
+        ToolOutput::Ok(_)
+    ));
+    for bad in [
+        json!({"minutes": -1, "reason": "r"}),
+        json!({"minutes": MAX_ADVANCE + 1, "reason": "r"}),
+        json!({"minutes": 5}),
+    ] {
+        assert!(matches!(pass_time(&bad), ToolOutput::Err(_)), "{bad}");
+    }
+}

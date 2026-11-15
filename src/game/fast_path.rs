@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::llm::{LlmClient, Message, Model, Request, ToolDefinition};
 use crate::rules::{self, Bindings, Refusal, Rule, RuleId, Scope};
+use crate::time::Bucket;
 use crate::world::{EventKind, StoreError, World};
 
 use super::GameError;
@@ -17,8 +18,10 @@ const INTERPRETER_SYSTEM: &str = "You match a text adventure player's input agai
 world's stored rules. A rule matches when the input asks for the action its trigger \
 describes; bind each of its roles to the id of the entity the input means (only entities \
 in the scene). List every rule that could match, best first, or none. Set clean to true only \
-when the input is nothing more than that one action. Reply with nothing but the interpret \
-tool call.";
+when the input is nothing more than that one action. Also size the whole input in world \
+time as duration: moment (a glance, a word), minutes (most actions), hour (a search, a meal, \
+a short walk) or hours (a journey, a long task, a sleep). Reply with nothing but the \
+interpret tool call.";
 
 const NARRATOR_SYSTEM: &str = "You narrate a text adventure. The engine has already resolved \
 the player's action by a known rule; describe exactly that outcome, nothing more: don't \
@@ -53,9 +56,11 @@ fn interpret_def() -> ToolDefinition {
                                  "description": "role -> entity id"}
                 }, "required": ["rule", "bindings"]}},
                 "clean": {"type": "boolean"},
-                "note": {"type": "string"}
+                "note": {"type": "string"},
+                "duration": {"type": "string", "enum": Bucket::ALL.map(Bucket::as_str),
+                             "description": "How much world time the input takes."}
             },
-            "required": ["matches", "clean"]
+            "required": ["matches", "clean", "duration"]
         }),
     )
 }
@@ -77,19 +82,33 @@ struct Match {
     bindings: Bindings,
 }
 
+/// What the interpreter made of an input.
+#[derive(Debug)]
+pub(crate) struct Interpreted {
+    pub verdict: Verdict,
+    /// Its estimate of how long the input takes, if it gave one.
+    pub duration: Option<Bucket>,
+    /// Model calls made (0 or 1).
+    pub calls: usize,
+}
+
 /// Ask the interpreter which rule `input` matches and decide whether the
 /// engine can apply it. Makes no call when there are no active rules.
-/// Returns the verdict and the number of model calls made.
 pub(crate) fn interpret(
     world: &World,
     client: &dyn LlmClient,
     scope: Scope,
     slice: &str,
     input: &str,
-) -> Result<(Verdict, usize), GameError> {
+) -> Result<Interpreted, GameError> {
+    let escalate = |calls| Interpreted {
+        verdict: Verdict::Escalate(String::new()),
+        duration: None,
+        calls,
+    };
     let active = rules::active_world(world)?;
     if active.is_empty() {
-        return Ok((Verdict::Escalate(String::new()), 0));
+        return Ok(escalate(0));
     }
     let mut prompt = format!("{slice}\nRules:\n");
     for rule in &active {
@@ -108,7 +127,7 @@ pub(crate) fn interpret(
                 EventKind::Judgment,
                 &json!({"by": "interpreter", "input": input, "error": e.to_string(), "verdict": "escalate"}),
             )?;
-            return Ok((Verdict::Escalate(String::new()), 1));
+            return Ok(escalate(1));
         }
     };
 
@@ -121,6 +140,10 @@ pub(crate) fn interpret(
         Some(Ok(i)) => decide(world, scope, &active, &i)?,
         Some(Err(_)) | None => Verdict::Escalate(String::new()),
     };
+    // Read on its own, so a bad estimate doesn't spoil the matches.
+    let duration = raw
+        .as_ref()
+        .and_then(|r| serde_json::from_value::<Bucket>(r["duration"].clone()).ok());
     let mut log = json!({
         "by": "interpreter",
         "input": input,
@@ -140,7 +163,11 @@ pub(crate) fn interpret(
         }
     }
     world.log_event(EventKind::Judgment, &log)?;
-    Ok((verdict, 1))
+    Ok(Interpreted {
+        verdict,
+        duration,
+        calls: 1,
+    })
 }
 
 /// Evaluate the interpreter's matches against the world.

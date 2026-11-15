@@ -173,6 +173,11 @@ pub struct RuleDef {
     /// failure, that branch's do instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<RuleCheck>,
+    /// World minutes the action takes when the fast path applies the rule.
+    /// A rule minted with `apply_to` and no minutes gets the duration of the
+    /// turn that minted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<u32>,
 }
 
 /// A change to one stat.
@@ -244,6 +249,9 @@ impl Rule {
         if let Some(check) = &self.def.check {
             v["check"] = json!({"stat": check.stat, "difficulty": check.difficulty});
         }
+        if let Some(minutes) = self.def.minutes {
+            v["minutes"] = json!(minutes);
+        }
         v
     }
 }
@@ -260,6 +268,14 @@ pub struct Scope {
 pub fn validate(def: &RuleDef) -> Result<(), String> {
     if def.name.trim().is_empty() || def.trigger.trim().is_empty() {
         return Err("a rule needs a name and a trigger".into());
+    }
+    if let Some(m) = def.minutes
+        && u64::from(m) > crate::time::MAX_ADVANCE
+    {
+        return Err(format!(
+            "minutes must be at most {} (a week), not {m}",
+            crate::time::MAX_ADVANCE
+        ));
     }
     for role in def.roles.keys() {
         if role == PLAYER_ROLE || role == ROOM_ROLE {
@@ -1000,6 +1016,7 @@ pub struct Amendment {
     pub outcome: Option<String>,
     pub adjust: Option<Vec<StatDelta>>,
     pub check: Option<RuleCheck>,
+    pub minutes: Option<u32>,
 }
 
 /// Amend an active world rule: a new version replaces the old one, which
@@ -1039,6 +1056,9 @@ pub fn amend(
     if let Some(v) = changes.check {
         d.check = Some(v);
     }
+    if let Some(v) = changes.minutes {
+        d.minutes = Some(v);
+    }
     if let Err(r) = validate(&rule.def) {
         return Ok(Err(r));
     }
@@ -1050,6 +1070,24 @@ pub fn amend(
     log_change(world, "amended", &rule, reason)?;
     let new_terms = register_vocabulary(world, &rule.def)?;
     Ok(Ok((rule, new_terms)))
+}
+
+/// Give an active world rule that has no duration yet the duration of the
+/// turn that minted it. Not an amendment: the version stays, and the change
+/// is logged as `timed`. Returns the rule if it changed.
+pub fn set_minutes(
+    world: &mut World,
+    id: RuleId,
+    minutes: u32,
+) -> Result<Option<Rule>, StoreError> {
+    let mut rule = match changeable(world, id)? {
+        Ok(r) if r.def.minutes.is_none() => r,
+        _ => return Ok(None),
+    };
+    rule.def.minutes = Some(minutes);
+    store(world, &rule, false)?;
+    log_change(world, "timed", &rule, "the turn that minted it")?;
+    Ok(Some(rule))
 }
 
 /// Retire an active world rule: it stops matching but stays listed. Stat

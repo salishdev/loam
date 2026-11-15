@@ -47,6 +47,7 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
             create_room_def(),
             move_player_def(),
             apply_patch_def(),
+            time::pass_time_definition(),
         ]
         .into_iter()
         .chain(inventory::tool_definitions())
@@ -119,6 +120,7 @@ pub fn dispatch(
             apply_patch(world, patch)
         }
         "apply_patch" => apply_patch(world, input!(Patch)),
+        time::PASS_TIME => Ok(time::pass_time(&call.input)),
         // Inventory tools land here only when there is no player yet.
         _ => refuse("there is no player yet"),
     }

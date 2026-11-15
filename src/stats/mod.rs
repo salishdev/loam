@@ -664,6 +664,7 @@ fn empty_def() -> RuleDef {
         outcome: String::new(),
         adjust: Vec::new(),
         check: None,
+        minutes: None,
     }
 }
 

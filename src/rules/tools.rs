@@ -60,6 +60,14 @@ fn check_schema() -> Value {
     })
 }
 
+fn minutes_schema() -> Value {
+    json!({
+        "type": "integer", "minimum": 0, "maximum": crate::time::MAX_ADVANCE,
+        "description": "World minutes the action takes each time the engine applies the rule. \
+                        Omitted with apply_to: this turn's duration."
+    })
+}
+
 fn roles_schema() -> Value {
     json!({
         "type": "object",
@@ -106,6 +114,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "outcome": {"type": "string", "description": "What happens, for the narrator."},
                     "adjust": adjust_schema(),
                     "check": check_schema(),
+                    "minutes": minutes_schema(),
                     "apply_to": {"type": "object", "additionalProperties": {"type": "integer"}}
                 },
                 "required": ["name", "trigger", "roles", "conditions", "effects", "outcome"]
@@ -127,7 +136,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "effects": effects_schema(),
                     "outcome": {"type": "string"},
                     "adjust": adjust_schema(),
-                    "check": check_schema()
+                    "check": check_schema(),
+                    "minutes": minutes_schema()
                 },
                 "required": ["id", "reason"]
             }),
