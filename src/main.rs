@@ -131,6 +131,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":why" => show(cmd, inspect::why(world, arg)),
                 ":quests" => show(cmd, inspect::quests(world)),
                 ":npcs" => show(cmd, inspect::npcs(world)),
+                ":inventory" | ":i" => show(cmd, inspect::inventory(world)),
                 ":relations" => show(cmd, inspect::relations(world, arg)),
                 ":stats" => show(cmd, inspect::stats(world)),
                 ":time" => show(cmd, inspect::time(world)),
@@ -517,7 +518,7 @@ impl rustyline::validate::Validator for InputStyle {}
 impl rustyline::Helper for InputStyle {}
 
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs, :stats, :time, :pressures, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
+:quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
 
 /// Prints text word-wrapped to the output width behind the margin, then a
 /// newline.

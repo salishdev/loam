@@ -370,6 +370,59 @@ fn stats_says_when_there_is_no_sheet() {
     assert!(out.starts_with("Stat sheet: none yet\nEvents: "), "{out}");
 }
 
+#[test]
+fn inventory_says_when_the_player_carries_nothing() {
+    let f = fixture();
+    assert_eq!(inventory(&f.world).unwrap(), "Carrying nothing (limit 10).");
+}
+
+#[test]
+fn inventory_nests_bag_contents_and_shows_slots_and_load() {
+    let mut f = fixture();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "create", "handle": "bag", "name": "satchel", "kind": "container",
+         "location": f.scope.room, "props": {"bulk": 2, "container": true}},
+        {"op": "create", "handle": "key", "name": "brass key", "kind": "item",
+         "location": f.scope.room, "props": {"bulk": 0.5}}
+    ]))
+    .unwrap();
+    let a = f.world.apply_engine_patch(&Patch::new(ops)).unwrap();
+    let (bag, key) = (a.handles["bag"], a.handles["key"]);
+    let inv = Inventory::default();
+    let you = f.scope.player;
+    for item in [f.crowbar, bag, key] {
+        inv.take(&mut f.world, you, item).unwrap();
+    }
+    inv.transfer(&mut f.world, you, key, bag).unwrap();
+    inv.equip(&mut f.world, you, f.crowbar, Some("main_hand"))
+        .unwrap();
+
+    assert_eq!(
+        inventory(&f.world).unwrap(),
+        format!(
+            "Carrying 3.5 of 10 bulk:\n  #{} crowbar (equipped: main_hand)\n  #{bag} satchel\n    #{key} brass key",
+            f.crowbar
+        )
+    );
+}
+
+#[test]
+fn inventory_flags_a_load_over_the_limit() {
+    let mut f = fixture();
+    let ops: Vec<Op> = serde_json::from_value(json!([
+        {"op": "create", "handle": "anvil", "name": "anvil", "kind": "item",
+         "location": f.scope.player, "props": {"bulk": 12}}
+    ]))
+    .unwrap();
+    // Placed by the engine, past the limit `take` would enforce.
+    f.world.apply_engine_patch(&Patch::new(ops)).unwrap();
+    let out = inventory(&f.world).unwrap();
+    assert!(
+        out.starts_with("Carrying 12 of 10 bulk (over the limit):"),
+        "{out}"
+    );
+}
+
 /// The fixture plus a cellar, a bible naming three NPCs, and NPCs in the
 /// cellar, in the hall (one inside a cart), and nowhere.
 fn with_npcs() -> (Fixture, EntityId) {

@@ -1,5 +1,5 @@
 //! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:npcs`, `:stats`, `:time`, `:pressures`, `:log`.
+//! `:quests`, `:npcs`, `:inventory`, `:stats`, `:time`, `:pressures`, `:log`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::game;
 use crate::glossary;
+use crate::inventory::{DEFAULT_SLOTS, Inventory, InventoryError};
 use crate::pressure;
 use crate::quest;
 use crate::rules::{self, Condition, RuleClass};
@@ -634,6 +635,38 @@ fn patch_by(p: &Value) -> String {
 /// - `#<seq>` shows that one event in full.
 ///
 /// Words combine in any order: `:log patch roll 50`.
+/// `:inventory`: what the player carries, bags' contents indented under
+/// them, equipped slots, and load against the carry limit.
+pub fn inventory(world: &World) -> Result<String, StoreError> {
+    let Some(player) = game::player_id(world)? else {
+        return Ok("No player yet.".into());
+    };
+    let listing = match Inventory::new(DEFAULT_SLOTS, stats::carry_limit).list(world, player) {
+        Ok(l) => l,
+        Err(InventoryError::Store(e)) => return Err(e),
+        Err(InventoryError::Refused(reason)) => return Ok(format!("No inventory: {reason}.")),
+    };
+    if listing.items.is_empty() {
+        return Ok(format!("Carrying nothing (limit {}).", listing.limit));
+    }
+    let mut out = format!("Carrying {} of {} bulk", listing.load, listing.limit);
+    if listing.over_limit {
+        out.push_str(" (over the limit)");
+    }
+    out.push(':');
+    // Items come depth-first, so a bag is listed before what's in it.
+    let mut depth: BTreeMap<EntityId, usize> = BTreeMap::new();
+    for item in &listing.items {
+        let d = item.inside.and_then(|c| depth.get(&c)).map_or(1, |d| d + 1);
+        depth.insert(item.id, d);
+        write!(out, "\n{}#{} {}", "  ".repeat(d), item.id, item.name).unwrap();
+        if let Some(slot) = &item.equipped {
+            write!(out, " (equipped: {slot})").unwrap();
+        }
+    }
+    Ok(out)
+}
+
 /// Advances `:time` lists under the clock.
 const TIME_ADVANCES: usize = 8;
 
