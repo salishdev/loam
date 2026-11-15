@@ -24,6 +24,7 @@ use loam::inspect;
 use loam::llm::AnthropicClient;
 use loam::quest::Verdict;
 use loam::world::World;
+use loam::wrap::{Wrapper, output_width, wrap};
 
 fn main() -> ExitCode {
     match run() {
@@ -68,10 +69,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
-    let mut stream = |t: &str| {
-        print!("{t}");
-        let _ = io::stdout().flush();
-    };
 
     if !game.has_bible()? {
         let mut seed = String::new();
@@ -99,10 +96,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         game.create_bible(&client, seed.trim())?;
     }
     if !game.has_begun()? {
-        game.begin(&client, &mut stream)?;
+        narrate(|stream| game.begin(&client, stream))?;
         println!();
     } else {
-        println!("Resuming {path}.\n\n{}", game.look()?);
+        say(&format!("Resuming {path}.\n\n{}", game.look()?));
     }
 
     loop {
@@ -129,13 +126,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":relations" => show(cmd, inspect::relations(world, arg)),
                 ":stats" => show(cmd, inspect::stats(world)),
                 ":fork" => fork(world, arg),
-                ":help" => println!("{HELP}"),
-                _ => println!("Unknown command {cmd}. {HELP}"),
+                ":help" => say(HELP),
+                _ => say(&format!("Unknown command {cmd}. {HELP}")),
             }
             continue;
         }
         println!();
-        match game.turn(&client, input, &mut stream) {
+        match narrate(|stream| game.turn(&client, input, stream)) {
             Ok(outcome) => {
                 if let Some(reason) = outcome.stop_reason {
                     eprintln!("\n[stopped early: {reason:?}]");
@@ -146,8 +143,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!();
                 for j in &outcome.judgments {
                     match j.verdict {
-                        Verdict::Complete => println!("\n[Quest complete: {}]", j.title),
-                        Verdict::Failed => println!("\n[Quest failed: {}]", j.title),
+                        Verdict::Complete => say(&format!("\n[Quest complete: {}]", j.title)),
+                        Verdict::Failed => say(&format!("\n[Quest failed: {}]", j.title)),
                         Verdict::Ongoing => {}
                     }
                 }
@@ -176,7 +173,10 @@ const USAGE: &str = "Usage: loam [--seed <name|file> | --prompt <text>] [save.db
                       Ignored when the save already has a world.
   --prompt <text>     Seed a new save from your own prompt. The save
                       defaults to loam.db.
-  --list-seeds        List the named seed prompts (./seeds and built-in).";
+  --list-seeds        List the named seed prompts (./seeds and built-in).
+
+  Text wraps at 80 columns or the terminal width, whichever is narrower;
+  set LOAM_WIDTH to another width, or to 0 to turn wrapping off.";
 
 enum Command {
     Help,
@@ -420,10 +420,29 @@ fn choose_seed(
 const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs, :stats, :fork <event> <path>, :tick, :quit";
 
+/// Prints text word-wrapped to the output width, then a newline.
+fn say(text: &str) {
+    println!("{}", wrap(text, output_width()));
+}
+
+/// Streams narration to stdout, word-wrapped to the output width, while `f`
+/// runs; `f` gets the callback to pass to the game.
+fn narrate<T>(f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
+    let mut wrapper = Wrapper::new(output_width());
+    let mut out = io::stdout();
+    let result = f(&mut |t: &str| {
+        let _ = write!(out, "{}", wrapper.push(t));
+        let _ = out.flush();
+    });
+    let _ = write!(out, "{}", wrapper.finish());
+    let _ = out.flush();
+    result
+}
+
 /// Print an inspector report; a failure leaves the save usable.
 fn show(cmd: &str, report: Result<String, loam::world::StoreError>) {
     match report {
-        Ok(text) => println!("{text}"),
+        Ok(text) => say(&text),
         Err(e) => eprintln!("[{cmd} unavailable: {e}]"),
     }
 }

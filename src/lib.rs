@@ -9,3 +9,4 @@ pub mod quest;
 pub mod rules;
 pub mod stats;
 pub mod world;
+pub mod wrap;
