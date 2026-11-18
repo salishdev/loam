@@ -33,11 +33,26 @@ loam --prompt "a lighthouse at the end of the world"  # your own prompt
 loam x.db                     # resume (or pick a seed if the save is new)
 ```
 
-In the game, `:help` lists the inspector commands (`:rules`, `:quests`,
-`:stats`, `:why`, `:log`, …).
+On a terminal loam opens a full-screen interface: the story, a status bar
+(game time, room, model, what this session has cost), the input line and a
+hint bar listing the keys that work right now. `:help` lists the inspector
+commands (`:rules`, `:quests`, `:stats`, `:why`, `:log`, …); they open in a
+side panel (Ctrl-P toggles it), so you can browse while a turn is still
+being written. Tab moves between the input, the story and the panel, Esc goes
+back, and `?` shows every key. The mouse wheel scrolls and a click focuses;
+`:mouse off` or `LOAM_MOUSE=0` gives you back the terminal's own text
+selection.
+
+`loam --plain` (or `LOAM_PLAIN=1`, or piping stdout) plays the same game as
+a plain line-by-line prompt.
 
 Text wraps at 80 columns, or the terminal width if that is narrower. Set
-`LOAM_WIDTH` to choose another width, or to `0` to turn wrapping off.
+`LOAM_WIDTH` to choose another width, or to `0` to turn wrapping off (in the
+full-screen interface, to use the whole story pane).
+
+Saves use SQLite's write-ahead log while loam runs, so a running save has
+`-wal` and `-shm` files beside it; they are folded back in when loam quits.
+Copy a save only while loam isn't running.
 
 The save records every model call: what was sent, what came back, tokens,
 cache hits, latency and cost. Set `LOAM_RECORD=0` to turn that off. Saves

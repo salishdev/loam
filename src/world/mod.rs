@@ -248,8 +248,40 @@ pub struct World {
 
 impl World {
     /// Open (or create) a world stored in a SQLite file.
+    ///
+    /// File saves use write-ahead logging, so a second, read-only connection
+    /// (see [`World::open_read_only`]) can read committed state while a turn
+    /// is still writing.
     pub fn open(path: impl AsRef<Path>) -> Result<World, StoreError> {
-        World::init(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        World::init(conn)
+    }
+
+    /// A read-only connection to a save another [`World`] has open, for
+    /// views that browse while the game plays. It never creates or upgrades
+    /// a store: the save must exist at the current schema version.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<World, StoreError> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() != Some(SCHEMA_VERSION.to_string().as_str()) {
+            return Err(StoreError::Corrupt(format!(
+                "a read-only view needs a schema {SCHEMA_VERSION} save, found {stored:?}"
+            )));
+        }
+        Ok(World { conn })
     }
 
     /// A throwaway world held in memory.

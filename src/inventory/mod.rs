@@ -136,7 +136,7 @@ pub struct Listing {
 /// Inventory rules: which slots carriers have and how much they can hold.
 pub struct Inventory {
     slots: Vec<String>,
-    limit: Box<dyn CarryLimit>,
+    limit: Box<dyn CarryLimit + Send>,
 }
 
 impl Default for Inventory {
@@ -168,7 +168,7 @@ enum Reach {
 impl Inventory {
     pub fn new<S: Into<String>>(
         slots: impl IntoIterator<Item = S>,
-        limit: impl CarryLimit + 'static,
+        limit: impl CarryLimit + Send + 'static,
     ) -> Self {
         Inventory {
             slots: slots.into_iter().map(Into::into).collect(),

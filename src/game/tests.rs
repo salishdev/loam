@@ -6,7 +6,7 @@ use crate::llm::{ContentBlock, Response, ScriptedClient, ToolOutput, ToolUse};
 
 const SECRET: &str = "The abbot drowned the bell to hide the ledger";
 
-fn bible_call() -> Response {
+pub(crate) fn bible_call() -> Response {
     crate::stats::with_sample_sheet(Response::canned_tool_use(
         "b1",
         "write_bible",
@@ -20,7 +20,7 @@ fn bible_call() -> Response {
     ))
 }
 
-fn opening_room() -> Response {
+pub(crate) fn opening_room() -> Response {
     Response::canned_tool_use(
         "r1",
         "create_room",
@@ -37,7 +37,7 @@ fn opening_room() -> Response {
     )
 }
 
-fn new_game() -> (Game, ScriptedClient) {
+pub(crate) fn new_game() -> (Game, ScriptedClient) {
     let client = ScriptedClient::new([bible_call(), Response::canned_text("")]);
     let mut game = Game::new(World::open_in_memory().unwrap());
     game.set_dice_seed(7);
@@ -47,7 +47,7 @@ fn new_game() -> (Game, ScriptedClient) {
 }
 
 /// A started game: bible written and the opening room generated.
-fn begun() -> (Game, ScriptedClient) {
+pub(crate) fn begun() -> (Game, ScriptedClient) {
     let (mut game, client) = new_game();
     client.push(Response::canned_tool_use(
         "t0",

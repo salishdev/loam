@@ -1,4 +1,9 @@
-//! Terminal REPL: `loam [--seed <name|file> | --prompt <text>] [save.db]`.
+//! Loam's front ends: `loam [--plain] [--seed <name|file> | --prompt <text>] [save.db]`.
+//!
+//! On a terminal loam opens the full-screen TUI ([`loam::tui`]); `--plain`,
+//! `LOAM_PLAIN=1` or a stdout that isn't a terminal gives the line REPL.
+//! Both drive the same game worker ([`loam::worker`]) and read inspector
+//! reports through a read-only connection to the save.
 //!
 //! A new save takes its seed prompt from `--seed` (a file, or the name of one
 //! in `./seeds/` or compiled into the binary, such as `drowned-mill`), from
@@ -23,14 +28,15 @@
 //! the current directory and then the repo root; real environment variables
 //! win.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use loam::game::{Game, GameError, TickOutcome};
-use loam::inspect;
+use loam::commands::{self, Notice};
+use loam::game::{Game, GameError};
 use loam::llm::AnthropicClient;
-use loam::quest::Verdict;
+use loam::tui::App;
+use loam::worker::{Command as WorkerCommand, Event as WorkerEvent, Worker};
 use loam::world::World;
 use loam::wrap::{Wrapper, output_margin, output_width, wrap_with_margin};
 
@@ -70,6 +76,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
     };
     let path = args.save;
+    let tui = use_tui(
+        args.plain,
+        std::env::var("LOAM_PLAIN").ok().as_deref(),
+        io::stdout().is_terminal(),
+    );
     let client = AnthropicClient::from_env()?;
     let mut game = Game::new(World::open(&path)?);
     game.set_recording(std::env::var("LOAM_RECORD").map_or(true, |v| v.trim() != "0"));
@@ -80,16 +91,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut editor = LineEditor::new()?;
 
-    if !game.has_bible()? {
+    // A new world's seed is chosen on plain lines, before the TUI starts.
+    let mut intro = Vec::new();
+    let seed = if game.has_bible()? {
+        None
+    } else {
         let mut seed = String::new();
         if let Some(found) = &seed_file {
-            say(&format!(
+            intro.push(format!(
                 "New world in {path}, seeded from {}.",
                 found.source
             ));
             seed.push_str(&found.text);
         } else if let Some(found) = choose_seed(&path, &mut editor)? {
-            say(&format!("Seeded from {}.", found.source));
+            intro.push(format!("Seeded from {}.", found.source));
             seed.push_str(&found.text);
         } else {
             say("Describe the world's plot, tone and setting; end with a blank line.");
@@ -104,14 +119,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if seed.trim().is_empty() {
             return Err("no seed prompt given".into());
         }
-        say("Building the world…");
-        game.create_bible(&client, seed.trim())?;
-    }
-    if !game.has_begun()? {
-        narrate(|stream| game.begin(&client, stream))?;
-        println!();
+        Some(seed.trim().to_string())
+    };
+    let resume = if game.has_begun()? {
+        Some(format!("Resuming {path}.\n\n{}", game.look()?))
     } else {
-        say(&format!("Resuming {path}.\n\n{}", game.look()?));
+        None
+    };
+
+    let worker = Worker::spawn(game, Box::new(client));
+    // Inspectors read through a second, read-only connection.
+    let view = World::open_read_only(&path)?;
+    if tui {
+        let mut app = App::new(view, loam::tui::mouse_from_env());
+        for line in intro {
+            app.info(line);
+        }
+        if let Some(seed) = seed {
+            app.info("Building the world…");
+            app.send(WorkerCommand::CreateBible(seed));
+        }
+        match resume {
+            Some(text) => {
+                app.load_recent(RESUME_STORY);
+                app.info(text);
+            }
+            None => app.send(WorkerCommand::Begin),
+        }
+        loam::tui::run(app, worker)?;
+        return Ok(());
+    }
+
+    for line in intro {
+        say(&line);
+    }
+    if let Some(seed) = seed {
+        say("Building the world…");
+        worker.send(WorkerCommand::CreateBible(seed));
+        if let Some(Err(e)) = await_worker(&worker) {
+            return Err(e.into());
+        }
+    }
+    match resume {
+        Some(text) => say(&text),
+        None => {
+            worker.send(WorkerCommand::Begin);
+            if let Some(Err(e)) = await_worker(&worker) {
+                return Err(e.into());
+            }
+            println!();
+        }
     }
 
     loop {
@@ -124,60 +181,88 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if input.starts_with(':') {
-            let (cmd, arg) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-            let arg = arg.trim();
-            let world = game.world();
+            let (cmd, arg) = commands::split(input);
+            if let Some(report) = commands::report(&view, cmd, arg) {
+                match report {
+                    Ok(text) => say(&text),
+                    Err(notice) => note(&notice),
+                }
+                continue;
+            }
             match cmd {
                 ":quit" | ":q" => break,
-                ":tick" => report_tick(game.tick(&client)),
-                ":rules" => show(cmd, inspect::rules(world)),
-                ":glossary" => show(cmd, inspect::glossary(world)),
-                ":why" => show(cmd, inspect::why(world, arg)),
-                ":quests" => show(cmd, inspect::quests(world)),
-                ":npcs" => show(cmd, inspect::npcs(world)),
-                ":inventory" | ":i" => show(cmd, inspect::inventory(world)),
-                ":relations" => show(cmd, inspect::relations(world, arg)),
-                ":stats" => show(cmd, inspect::stats(world)),
-                ":time" => show(cmd, inspect::time(world)),
-                ":pressures" => show(cmd, inspect::pressures(world)),
-                ":log" => show(cmd, inspect::log(world, arg)),
-                ":fork" => fork(world, arg),
-                ":help" => say(HELP),
-                _ => say(&format!("Unknown command {cmd}. {HELP}")),
+                ":tick" => {
+                    worker.send(WorkerCommand::Tick);
+                    await_worker(&worker);
+                }
+                ":help" => say(commands::HELP),
+                _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
             continue;
         }
         println!();
-        match narrate(|stream| game.turn(&client, input, stream)) {
-            Ok(outcome) => {
-                if let Some(reason) = outcome.stop_reason {
-                    note(&format!("\n[stopped early: {reason:?}]"));
-                }
-                if let Some(rule) = outcome.fast_path {
-                    note(&format!("\n[fast path: rule #{rule}]"));
-                }
-                println!();
-                for j in &outcome.judgments {
-                    match j.verdict {
-                        Verdict::Complete => say(&format!("\n[Quest complete: {}]", j.title)),
-                        Verdict::Failed => say(&format!("\n[Quest failed: {}]", j.title)),
-                        Verdict::Ongoing => {}
-                    }
-                }
-                // The world moves on off-screen; a failed tick is retried
-                // after the next turn.
-                if let Some(result) = game.maybe_tick(&client).transpose() {
-                    report_tick(result);
-                }
-            }
-            // A failed turn is reported; the save stays usable.
-            Err(e) => note(&format!("\n[turn failed: {e}]")),
-        }
+        worker.send(WorkerCommand::Turn(input.to_string()));
+        await_worker(&worker);
     }
+    // The writer must close last so it checkpoints the WAL into the save.
+    drop(view);
+    worker.shut_down();
     Ok(())
 }
 
-const USAGE: &str = "Usage: loam [--seed <name|file> | --prompt <text>] [save.db]
+/// Story paragraphs a resumed save opens with in the TUI.
+const RESUME_STORY: usize = 20;
+
+/// The TUI unless `--plain`, `LOAM_PLAIN=1` or stdout isn't a terminal.
+fn use_tui(plain_flag: bool, plain_env: Option<&str>, terminal: bool) -> bool {
+    !plain_flag && plain_env.is_none_or(|v| v.trim() != "1") && terminal
+}
+
+/// Plain mode: print what the worker reports until it is idle again:
+/// narration streamed and word-wrapped, then the engine's notices. Returns
+/// how building the bible or the opening went, if that is what ran.
+fn await_worker(worker: &Worker) -> Option<Result<(), GameError>> {
+    let mut wrapper = Wrapper::with_margin(output_width(), output_margin());
+    let mut out = io::stdout();
+    let mut fatal = None;
+    while let Some(event) = worker.recv() {
+        match event {
+            WorkerEvent::Text(t) => {
+                let _ = write!(out, "{}", wrapper.push(&t));
+                let _ = out.flush();
+            }
+            WorkerEvent::BibleDone(result) => fatal = Some(result),
+            WorkerEvent::TurnDone { opening, outcome } => {
+                let _ = write!(out, "{}", wrapper.finish());
+                let _ = out.flush();
+                if opening {
+                    fatal = Some(outcome.map(|_| ()));
+                    continue;
+                }
+                let notices = commands::turn_notices(&outcome);
+                for n in &notices {
+                    if let Notice::Engine(t) = n {
+                        note(&format!("\n{t}"));
+                    }
+                }
+                if outcome.is_ok() {
+                    println!();
+                }
+                for n in &notices {
+                    if let Notice::Story(t) = n {
+                        say(&format!("\n{t}"));
+                    }
+                }
+            }
+            WorkerEvent::TickDone { outcome, .. } => note(&commands::tick_notice(&outcome)),
+            WorkerEvent::RerollProgress { .. } => {}
+            WorkerEvent::Ready => break,
+        }
+    }
+    fatal
+}
+
+const USAGE: &str = "Usage: loam [--plain] [--seed <name|file> | --prompt <text>] [save.db]
        loam --list-seeds
 
   A new save without --seed or --prompt asks you to pick a named seed or
@@ -190,6 +275,11 @@ const USAGE: &str = "Usage: loam [--seed <name|file> | --prompt <text>] [save.db
   --prompt <text>     Seed a new save from your own prompt. The save
                       defaults to loam.db.
   --list-seeds        List the named seed prompts (./seeds and built-in).
+  --plain             Use the line REPL instead of the full-screen TUI (also
+                      LOAM_PLAIN=1, or when stdout isn't a terminal).
+
+  In the TUI the mouse is captured (wheel scrolls, click focuses);
+  LOAM_MOUSE=0 or :mouse off restores native text selection.
 
   Text wraps at 80 columns or the terminal width, whichever is narrower;
   set LOAM_WIDTH to another width, or to 0 to turn wrapping off.";
@@ -203,6 +293,7 @@ enum Command {
 #[derive(Debug, PartialEq)]
 struct PlayArgs {
     save: String,
+    plain: bool,
     seed: Option<String>,
     prompt: Option<String>,
 }
@@ -211,11 +302,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     let mut seed = None;
     let mut prompt = None;
     let mut save = None;
+    let mut plain = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "--list-seeds" => return Ok(Command::ListSeeds),
+            "--plain" => plain = true,
             "--seed" => {
                 seed = Some(args.next().ok_or("--seed needs a name or file")?);
             }
@@ -238,7 +331,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
         Some(s) => format!("{}.db", seed_name(s)),
         None => "loam.db".into(),
     });
-    Ok(Command::Play(PlayArgs { save, seed, prompt }))
+    Ok(Command::Play(PlayArgs {
+        save,
+        plain,
+        seed,
+        prompt,
+    }))
 }
 
 /// `seeds/drowned-mill.txt` and `drowned-mill` both name `drowned-mill`.
@@ -521,9 +619,6 @@ impl rustyline::hint::Hinter for InputStyle {
 impl rustyline::validate::Validator for InputStyle {}
 impl rustyline::Helper for InputStyle {}
 
-const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | :log #<event>, :fork <event> <path>, :tick, :quit";
-
 /// Prints text word-wrapped to the output width behind the margin, then a
 /// newline.
 fn say(text: &str) {
@@ -550,69 +645,6 @@ fn colour_on(stream: &impl io::IsTerminal) -> bool {
     stream.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
 }
 
-/// Streams narration to stdout, word-wrapped to the output width, while `f`
-/// runs; `f` gets the callback to pass to the game.
-fn narrate<T>(f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
-    let mut wrapper = Wrapper::with_margin(output_width(), output_margin());
-    let mut out = io::stdout();
-    let result = f(&mut |t: &str| {
-        let _ = write!(out, "{}", wrapper.push(t));
-        let _ = out.flush();
-    });
-    let _ = write!(out, "{}", wrapper.finish());
-    let _ = out.flush();
-    result
-}
-
-/// Print an inspector report; a failure leaves the save usable.
-fn show(cmd: &str, report: Result<String, loam::world::StoreError>) {
-    match report {
-        Ok(text) => say(&text),
-        Err(e) => note(&format!("[{cmd} unavailable: {e}]")),
-    }
-}
-
-/// `:fork <event> <path>`: branch the session at an event into a new save.
-fn fork(world: &World, arg: &str) {
-    let mut parts = arg.split_whitespace();
-    let (Some(Ok(at)), Some(path), None) = (
-        parts
-            .next()
-            .map(|n| n.trim_start_matches('#').parse::<i64>()),
-        parts.next(),
-        parts.next(),
-    ) else {
-        say("Usage: :fork <event> <path>");
-        return;
-    };
-    // Checked first so a bad event number doesn't leave an empty save behind.
-    match world.last_seq() {
-        Ok(last) if (0..=last).contains(&at) => {}
-        Ok(last) => {
-            say(&format!("No event #{at}: the log ends at #{last}."));
-            return;
-        }
-        Err(e) => {
-            note(&format!("[fork failed: {e}]"));
-            return;
-        }
-    }
-    match world.fork(at, path) {
-        Ok(_) => say(&format!(
-            "Forked at event #{at} into {path}; run `loam {path}` to play it."
-        )),
-        Err(e) => note(&format!("[fork failed: {e}]")),
-    }
-}
-
-/// A terse builder's line on stderr; the player sees nothing of the tick.
-fn report_tick(result: Result<TickOutcome, GameError>) {
-    match result {
-        Ok(t) => note(&format!("[world tick: {} change(s)]", t.changes.len())),
-        Err(e) => note(&format!("[world tick failed: {e}]")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +663,7 @@ mod tests {
             play(&[]),
             PlayArgs {
                 save: "loam.db".into(),
+                plain: false,
                 seed: None,
                 prompt: None,
             }
@@ -668,6 +701,16 @@ mod tests {
             (b.prompt.as_deref(), b.save.as_str()),
             (Some("fog"), "fog.db")
         );
+    }
+
+    #[test]
+    fn plain_flag_and_env_choose_the_line_repl() {
+        assert!(play(&["--plain", "x.db"]).plain);
+        assert!(use_tui(false, None, true));
+        assert!(use_tui(false, Some("0"), true));
+        assert!(!use_tui(true, None, true));
+        assert!(!use_tui(false, Some("1"), true));
+        assert!(!use_tui(false, None, false));
     }
 
     #[test]

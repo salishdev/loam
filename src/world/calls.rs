@@ -107,6 +107,26 @@ impl World {
         }
     }
 
+    /// The id of the latest recorded call (0 when there are none), so a
+    /// session can total only the calls it made with [`World::cost_since`].
+    pub fn last_call_id(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM llm_calls", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// What the calls recorded after call `id` cost, in US dollars (calls
+    /// on models without a known price count as nothing).
+    pub fn cost_since(&self, id: i64) -> Result<f64, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM llm_calls WHERE id > ?1",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// A stored prompt (system prompt or tool definitions) by hash.
     pub fn prompt(&self, hash: &str) -> Result<Option<String>, StoreError> {
         Ok(self

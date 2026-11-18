@@ -13,7 +13,7 @@ mod tick;
 mod tools;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use context::{STALL_HINT, STALL_TURNS, local_slice, stall_hint};
 pub use npcs::{NpcSighting, bible_npc_names, npcs};
