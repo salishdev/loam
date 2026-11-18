@@ -20,8 +20,10 @@ fn panel_width(total: u16) -> u16 {
 
 /// Draw the whole screen and remember where things went.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [body, input, status, hints] = Layout::vertical([
+    // A blank row keeps the last of the story off the input line.
+    let [body, _gap, input, status, hints] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -663,6 +665,7 @@ mod tests {
             rows[0].starts_with("  You wake in a flooded chapel."),
             "{rows:?}"
         );
+        assert_eq!(rows[8].trim(), "", "{rows:?}");
         assert!(rows[9].starts_with("› look"), "{}", rows[9]);
         assert!(rows[10].contains("Drowned Chapel"), "{}", rows[10]);
         assert!(rows[10].contains("Day 1"));
