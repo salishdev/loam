@@ -1,4 +1,4 @@
-//! Drawing the TUI: story, side panel, status bar, input line, hint bar,
+//! Drawing the TUI: story, side panel, input line, status bar, hint bar,
 //! and the help overlay.
 
 use ratatui::Frame;
@@ -20,7 +20,7 @@ fn panel_width(total: u16) -> u16 {
 
 /// Draw the whole screen and remember where things went.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [body, status, input, hints] = Layout::vertical([
+    let [body, input, status, hints] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_has_story_status_input_and_hints() {
+    fn layout_has_story_input_status_and_hints() {
         let mut a = app();
         a.load_recent(10);
         typed(&mut a, "look");
@@ -663,11 +663,11 @@ mod tests {
             rows[0].starts_with("  You wake in a flooded chapel."),
             "{rows:?}"
         );
-        assert!(rows[9].contains("Drowned Chapel"), "{}", rows[9]);
-        assert!(rows[9].contains("Day 1"));
-        assert!(rows[9].contains("director sonnet"));
-        assert!(rows[9].contains("$0.000"));
-        assert!(rows[10].starts_with("› look"));
+        assert!(rows[9].starts_with("› look"), "{}", rows[9]);
+        assert!(rows[10].contains("Drowned Chapel"), "{}", rows[10]);
+        assert!(rows[10].contains("Day 1"));
+        assert!(rows[10].contains("director sonnet"));
+        assert!(rows[10].contains("$0.000"));
         assert!(rows[11].contains("Enter send"));
     }
 
@@ -696,7 +696,7 @@ mod tests {
         assert!(director.contains("* director   opus    medium"), "{text}");
         assert!(text.contains("interpret  haiku   default"), "{text}");
         assert!(text.contains("tick       sonnet  medium"), "{text}");
-        assert!(rows[11].contains("director opus"), "{}", rows[11]);
+        assert!(rows[12].contains("director opus"), "{}", rows[12]);
         assert!(rows[13].contains("e effort"), "{}", rows[13]);
 
         // The selected row is drawn reversed.
