@@ -43,6 +43,10 @@ pub enum Command {
     /// ([`crate::reroll`]). No tick follows. The finished reroll is kept
     /// for [`Command::Adopt`] until the next reroll or switch.
     Reroll(reroll::Spec),
+    /// Play an edited director prompt beside an unedited control
+    /// ([`reroll::surgery`]), reported like a reroll and adoptable the same
+    /// way.
+    Surgery(reroll::surgery::Surgery),
     /// Write variant `n` of the latest reroll into a new branch save beside
     /// this one. It doesn't switch: the front end does, as for `:switch`,
     /// so its read-only view closes before the writer.
@@ -212,6 +216,24 @@ fn serve(
                             Progress::Variant(v) => Event::RerollProgress(v.clone()),
                         });
                     });
+                let _ = out.send(Event::RerollDone(outcome.map(|r| {
+                    latest = Some(r);
+                })));
+            }
+            Command::Surgery(surgery) => {
+                latest = None;
+                let outcome = reroll::surgery::run(
+                    game.world(),
+                    &surgery,
+                    game.brains(),
+                    &|_| client,
+                    &mut |p| {
+                        let _ = out.send(match p {
+                            Progress::Started(head) => Event::RerollStarted(head.clone()),
+                            Progress::Variant(v) => Event::RerollProgress(v.clone()),
+                        });
+                    },
+                );
                 let _ = out.send(Event::RerollDone(outcome.map(|r| {
                     latest = Some(r);
                 })));
@@ -522,6 +544,61 @@ mod tests {
                 Event::Adopted {
                     outcome: Err(_),
                     ..
+                }
+            ),
+            "{events:?}"
+        );
+        worker.shut_down();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_surgery_runs_like_a_reroll_and_its_edited_variant_adopts() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        use crate::reroll::{Mark, surgery};
+        let dir = temp_dir("worker-surgery");
+        let main = saved_game(&dir, "mill.db");
+        let client = ScriptedClient::new(["You wait.", "A", "A"].map(Response::canned_text));
+        let worker = Worker::spawn(Game::new(World::open(&main).unwrap()), Box::new(client));
+        worker.send(Command::Turn("wait".into()));
+        until_ready(&worker);
+
+        // The front end prepares and edits through its read-only view.
+        let view = World::open_read_only(&main).unwrap();
+        let spec = surgery::Spec::parse("1").unwrap();
+        let prepared = surgery::prepare(&view, &spec).unwrap();
+        let text = prepared
+            .text()
+            .replace("Player input:", "Engine note: hurry.\nPlayer input:");
+        let edit = surgery::apply(prepared, &text).unwrap();
+        drop(view);
+        worker.send(Command::Surgery(surgery::Surgery { spec, edit }));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::RerollStarted(h) if h.n == 2 && h.is_surgery()),
+            "{events:?}"
+        );
+        let marks: Vec<(usize, Mark)> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::RerollProgress(v) => Some((v.n, v.mark)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marks, [(1, Mark::Edited), (2, Mark::Control)]);
+        assert!(matches!(
+            events[events.len() - 2],
+            Event::RerollDone(Ok(()))
+        ));
+
+        worker.send(Command::Adopt(1));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(
+                &events[0],
+                Event::Adopted {
+                    variant: 1,
+                    outcome: Ok(_)
                 }
             ),
             "{events:?}"

@@ -412,19 +412,64 @@ impl Game {
                 bucket.as_str()
             ));
         }
-        // The stall hint is for the director alone: the interpreter and the
-        // fast-path narrator never see it.
-        let mut instruction = String::new();
-        if let Some(hint) = stall {
-            instruction.push_str(&format!("Engine note: {hint}\n"));
-        }
-        if !note.is_empty() {
-            instruction.push_str(&format!("Engine note: {note}\n"));
-        }
-        instruction.push_str(&format!("Player input: {input}"));
+        let instruction = turn_instruction(stall, &note, input);
         let mut outcome = self.director_turn(client, &slice, &instruction, turn, on_text)?;
         outcome.calls += calls;
         Ok(outcome)
+    }
+
+    /// What the director would be told if the player typed `input` now and
+    /// the turn went straight to the director (no interpreter, so no
+    /// duration estimate or escalation note). No model call, nothing
+    /// logged. `:surgery` edits this, then plays it with
+    /// [`turn_with_prompt`](Self::turn_with_prompt).
+    pub fn director_prompt(&self, input: &str) -> Result<DirectorPrompt, GameError> {
+        if !self.has_bible()? {
+            return Err(GameError::NotStarted);
+        }
+        let slice = local_slice(&self.world)?;
+        let stall = context::stall_hint(&self.world)?;
+        let instruction = turn_instruction(stall, "", input);
+        Ok(DirectorPrompt {
+            system: DIRECTOR_SYSTEM.to_owned(),
+            message: self.director_message(&slice, &instruction)?,
+        })
+    }
+
+    /// Play one turn from `input` with the director told exactly `prompt`
+    /// (system prompt and turn message), skipping the interpreter: a turn
+    /// the fast path would take goes to the director. Recorded like
+    /// [`turn`](Self::turn).
+    pub fn turn_with_prompt(
+        &mut self,
+        client: &dyn LlmClient,
+        input: &str,
+        prompt: &DirectorPrompt,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, GameError> {
+        self.recorded(client, CallsFor::LastTurn, |game, client| {
+            if !game.has_bible()? {
+                return Err(GameError::NotStarted);
+            }
+            game.world
+                .log_event(EventKind::Input, &json!({"text": input}))?;
+            let turn = Turn {
+                start: game.world.last_seq()?,
+                input: Some(input),
+                estimate: None,
+                rule_minutes: None,
+            };
+            game.run_director(client, &prompt.system, &prompt.message, turn, on_text)
+        })
+    }
+
+    /// The director's turn message: the slice, the pressures, then the
+    /// instruction.
+    fn director_message(&self, slice: &str, instruction: &str) -> Result<String, GameError> {
+        // Pressures go to the director only, never to the narrator or the
+        // interpreter, which share the slice.
+        let pressures = pressure_section(&self.world)?;
+        Ok(format!("{slice}{pressures}\n{instruction}"))
     }
 
     fn director_turn(
@@ -435,15 +480,21 @@ impl Game {
         turn: Turn,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, GameError> {
-        // Pressures go to the director only, never to the narrator or the
-        // interpreter, which share the slice.
-        let pressures = pressure_section(&self.world)?;
-        let request = Request::for_role(
-            "director",
-            vec![Message::user(format!("{slice}{pressures}\n{instruction}"))],
-        )
-        .system(DIRECTOR_SYSTEM)
-        .tools(tools::definitions(Phase::Play));
+        let message = self.director_message(slice, instruction)?;
+        self.run_director(client, DIRECTOR_SYSTEM, &message, turn, on_text)
+    }
+
+    fn run_director(
+        &mut self,
+        client: &dyn LlmClient,
+        system: &str,
+        message: &str,
+        turn: Turn,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, GameError> {
+        let request = Request::for_role("director", vec![Message::user(message)])
+            .system(system)
+            .tools(tools::definitions(Phase::Play));
         let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text, None)?;
         let mut result = self.finish(client, &outcome.final_response, turn)?;
         result.calls = outcome.calls;
@@ -589,6 +640,29 @@ impl Game {
             .unwrap_or_default();
         Ok(format!("{}\n{description}", room.name))
     }
+}
+
+/// What the director is told on a turn: its system prompt and the turn's
+/// user message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectorPrompt {
+    pub system: String,
+    pub message: String,
+}
+
+/// The engine notes and the player's input that end the director's turn
+/// message. The stall hint is for the director alone: the interpreter and
+/// the fast-path narrator never see it.
+fn turn_instruction(stall: Option<&str>, note: &str, input: &str) -> String {
+    let mut instruction = String::new();
+    if let Some(hint) = stall {
+        instruction.push_str(&format!("Engine note: {hint}\n"));
+    }
+    if !note.is_empty() {
+        instruction.push_str(&format!("Engine note: {note}\n"));
+    }
+    instruction.push_str(&format!("Player input: {input}"));
+    instruction
 }
 
 /// How long a turn took and who decided: the director's last `pass_time`,

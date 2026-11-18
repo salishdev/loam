@@ -379,6 +379,7 @@ fn the_plain_report_stacks_the_variants_under_the_summary() {
     let variants = vec![
         VariantView {
             n: 2,
+            mark: Mark::Plain,
             result: Ok(Played {
                 narration: "It holds.".into(),
                 route: "director".into(),
@@ -389,6 +390,7 @@ fn the_plain_report_stacks_the_variants_under_the_summary() {
         },
         VariantView {
             n: 1,
+            mark: Mark::Plain,
             result: Ok(Played {
                 narration: "The door bursts.".into(),
                 route: "director".into(),
@@ -428,4 +430,278 @@ It holds.
     );
     // Part way through, the overview says how far it got.
     assert!(overview(&head, &variants[..1])[1].contains("1/2 done"));
+}
+
+mod surgery_tests {
+    use super::super::surgery::{self, Spec as SurgerySpec, Surgery, Target};
+    use super::*;
+    use crate::llm::ContentBlock;
+
+    fn first_user_text(req: &crate::llm::Request) -> String {
+        match &req.messages[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    fn operate(game: &Game, surgery: &Surgery, scripts: &[ScriptedClient]) -> Reroll {
+        surgery::run(
+            game.world(),
+            surgery,
+            game.brains(),
+            &|n| &scripts[n - 1] as &(dyn LlmClient + Sync),
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn spec_defaults_to_two_edited_variants_and_takes_reroll_knobs() {
+        let s = SurgerySpec::parse("").unwrap();
+        assert_eq!(
+            (s.target, s.reroll.n, s.reroll.turn),
+            (Target::Message, 2, None)
+        );
+        let s = SurgerySpec::parse("#7 system 4 director=haiku dice=fresh").unwrap();
+        assert_eq!(s.target, Target::System);
+        assert_eq!(
+            (s.reroll.turn, s.reroll.n, s.reroll.fresh_dice),
+            (Some(7), 4, true)
+        );
+        assert_eq!(s.reroll.director, Some(Model::Haiku));
+        assert!(SurgerySpec::parse("8").unwrap_err().contains("1 to 7"));
+        assert_eq!(SurgerySpec::parse("sideways").unwrap_err(), surgery::USAGE);
+    }
+
+    #[test]
+    fn prepare_rebuilds_the_message_the_turn_sent() {
+        let (mut game, client) = begun();
+        let start = client.requests().len();
+        client.push(Response::canned_text("You wait by the altar."));
+        game.turn(&client, "light the candle", &mut |_| {}).unwrap();
+        let sent = client.requests()[start].clone();
+        let seq = xray::latest_turn(game.world()).unwrap().unwrap();
+        // A later turn doesn't change what the earlier one is rebuilt from.
+        client.push(Response::canned_text("Still waiting."));
+        game.turn(&client, "wait", &mut |_| {}).unwrap();
+
+        let spec = SurgerySpec::parse(&format!("#{seq}")).unwrap();
+        let prepared = surgery::prepare(game.world(), &spec).unwrap();
+        assert_eq!(prepared.turn_seq, seq);
+        assert_eq!(prepared.input, "light the candle");
+        assert_eq!(prepared.text(), first_user_text(&sent));
+        let system = SurgerySpec::parse(&format!("#{seq} system")).unwrap();
+        let prepared = surgery::prepare(game.world(), &system).unwrap();
+        assert_eq!(Some(prepared.text()), sent.system.as_deref());
+
+        let no_turn = surgery::prepare(game.world(), &SurgerySpec::parse("#1").unwrap());
+        assert!(no_turn.unwrap_err().contains("isn't a turn's input"));
+    }
+
+    #[test]
+    fn an_unchanged_or_empty_edit_cancels_without_calling_a_model() {
+        let (game, _) = played();
+        let calls = game.world().calls().unwrap().len();
+        let spec = SurgerySpec::parse("").unwrap();
+        let prepared = surgery::prepare(game.world(), &spec).unwrap();
+        let text = prepared.text().to_owned();
+        assert_eq!(surgery::apply(prepared.clone(), &text), None);
+        assert_eq!(
+            surgery::apply(prepared.clone(), &format!("{text}\n\n")),
+            None
+        );
+        assert_eq!(surgery::apply(prepared.clone(), "  \n"), None);
+        // Preparing made no call and wrote nothing.
+        assert_eq!(game.world().calls().unwrap().len(), calls);
+        assert!(game.world().rerolls().unwrap().is_empty());
+        // An editor's trailing newline isn't part of the edit.
+        let edit =
+            surgery::apply(prepared, &format!("{}\n", text.replace("candle", "lamp"))).unwrap();
+        assert!(!edit.edited.message.ends_with('\n'));
+        assert!(
+            edit.diff.contains("- ") && edit.diff.contains("lamp"),
+            "{}",
+            edit.diff
+        );
+    }
+
+    #[test]
+    fn edited_variants_send_the_edit_and_the_control_sends_the_original() {
+        let (game, seq) = played();
+        let state = game.world().state().unwrap();
+        let spec = SurgerySpec::parse("").unwrap();
+        let prepared = surgery::prepare(game.world(), &spec).unwrap();
+        let original = prepared.prompt.clone();
+        let edited_text = original.message.replace(
+            "Player input:",
+            "Engine note: the candle is cursed.\nPlayer input:",
+        );
+        let edit = surgery::apply(prepared, &edited_text).unwrap();
+        let surgery = Surgery { spec, edit };
+        let scripts: Vec<ScriptedClient> = ["A blue flame.", "It hisses.", "It catches."]
+            .into_iter()
+            .map(|t| ScriptedClient::new([Response::canned_text(t)]))
+            .collect();
+        let r = operate(&game, &surgery, &scripts);
+
+        assert_eq!(r.head.turn_seq, seq);
+        assert_eq!(r.head.n, 3);
+        assert!(r.head.is_surgery());
+        assert!(
+            r.head
+                .title()
+                .starts_with(&format!("Surgery r{}", r.head.id))
+        );
+        assert!(
+            r.head.title().contains("✂ message surgery"),
+            "{}",
+            r.head.title()
+        );
+        let marks: Vec<Mark> = r.variants.iter().map(|v| v.mark).collect();
+        assert_eq!(marks, [Mark::Edited, Mark::Edited, Mark::Control]);
+        assert_eq!(
+            (r.head.mark(1), r.head.mark(3)),
+            (Mark::Edited, Mark::Control)
+        );
+        for (i, script) in scripts.iter().enumerate() {
+            let reqs = script.requests();
+            assert_eq!(reqs.len(), 1, "variant {}: the director only", i + 1);
+            let want = if i < 2 {
+                &edited_text
+            } else {
+                &original.message
+            };
+            assert_eq!(&first_user_text(&reqs[0]), want, "variant {}", i + 1);
+            assert_eq!(reqs[0].system.as_deref(), Some(original.system.as_str()));
+        }
+        assert!(variant_heading(&r.variants[0]).starts_with("Variant 1 ✂ ·"));
+        assert!(variant_heading(&r.variants[2]).starts_with("Variant 3 (control) ·"));
+
+        // The knobs record the surgery and its diff; the save is untouched
+        // but for call records and the row.
+        let rows = game.world().rerolls().unwrap();
+        let knobs = &rows.last().unwrap().knobs;
+        assert_eq!(knobs["surgery"]["target"], json!("message"));
+        assert_eq!(knobs["surgery"]["control"], json!(3));
+        assert!(
+            knobs["surgery"]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+ Engine note: the candle is cursed.")
+        );
+        assert_eq!(game.world().state().unwrap(), state);
+        let overview = overview(&r.head, &r.variants).join("\n");
+        assert!(overview.contains("✂ edit:\n  @@ …"), "{overview}");
+        let listed = list(game.world()).unwrap();
+        assert!(listed.contains("✂ message surgery") && listed.contains("✂ edit:"));
+        // Edited variants can be adopted like any other.
+        let dir = std::env::temp_dir().join(format!("loam-surgery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adopted.db");
+        let _ = std::fs::remove_file(&path);
+        r.adopt(1, &path).unwrap();
+        let adopted = World::open(&path).unwrap();
+        assert_eq!(
+            adopted
+                .last_event(EventKind::Narration)
+                .unwrap()
+                .unwrap()
+                .payload["text"],
+            json!("A blue flame.")
+        );
+        drop(adopted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_surgery_edits_the_system_prompt_only() {
+        let (game, _) = played();
+        let spec = SurgerySpec::parse("system 1").unwrap();
+        let prepared = surgery::prepare(game.world(), &spec).unwrap();
+        let original = prepared.prompt.clone();
+        let edit = surgery::apply(prepared, "You are a terse director.").unwrap();
+        let surgery = Surgery { spec, edit };
+        let scripts: Vec<ScriptedClient> = ["Lit.", "It catches."]
+            .into_iter()
+            .map(|t| ScriptedClient::new([Response::canned_text(t)]))
+            .collect();
+        let r = operate(&game, &surgery, &scripts);
+        assert_eq!(r.head.n, 2);
+        let edited = &scripts[0].requests()[0];
+        assert_eq!(edited.system.as_deref(), Some("You are a terse director."));
+        assert_eq!(first_user_text(edited), original.message);
+        let control = &scripts[1].requests()[0];
+        assert_eq!(control.system.as_deref(), Some(original.system.as_str()));
+        assert!(r.head.title().contains("✂ system surgery"));
+    }
+}
+
+#[test]
+fn word_diff_shows_changed_words_with_context() {
+    use super::surgery::word_diff;
+    let d = word_diff(
+        "the quick brown fox jumps over the lazy dog",
+        "the quick red fox jumps over the dog",
+    );
+    assert_eq!(
+        d,
+        "@@ …the quick\n- brown fox jumps over the lazy\n+ red fox jumps over the"
+    );
+    let d = word_diff(
+        "one two three four five six seven eight nine ten eleven twelve",
+        "zero one two three four five six seven eight nine ten eleven",
+    );
+    assert_eq!(
+        d,
+        "@@ (start)\n+ zero\n@@ …six seven eight nine ten eleven\n- twelve"
+    );
+    assert_eq!(word_diff("same", "same"), "");
+    assert_eq!(word_diff("a b", "a\nb"), "(whitespace only)");
+}
+
+#[test]
+fn the_plain_report_of_a_surgery_shows_the_edit_and_marks() {
+    let head = Head {
+        id: 5,
+        turn_seq: 9,
+        input: "kick the door".into(),
+        n: 2,
+        knobs: json!({"surgery": {"target": "system", "control": 2, "diff": "@@ …be\n- kind\n+ cruel"}}),
+        dice: "same".into(),
+    };
+    let variant = |n: usize, text: &str| VariantView {
+        n,
+        mark: head.mark(n),
+        result: Ok(Played {
+            narration: text.into(),
+            route: "director".into(),
+            facts: vec![],
+        }),
+        calls: 1,
+        cost_usd: 0.001,
+    };
+    let text = report_text(
+        &head,
+        &[variant(1, "It splinters."), variant(2, "It holds.")],
+    );
+    let top: Vec<&str> = text.lines().take(6).collect();
+    assert_eq!(
+        top,
+        [
+            "Surgery r5 of turn #9 \"kick the door\" · 2 variants · ✂ system surgery · same dice",
+            "total $0.002",
+            "✂ edit:",
+            "  @@ …be",
+            "  - kind",
+            "  + cruel",
+        ]
+    );
+    assert!(
+        text.contains("── Variant 1 ✂ · director · 1 call"),
+        "{text}"
+    );
+    assert!(
+        text.contains("── Variant 2 (control) · director · 1 call"),
+        "{text}"
+    );
 }

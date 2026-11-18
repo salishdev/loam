@@ -13,7 +13,7 @@ use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::explain::{self, Notes, Topic};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
-use crate::reroll::{self, Head, VariantView};
+use crate::reroll::{self, Head, VariantView, surgery};
 use crate::worker::{Command, Event};
 use crate::world::{StoredCall, World};
 use crate::xray::{self, TurnXray, tree::Tree};
@@ -161,6 +161,9 @@ pub enum TermAction {
     Copy(String),
     /// Open text in `$EDITOR` (read-only use: edits are discarded).
     Edit(String),
+    /// Edit a director prompt in `$EDITOR` for `:surgery`, then hand the
+    /// result to [`App::surgery_edited`].
+    Surgery(surgery::Spec, surgery::Prepared),
 }
 
 impl PanelView {
@@ -720,7 +723,10 @@ impl App {
                 Some(seq) => self.command(&format!(":reroll #{seq}")),
                 None => self.flash = Some("No turn to reroll yet.".into()),
             },
-            KeyCode::Char('s') => self.flash = Some("Surgery isn't built yet (coming).".into()),
+            KeyCode::Char('s') => match seq {
+                Some(seq) => self.command(&format!(":surgery #{seq}")),
+                None => self.flash = Some("No turn to operate on yet.".into()),
+            },
             _ => return false,
         }
         true
@@ -960,6 +966,50 @@ impl App {
             }
             Err(e) => self.flash = Some(e),
         }
+    }
+
+    /// `:surgery [#turn] [system] [n] [knobs…]` (or `s` in the X-ray):
+    /// build the director's prompt for the turn and ask the event loop to
+    /// open it in `$EDITOR`.
+    fn surgery_command(&mut self, arg: &str) {
+        if self.refuse_while_busy() {
+            return;
+        }
+        let prepared = surgery::Spec::parse(arg)
+            .and_then(|spec| surgery::prepare(&self.view, &spec).map(|prepared| (spec, prepared)));
+        match prepared {
+            Ok((spec, prepared)) => self.action = Some(TermAction::Surgery(spec, prepared)),
+            Err(e) => self.flash = Some(e),
+        }
+    }
+
+    /// The editor closed on a `:surgery` prompt: `edited` is the text it
+    /// left, or `None` when it failed. An empty or unchanged edit cancels
+    /// without calling a model; otherwise the surgery runs into the reroll
+    /// view.
+    pub fn surgery_edited(
+        &mut self,
+        spec: surgery::Spec,
+        prepared: surgery::Prepared,
+        edited: Option<String>,
+    ) {
+        let Some(edited) = edited else {
+            self.flash = Some(format!(
+                "{} exited with an error; surgery cancelled.",
+                super::editor_command()
+            ));
+            return;
+        };
+        let Some(edit) = surgery::apply(prepared, &edited) else {
+            self.flash = Some("Nothing edited: surgery cancelled, no model called.".into());
+            return;
+        };
+        if self.refuse_while_busy() {
+            return;
+        }
+        self.reroll = Some(RerollScreen::new());
+        self.reroll_open = true;
+        self.send(Command::Surgery(surgery::Surgery { spec, edit }));
     }
 
     /// `a` or `:adopt <n>`: make variant `n` of the latest reroll a new
@@ -1272,6 +1322,7 @@ impl App {
                 }
             }
             ":reroll" => self.reroll_command(arg),
+            ":surgery" => self.surgery_command(arg),
             ":adopt" => match arg.trim().parse::<usize>() {
                 Ok(n) => self.adopt(n),
                 Err(_) => {
@@ -1831,7 +1882,7 @@ impl App {
         }
         if self.focus == Focus::Panel && self.xray_on_top() {
             return "↑↓ select call · Enter/c context · [ ] turn · r reroll · \
-                    s surgery (coming) · Esc back · Tab focus"
+                    s surgery · Esc back · Tab focus"
                 .into();
         }
         match self.focus {
@@ -1887,10 +1938,12 @@ fn text_width(width: usize) -> usize {
 pub fn help_text() -> String {
     format!(
         "{}\n\nTUI: Ctrl-X (or :xray) toggles the X-ray panel; in it ↑↓ select a call, \
-         Enter opens its context, [ ] step turns and r rerolls the turn. Ctrl-R (or :reroll) \
-         rerolls the last turn into a full-screen view of variants. Ctrl-N dismisses a \
-         first-time note. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
-         capture (off restores native text selection; Shift-drag selects while it's on). \
+         Enter opens its context, [ ] step turns, r rerolls the turn and s opens its director \
+         prompt in $EDITOR for :surgery. Ctrl-R (or :reroll) rerolls the last turn into a \
+         full-screen view of variants; a surgery's edited variants are marked ✂. Ctrl-N \
+         dismisses a first-time note. :panel toggles this panel (Ctrl-P), :mouse [on|off] \
+         switches mouse capture (off restores native text selection; Shift-drag selects while \
+         it's on). \
          Press ? outside the input line for the keys.",
         commands::HELP
     )
@@ -1926,9 +1979,9 @@ Story and panel
 
 X-ray panel (Ctrl-X)
   ↑ ↓ / Enter c     select a call / open its context
-  [ ]   r s         previous, next turn   reroll this turn, surgery (coming)
+  [ ]   r s         previous, next turn   reroll this turn, edit it (surgery)
 
-Reroll view (Ctrl-R, :reroll)
+Reroll view (Ctrl-R, :reroll, :surgery; ✂ marks edited variants)
   ← → h l  1-8      pick a variant
   Enter   d         its whole narration, its full diff
   c                 its director call in the context viewer
@@ -2419,6 +2472,7 @@ pub(crate) mod tests {
         let variants = (1..=n)
             .map(|k| VariantView {
                 n: k,
+                mark: crate::reroll::Mark::Plain,
                 result: Ok(Played {
                     narration: format!("Narration of variant {k}."),
                     route: "director".into(),
@@ -2745,11 +2799,64 @@ pub(crate) mod tests {
         assert!(app.context.is_none());
         app.on_key(key(KeyCode::Char('c')));
         assert!(app.context.is_some());
-        // Surgery is announced, not yet wired.
-        app.context = None;
+    }
+
+    #[test]
+    fn s_in_the_xray_opens_the_turns_prompt_for_surgery() {
+        let (mut app, first, _) = xray_app();
+        app.on_key(ctrl('x'));
+        app.focus = Focus::Panel;
+        app.on_key(key(KeyCode::Char('[')));
         app.on_key(key(KeyCode::Char('s')));
-        assert!(app.flash.as_deref().unwrap().contains("Surgery"));
+        let Some(TermAction::Surgery(spec, prepared)) = app.action.take() else {
+            panic!("expected a surgery action, got {:?}", app.action);
+        };
+        assert_eq!(prepared.turn_seq, first);
+        assert_eq!(spec.target, surgery::Target::Message);
+        assert!(prepared.text().contains("Player input:"));
+        assert!(app.outbox.is_empty(), "nothing runs before the edit");
+
+        // An unchanged edit cancels with no worker command.
+        let text = prepared.text().to_owned();
+        app.surgery_edited(spec.clone(), prepared.clone(), Some(format!("{text}\n")));
+        assert!(app.flash.as_deref().unwrap().contains("surgery cancelled"));
+        assert!(app.outbox.is_empty() && !app.reroll_open);
+        // So does an editor that failed.
+        app.surgery_edited(spec.clone(), prepared.clone(), None);
+        assert!(app.flash.as_deref().unwrap().contains("surgery cancelled"));
         assert!(app.outbox.is_empty());
+
+        // A real edit runs into the reroll view.
+        app.surgery_edited(
+            spec,
+            prepared,
+            Some(text.replace("Player input:", "Hint: no.\nPlayer input:")),
+        );
+        assert!(app.reroll_open);
+        match app.outbox.as_slice() {
+            [Command::Surgery(s)] => {
+                assert_eq!(s.edit.prepared.turn_seq, first);
+                assert!(s.edit.edited.message.contains("Hint: no."));
+            }
+            other => panic!("expected a surgery command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surgery_reports_what_it_cannot_operate_on() {
+        let (mut app, _, _) = xray_app();
+        typed(&mut app, ":surgery #1");
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.flash
+                .as_deref()
+                .unwrap()
+                .contains("isn't a turn's input")
+        );
+        typed(&mut app, ":surgery 9");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.flash.as_deref().unwrap().contains("1 to 7"));
+        assert!(app.action.is_none() && app.outbox.is_empty());
     }
 
     #[test]

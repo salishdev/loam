@@ -13,6 +13,7 @@
 //! [`summarize`] groups identical changes across variants. No model call is
 //! needed to compare them.
 
+pub mod surgery;
 #[cfg(test)]
 mod tests;
 
@@ -22,7 +23,7 @@ use std::sync::mpsc::channel;
 
 use serde_json::{Value, json};
 
-use crate::game::{Game, TurnOutcome};
+use crate::game::{DirectorPrompt, Game, TurnOutcome};
 use crate::llm::{Brains, CallRecord, Effort, LlmClient, Model};
 use crate::world::{
     ENGINE_PROP_PREFIX, Entity, EntityId, EventKind, Relation, StoreError, World, WorldState,
@@ -137,9 +138,13 @@ impl Spec {
     }
 }
 
-/// `director haiku · effort high · same dice`: what a reroll ran with.
+/// `director haiku · effort high · same dice`: what a reroll ran with
+/// (`✂ message surgery · …` for surgery).
 pub fn describe_knobs(knobs: &Value, dice: &str) -> String {
     let mut parts = Vec::new();
+    if let Some(target) = knobs["surgery"]["target"].as_str() {
+        parts.push(format!("✂ {target} surgery"));
+    }
     if let Some(m) = knobs["director"].as_str() {
         parts.push(format!("director {m}"));
     }
@@ -204,11 +209,36 @@ impl Played {
     }
 }
 
+/// What sets a variant apart in a surgery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mark {
+    /// A plain reroll variant.
+    #[default]
+    Plain,
+    /// Played with the edited prompt: shown with ✂.
+    Edited,
+    /// Played with the prompt unedited, for comparison.
+    Control,
+}
+
+impl Mark {
+    /// ` ✂`, ` (control)` or nothing, after a variant's number.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Mark::Plain => "",
+            Mark::Edited => " ✂",
+            Mark::Control => " (control)",
+        }
+    }
+}
+
 /// One finished variant, as the front ends show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantView {
     /// From 1.
     pub n: usize,
+    /// Edited or control, in a surgery.
+    pub mark: Mark,
     /// The turn, or why it failed.
     pub result: Result<Played, String>,
     /// Model calls it made.
@@ -231,9 +261,15 @@ pub struct Head {
 
 impl Head {
     /// `Reroll r3 of turn #42 "kick the door" · 3 variants · same dice`
+    /// (`Surgery r3 …` for a surgery).
     pub fn title(&self) -> String {
         format!(
-            "Reroll r{} of turn #{} \"{}\" · {} variant{} · {}",
+            "{} r{} of turn #{} \"{}\" · {} variant{} · {}",
+            if self.is_surgery() {
+                "Surgery"
+            } else {
+                "Reroll"
+            },
             self.id,
             self.turn_seq,
             xray::clip(&self.input, 60),
@@ -241,6 +277,21 @@ impl Head {
             if self.n == 1 { "" } else { "s" },
             describe_knobs(&self.knobs, &self.dice)
         )
+    }
+
+    /// Whether this is a `:surgery` (edited variants and a control).
+    pub fn is_surgery(&self) -> bool {
+        self.knobs["surgery"].is_object()
+    }
+
+    /// How variant `n` is marked: in a surgery the control is the variant
+    /// its knobs name and the rest are edited.
+    pub fn mark(&self, n: usize) -> Mark {
+        match self.knobs["surgery"]["control"].as_u64() {
+            None => Mark::Plain,
+            Some(c) if c == n as u64 => Mark::Control,
+            Some(_) => Mark::Edited,
+        }
     }
 }
 
@@ -318,6 +369,39 @@ pub fn run<'c>(
     clients: &dyn Fn(usize) -> &'c (dyn LlmClient + Sync),
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Reroll, String> {
+    let plans = vec![Plan::Plain; spec.n];
+    run_plans(
+        world,
+        spec,
+        &spec.knobs(),
+        &plans,
+        session,
+        clients,
+        progress,
+    )
+}
+
+/// How one variant plays its turn.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Plan {
+    /// The whole turn from the raw input, as it would play.
+    Plain,
+    /// Straight to the director with this prompt.
+    Prompt(DirectorPrompt, Mark),
+}
+
+/// Run one variant per plan (`spec.n` is ignored: the plans say how many),
+/// storing `knobs` in the `rerolls` row.
+pub(crate) fn run_plans<'c>(
+    world: &World,
+    spec: &Spec,
+    knobs: &Value,
+    plans: &[Plan],
+    session: &Brains,
+    clients: &dyn Fn(usize) -> &'c (dyn LlmClient + Sync),
+    progress: &mut dyn FnMut(Progress),
+) -> Result<Reroll, String> {
+    let n = plans.len();
     let failed = |e: StoreError| format!("[reroll failed: {e}]");
     let turn_seq = match spec.turn {
         Some(seq) => seq,
@@ -328,12 +412,12 @@ pub fn run<'c>(
     let input = turn_input(world, turn_seq)
         .map_err(failed)?
         .ok_or_else(|| format!("Event #{turn_seq} isn't a turn's input; :xray shows turns."))?;
-    if !(1..=MAX_N).contains(&spec.n) {
+    if !(1..=MAX_N).contains(&n) {
         return Err(format!("A reroll runs 1 to {MAX_N} variants."));
     }
     let brains = spec.brains(session);
-    let mut forks = Vec::with_capacity(spec.n);
-    for _ in 0..spec.n {
+    let mut forks = Vec::with_capacity(n);
+    for _ in 0..n {
         forks.push(
             world
                 .fork_in_memory(turn_seq - 1)
@@ -341,50 +425,60 @@ pub fn run<'c>(
         );
     }
     let id = world
-        .insert_reroll(turn_seq, spec.n, &spec.knobs(), spec.dice())
+        .insert_reroll(turn_seq, n, knobs, spec.dice())
         .map_err(failed)?;
     let head = Head {
         id,
         turn_seq,
         input: input.clone(),
-        n: spec.n,
-        knobs: spec.knobs(),
+        n,
+        knobs: knobs.clone(),
         dice: spec.dice().into(),
     };
     progress(Progress::Started(&head));
 
-    let mut variants: Vec<Option<VariantView>> = vec![None; spec.n];
-    let mut worlds: Vec<Option<World>> = (0..spec.n).map(|_| None).collect();
+    let mut variants: Vec<Option<VariantView>> = vec![None; n];
+    let mut worlds: Vec<Option<World>> = (0..n).map(|_| None).collect();
     let mut take = |ran: Ran, progress: &mut dyn FnMut(Progress)| -> Result<(), String> {
-        let n = ran.view.n;
+        let k = ran.view.n;
         world
-            .record_variant_calls(turn_seq, id, n as i64, &ran.calls)
+            .record_variant_calls(turn_seq, id, k as i64, &ran.calls)
             .map_err(failed)?;
         progress(Progress::Variant(&ran.view));
         if ran.view.result.is_ok() {
-            worlds[n - 1] = Some(ran.world);
+            worlds[k - 1] = Some(ran.world);
         }
-        variants[n - 1] = Some(ran.view);
+        variants[k - 1] = Some(ran.view);
         Ok(())
     };
 
     let mut forks = forks.into_iter().enumerate().map(|(i, w)| (i + 1, w));
     // Variant 1 alone first: it writes the prompt cache the rest read.
-    let (n, first) = forks.next().expect("at least one variant");
+    let (first_n, first) = forks.next().expect("at least one variant");
     take(
-        play(first, n, &input, &brains, spec.fresh_dice, clients(n)),
+        play(
+            first,
+            first_n,
+            &input,
+            &plans[0],
+            &brains,
+            spec.fresh_dice,
+            clients(first_n),
+        ),
         progress,
     )?;
-    let rest: Vec<_> = forks.map(|(n, w)| (n, w, clients(n))).collect();
+    let rest: Vec<_> = forks
+        .map(|(k, w)| (k, w, &plans[k - 1], clients(k)))
+        .collect();
     if !rest.is_empty() {
         let (tx, rx) = channel();
         std::thread::scope(|scope| -> Result<(), String> {
-            for (n, fork, client) in rest {
+            for (k, fork, plan, client) in rest {
                 let tx = tx.clone();
                 let (input, brains) = (&input, &brains);
                 let fresh = spec.fresh_dice;
                 scope.spawn(move || {
-                    let _ = tx.send(play(fork, n, input, brains, fresh, client));
+                    let _ = tx.send(play(fork, k, input, plan, brains, fresh, client));
                 });
             }
             drop(tx);
@@ -401,14 +495,14 @@ pub fn run<'c>(
         variants,
         worlds,
     };
-    let summary = summary_text(&reroll.summary(), spec.n).join("\n");
+    let summary = summary_text(&reroll.summary(), n).join("\n");
     world.set_reroll_summary(id, &summary).map_err(failed)?;
     Ok(reroll)
 }
 
 /// The text the player typed for the turn whose input is event `seq`, or
 /// `None` when that event isn't a turn's input.
-fn turn_input(world: &World, seq: i64) -> Result<Option<String>, StoreError> {
+pub(crate) fn turn_input(world: &World, seq: i64) -> Result<Option<String>, StoreError> {
     Ok(world
         .event(seq)?
         .filter(|e| e.kind == EventKind::Input && e.payload["seed"] != json!(true))
@@ -427,6 +521,7 @@ fn play(
     mut fork: World,
     n: usize,
     input: &str,
+    plan: &Plan,
     brains: &Brains,
     fresh_dice: bool,
     client: &dyn LlmClient,
@@ -438,7 +533,13 @@ fn play(
     let before = fork.state();
     let mut game = Game::new(fork);
     game.set_brains(brains.clone());
-    let outcome = game.turn(client, input, &mut |_| {});
+    let (outcome, mark) = match plan {
+        Plan::Plain => (game.turn(client, input, &mut |_| {}), Mark::Plain),
+        Plan::Prompt(prompt, mark) => (
+            game.turn_with_prompt(client, input, prompt, &mut |_| {}),
+            *mark,
+        ),
+    };
     let world = game.into_world();
     let calls: Vec<CallRecord> = match world.turn_seqs().map(|s| s.last().copied()) {
         Ok(Some(seq)) if start.as_ref().is_ok_and(|&s| seq > s) => world
@@ -457,6 +558,7 @@ fn play(
     Ran {
         view: VariantView {
             n,
+            mark,
             result,
             calls: calls.len(),
             cost_usd: calls
@@ -749,8 +851,9 @@ pub fn variant_heading(v: &VariantView) -> String {
         Err(_) => "failed",
     };
     format!(
-        "Variant {} · {route} · {} call{} · ${:.3}",
+        "Variant {}{} · {route} · {} call{} · ${:.3}",
         v.n,
+        v.mark.suffix(),
         v.calls,
         if v.calls == 1 { "" } else { "s" },
         v.cost_usd
@@ -789,6 +892,9 @@ pub fn overview(head: &Head, variants: &[VariantView]) -> Vec<String> {
         String::new()
     };
     lines.push(format!("total ${:.3}{progress}", s.cost_usd));
+    if let Some(diff) = head.knobs["surgery"]["diff"].as_str() {
+        lines.extend(surgery::diff_preview(diff));
+    }
     lines.extend(summary_text(&s, head.n));
     lines
 }
@@ -859,6 +965,12 @@ pub fn list(world: &World) -> Result<String, StoreError> {
                 }
             }
             None => out.push_str("    (didn't finish)\n"),
+        }
+        if let Some(diff) = r.knobs["surgery"]["diff"].as_str() {
+            writeln!(out, "    ✂ edit:").unwrap();
+            for line in diff.lines() {
+                writeln!(out, "      {line}").unwrap();
+            }
         }
     }
     out.push_str(

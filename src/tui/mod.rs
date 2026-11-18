@@ -89,6 +89,13 @@ fn event_loop(terminal: &mut Term, app: &mut App, worker: &Worker) -> io::Result
                 }
                 dirty = true;
             }
+            Some(TermAction::Surgery(spec, prepared)) => {
+                let edited = edit_in_editor(terminal, prepared.text(), ".md", app.mouse)
+                    .ok()
+                    .flatten();
+                app.surgery_edited(spec, prepared, edited);
+                dirty = true;
+            }
             None => {}
         }
         if dirty {

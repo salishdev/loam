@@ -283,6 +283,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => say(&e),
                 },
+                ":surgery" => {
+                    let prepared = loam::reroll::surgery::Spec::parse(arg).and_then(|spec| {
+                        loam::reroll::surgery::prepare(&view, &spec).map(|p| (spec, p))
+                    });
+                    let (spec, prepared) = match prepared {
+                        Ok(p) => p,
+                        Err(e) => {
+                            say(&e);
+                            continue;
+                        }
+                    };
+                    let editor_cmd = loam::tui::editor_command();
+                    let edited = match loam::tui::edit_text(prepared.text(), ".md", &editor_cmd) {
+                        Ok(Some(text)) => text,
+                        Ok(None) | Err(_) => {
+                            note(&format!(
+                                "[{editor_cmd} exited with an error; surgery cancelled]"
+                            ));
+                            continue;
+                        }
+                    };
+                    let Some(edit) = loam::reroll::surgery::apply(prepared, &edited) else {
+                        say("Nothing edited: surgery cancelled, no model called.");
+                        continue;
+                    };
+                    worker.send(WorkerCommand::Surgery(loam::reroll::surgery::Surgery {
+                        spec,
+                        edit,
+                    }));
+                    if let Some(done) = await_reroll(&worker) {
+                        last_reroll = Some(done);
+                    }
+                }
                 ":adopt" => {
                     let Ok(n) = arg.trim().parse::<usize>() else {
                         say("Usage: :adopt <n> (a variant of the latest reroll)");

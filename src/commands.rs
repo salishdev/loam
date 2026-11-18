@@ -35,6 +35,7 @@ pub const COMMANDS: &[&str] = &[
     ":rerolls",
     ":rules",
     ":stats",
+    ":surgery",
     ":switch",
     ":tick",
     ":time",
@@ -55,8 +56,12 @@ shows this game's saves as a tree, :switch <n|name> plays another, :fork <event>
 [label] makes a new branch; :reroll [#turn] [n] [director=<model>] [effort=<level>] \
 [dice=fresh] reruns a turn n times (default 3, max 8) without touching the save and compares \
 the variants, :reroll show <n> reads one, :adopt <n> plays it as a new branch; :rerolls lists \
-past rerolls, :context r<id>.<n>[.<k>] shows a variant's calls; :explain [topic] explains \
-the workbench's ideas (a note also explains each the first time it turns up).";
+past rerolls, :context r<id>.<n>[.<k>] shows a variant's calls; :surgery [#turn] [system] [n] \
+[director=<model>] [effort=<level>] [dice=fresh] opens what the director was told for a turn \
+(its turn message, or with system its system prompt) in $EDITOR, then plays n edited variants \
+(default 2, marked ✂) beside an unedited control, always on the director path; an unchanged \
+edit cancels; :explain [topic] explains the workbench's ideas (a note also explains each the \
+first time it turns up).";
 
 /// The commands that start with `prefix` (which starts with `:`), sorted.
 pub fn complete(prefix: &str) -> Vec<&'static str> {

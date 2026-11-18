@@ -280,8 +280,13 @@ fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(area);
     let state = if r.running { "running" } else { "done" };
+    let what = if r.head.as_ref().is_some_and(reroll::Head::is_surgery) {
+        "surgery"
+    } else {
+        "reroll"
+    };
     frame.render_widget(
-        Paragraph::new(format!(" reroll · {state} — Esc closes"))
+        Paragraph::new(format!(" {what} · {state} — Esc closes"))
             .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
         title,
     );
@@ -307,8 +312,9 @@ fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
             let spans: Vec<Span> = (1..=n)
                 .map(|k| {
-                    let mark = if r.variant(k).is_some() { "" } else { "…" };
-                    let label = format!(" {k}{mark} ");
+                    let running = if r.variant(k).is_some() { "" } else { "…" };
+                    let mark = r.head.as_ref().map_or("", |h| h.mark(k).suffix());
+                    let label = format!(" {k}{mark}{running} ");
                     if k == r.selected {
                         Span::styled(label, Style::new().add_modifier(Modifier::REVERSED))
                     } else {
@@ -375,7 +381,13 @@ fn draw_variant_column(frame: &mut Frame, r: &RerollScreen, k: usize, area: Rect
     let selected = k == r.selected;
     let inner = usize::from(area.width.saturating_sub(4));
     let (title, lines): (String, Vec<Line>) = match r.variant(k) {
-        None => (format!(" Variant {k} "), vec![Line::from(" running…")]),
+        None => (
+            format!(
+                " Variant {k}{} ",
+                r.head.as_ref().map_or("", |h| h.mark(k).suffix())
+            ),
+            vec![Line::from(" running…")],
+        ),
         Some(v) => {
             let mut lines = Vec::new();
             if let Ok(p) = &v.result {
@@ -992,5 +1004,45 @@ mod tests {
             "{diff}"
         );
         assert!(diff.contains("(nothing changed)"), "{diff}");
+    }
+
+    #[test]
+    fn a_surgery_marks_edited_variants_and_the_control() {
+        use crate::reroll::Mark;
+        use crate::tui::app::tests::reroll_events;
+        use crate::worker::Event;
+        let mut app = app();
+        app.on_key(ctrl('r'));
+        let (mut head, mut variants) = reroll_events(3);
+        head.knobs = serde_json::json!({"surgery": {
+            "target": "message", "control": 3, "diff": "@@ …the\n- old words\n+ new words"
+        }});
+        for v in &mut variants {
+            v.mark = head.mark(v.n);
+        }
+        assert_eq!(variants[2].mark, Mark::Control);
+        app.on_event(Event::RerollStarted(head));
+        app.on_event(Event::RerollProgress(variants[0].clone()));
+
+        let wide = screen(&render(&mut app, 120, 30));
+        assert!(wide.contains("surgery · running"), "{wide}");
+        assert!(wide.contains("Surgery r1 of turn #9"), "{wide}");
+        assert!(wide.contains("✂ message surgery"), "{wide}");
+        assert!(
+            wide.contains("✂ edit:") && wide.contains("+ new words"),
+            "{wide}"
+        );
+        assert!(wide.contains("Variant 1 ✂ ·"), "{wide}");
+        assert!(
+            wide.contains("Variant 2 ✂"),
+            "running, still marked: {wide}"
+        );
+        assert!(wide.contains("Variant 3 (control)"), "{wide}");
+
+        let narrow = screen(&render(&mut app, 60, 30));
+        assert!(
+            narrow.contains(" 1 ✂  2 ✂…  3 (control)… "),
+            "tabs: {narrow}"
+        );
     }
 }

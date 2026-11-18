@@ -58,6 +58,14 @@ fresh dice. Press `a` on a variant (or `:adopt <n>`) to keep it: it becomes a
 new branch save beside this one and play switches to it. `:rerolls` lists
 past rerolls.
 
+`:surgery #12` (or `s` in the X-ray panel) opens what the director was told
+for turn 12 in `$EDITOR`; `:surgery #12 system` opens its system prompt
+instead. Save an edit and loam plays the turn with it (twice by default)
+beside one unedited control, so you can see what your change did. Edited
+variants are marked ✂ and can be adopted like any reroll. Surgery always
+goes to the director, even for a turn the fast path took. Quit without
+changing anything and nothing runs. It takes the same options as `:reroll`.
+
 `loam --plain` (or `LOAM_PLAIN=1`, or piping stdout) plays the same game as
 a plain line-by-line prompt.
 

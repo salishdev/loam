@@ -2933,3 +2933,51 @@ fn brains_reach_the_request_and_the_call_record() {
     assert_eq!(last.model, Model::Sonnet);
     assert_eq!(last.effort, Some(crate::llm::Effort::Medium));
 }
+
+#[test]
+fn the_director_prompt_is_what_a_director_turn_sends() {
+    let (mut game, client) = begun();
+    let prompt = game.director_prompt("light the candle").unwrap();
+    let start = client.requests().len();
+    client.push(Response::canned_text("You wait."));
+    game.turn(&client, "light the candle", &mut |_| {}).unwrap();
+    let sent = &client.requests()[start];
+    assert_eq!(first_user_text(sent), prompt.message);
+    assert_eq!(sent.system.as_deref(), Some(prompt.system.as_str()));
+    assert!(prompt.message.ends_with("Player input: light the candle"));
+}
+
+#[test]
+fn a_turn_with_a_given_prompt_skips_the_interpreter_and_fast_path() {
+    let (mut game, client, oak, _) = with_doors();
+    client.push(kick_mint(oak));
+    client.push(Response::canned_text("The oak door bursts."));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+
+    // A rule now exists, so a normal turn would ask the interpreter first.
+    let mut prompt = game.director_prompt("kick the elm door").unwrap();
+    prompt.message = prompt
+        .message
+        .replace("Player input:", "EDITED. Player input:");
+    prompt.system.push_str(" Be terse.");
+    let start = client.requests().len();
+    client.push(Response::canned_text("You stub your toe."));
+    let outcome = game
+        .turn_with_prompt(&client, "kick the elm door", &prompt, &mut |_| {})
+        .unwrap();
+    assert_eq!(outcome.fast_path, None);
+    let reqs = &client.requests()[start..];
+    assert_eq!(reqs.len(), 1, "only the director: no interpreter, no judge");
+    assert_eq!(reqs[0].model, Model::Sonnet);
+    assert!(!reqs[0].tools.is_empty());
+    assert_eq!(first_user_text(&reqs[0]), prompt.message);
+    assert_eq!(reqs[0].system.as_deref(), Some(prompt.system.as_str()));
+    // It is a turn like any other: logged input, narration, recorded calls.
+    let seq = last_turn(game.world()).unwrap().unwrap();
+    assert_eq!(
+        game.world().event(seq).unwrap().unwrap().payload["text"],
+        json!("kick the elm door")
+    );
+    assert_eq!(game.world().turn_calls(seq).unwrap().len(), 1);
+}
