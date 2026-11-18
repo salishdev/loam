@@ -319,6 +319,34 @@ impl World {
         self.meta("parent")
     }
 
+    /// The file this world is stored in; `None` for an in-memory world.
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
+    /// The branch's free-text label (meta `label`), if it has one.
+    pub fn label(&self) -> Result<Option<String>, StoreError> {
+        self.meta("label")
+    }
+
+    /// Set (or, with an empty `label`, clear) the branch's label.
+    pub fn set_label(&self, label: &str) -> Result<(), StoreError> {
+        let label = label.trim();
+        if label.is_empty() {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = 'label'", [])?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('label', ?1)",
+                [label],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Validate and apply a patch atomically, logging it as a `patch` event
     /// in the same transaction. A rejected patch changes nothing in the
     /// world and is logged as a `patch_rejected` event.

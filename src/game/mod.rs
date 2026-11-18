@@ -237,6 +237,13 @@ impl Game {
         self.world
     }
 
+    /// Play `world` from now on (switching branches), keeping this
+    /// session's settings: brains, recording and the dice seed. Returns the
+    /// world it replaces.
+    pub fn switch_world(&mut self, world: World) -> World {
+        std::mem::replace(&mut self.world, world)
+    }
+
     /// Whether this world already has a bible (an existing save).
     pub fn has_bible(&self) -> Result<bool, GameError> {
         Ok(bible_id(&self.world)?.is_some())

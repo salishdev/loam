@@ -7,6 +7,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
+use std::path::PathBuf;
+
+use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::worker::{Command, Event};
@@ -49,7 +52,8 @@ pub struct PanelView {
     pub text: String,
     /// First visible line.
     pub scroll: usize,
-    /// The highlighted line, in views with rows to pick (`:brain`).
+    /// The highlighted text line, in views with rows to pick (`:brain`,
+    /// `:branches`); all of its wrapped screen lines are highlighted.
     pub selected: Option<usize>,
     /// Set for the X-ray view, which shows this instead of `text`.
     pub xray: Option<XrayPanel>,
@@ -127,8 +131,15 @@ pub const OVERLAY_BELOW: u16 = 120;
 pub struct App {
     /// The read-only view of the save.
     view: World,
-    /// The last call id before this session, for the session's cost.
+    /// The last call id before this session (or since switching to this
+    /// branch), for the session's cost.
     since_call: i64,
+    /// What the session spent in branches it has left.
+    cost_carried: f64,
+    /// The save being left, until the worker confirms a switch.
+    switching_from: Option<PathBuf>,
+    /// The rows of the `:branches` view, as last scanned.
+    branches: Vec<Branch>,
     pub status: Status,
     /// Each role's model and effort this session; the worker gets a copy
     /// whenever it changes.
@@ -183,6 +194,9 @@ impl App {
         let mut app = App {
             view,
             since_call,
+            cost_carried: 0.0,
+            switching_from: None,
+            branches: Vec::new(),
             status: Status::default(),
             brains: Brains::default(),
             story: Vec::new(),
@@ -271,7 +285,8 @@ impl App {
     }
 
     fn refresh_status(&mut self) {
-        if let Ok(s) = commands::status(&self.view, self.since_call) {
+        if let Ok(mut s) = commands::status(&self.view, self.since_call) {
+            s.cost_usd += self.cost_carried;
             self.status = s;
         }
     }
@@ -319,6 +334,7 @@ impl App {
                 self.refresh_status();
                 self.refresh_panel();
             }
+            Event::Switched { path, outcome } => self.switched(path, outcome),
             Event::RerollProgress { .. } => {}
             Event::Ready => {
                 self.pending = self.pending.saturating_sub(1);
@@ -657,6 +673,129 @@ impl App {
         }
     }
 
+    /// Open (or redraw) the `:branches` tree with `row` selected, or the
+    /// current save's row.
+    fn show_branches(&mut self, row: Option<usize>) {
+        let text = match commands::branches(&self.view) {
+            Ok(text) => text,
+            Err(e) => {
+                self.flash = Some(format!("[:branches unavailable: {e}]"));
+                return;
+            }
+        };
+        self.branches = self
+            .view
+            .path()
+            .and_then(|p| crate::branches::scan(&p).ok())
+            .unwrap_or_default();
+        let row = row
+            .or_else(|| self.branches.iter().position(|b| b.current))
+            .unwrap_or(0)
+            .min(self.branches.len().saturating_sub(1));
+        self.open_view(":branches", "", text);
+        if let Some(v) = self.panel.last_mut()
+            && !self.branches.is_empty()
+        {
+            v.selected = Some(row);
+        }
+    }
+
+    /// The selected branch's row, while the `:branches` view is on top.
+    fn branch_row(&self) -> Option<usize> {
+        let top = self.panel.last().filter(|v| v.cmd == ":branches")?;
+        top.selected.filter(|&r| r < self.branches.len())
+    }
+
+    /// Keys in the `:branches` view; `false` when the key isn't one of them.
+    fn branch_key(&mut self, key: KeyEvent) -> bool {
+        let Some(row) = self.branch_row() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.show_branches(Some(row.saturating_sub(1))),
+            KeyCode::Down | KeyCode::Char('j') => self.show_branches(Some(row + 1)),
+            KeyCode::Enter => self.command(&format!(":switch {}", row + 1)),
+            KeyCode::Char('f') => {
+                if self.refuse_while_busy() {
+                    return true;
+                }
+                // Forks the latest event: the game as it stands.
+                let at = self.view.last_seq().unwrap_or(0);
+                self.flash = Some(match commands::fork(&self.view, &at.to_string()) {
+                    Ok(said) | Err(said) => said,
+                });
+                self.show_branches(Some(row));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Says so and returns `true` while the worker is busy.
+    fn refuse_while_busy(&mut self) -> bool {
+        if self.busy() {
+            self.flash = Some("The world is still answering; wait for it.".into());
+        }
+        self.busy()
+    }
+
+    /// `:switch`: point the view at the other save, then ask the worker to
+    /// play it. The old view closes first, so the worker's writer is the
+    /// last connection to the old save and checkpoints it.
+    fn switch_to(&mut self, path: PathBuf) {
+        let view = match World::open_read_only(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                self.flash = Some(format!("[can't open {}: {e}]", path.display()));
+                return;
+            }
+        };
+        self.switching_from = self.view.path();
+        self.cost_carried += self.view.cost_since(self.since_call).unwrap_or(0.0);
+        self.since_call = view.last_call_id().unwrap_or(0);
+        self.view = view;
+        self.send(Command::Switch(path));
+    }
+
+    /// The worker finished a switch: reload the story from the branch, or
+    /// go back to the old save's view if it failed.
+    fn switched(&mut self, path: PathBuf, outcome: Result<String, String>) {
+        let from = self.switching_from.take();
+        match outcome {
+            Ok(look) => {
+                self.story.clear();
+                self.streaming = false;
+                self.story_scroll = 0;
+                self.load_recent(RESUME_STORY);
+                let name = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                self.info(format!("Switched to {name}.\n\n{look}"));
+            }
+            Err(e) => {
+                if let Some(from) = from
+                    && let Ok(view) = World::open_read_only(&from)
+                {
+                    self.since_call = view.last_call_id().unwrap_or(0);
+                    self.view = view;
+                }
+                self.notice(format!("[switch failed: {e}]"));
+            }
+        }
+        self.refresh_status();
+        // Turn numbers mean something else in another branch: X-ray views
+        // go back to following the latest turn.
+        for x in self.panel.iter_mut().filter_map(|v| v.xray.as_mut()) {
+            x.follow = true;
+        }
+        if self.panel.last().is_some_and(|v| v.cmd == ":branches") {
+            self.show_branches(None);
+        } else {
+            self.refresh_panel();
+        }
+    }
+
     /// Esc or `h` in the panel: back one view; past the first, close it.
     fn panel_back(&mut self) {
         self.panel.pop();
@@ -706,6 +845,11 @@ impl App {
     fn command(&mut self, line: &str) {
         let (cmd, arg) = commands::split(line);
         match cmd {
+            ":branches" => {
+                self.show_branches(None);
+                self.focus = Focus::Panel;
+                return;
+            }
             ":xray" => {
                 match arg {
                     "on" if !self.xray_on_top() => self.open_xray(None),
@@ -755,6 +899,15 @@ impl App {
                 "" => self.mouse = !self.mouse,
                 _ => self.flash = Some("Usage: :mouse [on|off]".into()),
             },
+            ":switch" => {
+                if self.refuse_while_busy() {
+                    return;
+                }
+                match commands::switch_target(&self.view, arg) {
+                    Ok(path) => self.switch_to(path),
+                    Err(said) => self.flash = Some(said),
+                }
+            }
             ":tick" if self.busy() => {
                 self.flash = Some("The world is still answering; wait for it.".into());
             }
@@ -792,12 +945,12 @@ impl App {
                 self.toggle_xray();
                 return;
             }
-            KeyCode::Char(c @ ('r' | 'b')) if ctrl => {
-                let what = match c {
-                    'r' => "Rerolls",
-                    _ => "The branch tree",
-                };
-                self.flash = Some(format!("{what} isn't built yet."));
+            KeyCode::Char('b') if ctrl => {
+                self.command(":branches");
+                return;
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.flash = Some("Rerolls aren't built yet.".into());
                 return;
             }
             KeyCode::PageUp => {
@@ -1011,7 +1164,7 @@ impl App {
     }
 
     fn panel_key(&mut self, key: KeyEvent) {
-        if self.brain_key(key) || self.xray_key(key) {
+        if self.brain_key(key) || self.xray_key(key) || self.branch_key(key) {
             return;
         }
         let height = self.panel_height.max(1);
@@ -1190,10 +1343,19 @@ impl App {
                     })
                     .collect(),
             },
-            Some(v) => wrap(&v.text)
-                .into_iter()
+            // A selected text line stays highlighted whole when it wraps.
+            Some(v) => v
+                .text
+                .split('\n')
                 .enumerate()
-                .map(|(i, l)| (l, v.selected == Some(i)))
+                .flat_map(|(i, line)| {
+                    let lines = if line.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        wrap(line)
+                    };
+                    lines.into_iter().map(move |l| (l, v.selected == Some(i)))
+                })
                 .collect(),
             None => vec![(EMPTY_PANEL.to_string(), false)],
         }
@@ -1266,12 +1428,18 @@ impl App {
             Focus::Panel if self.brain_row().is_some() => {
                 "↑↓ role · Enter model · e effort · Esc/h back · Tab focus · ? help".into()
             }
+            Focus::Panel if self.branch_row().is_some() => {
+                "↑↓ branch · Enter switch · f fork here · Esc/h back · Tab focus · ? help".into()
+            }
             Focus::Panel => "j/k scroll · g/G top/bottom · / search · n/N next · Esc/h back · \
                              Tab focus · ? help"
                 .into(),
         }
     }
 }
+
+/// Story paragraphs a resumed save, or a branch switched to, opens with.
+pub const RESUME_STORY: usize = 20;
 
 /// The input prompt; it sits in the story's margin.
 pub const PROMPT: &str = "› ";
@@ -1333,6 +1501,11 @@ Story and panel
   Enter             next model (haiku → sonnet → opus)
   e                 next effort (low → medium → high → xhigh → max)
 
+:branches panel (Ctrl-B)
+  ↑ ↓  j k          pick a branch
+  Enter             switch to it
+  f                 fork the game as it stands into a new branch
+
 X-ray panel (Ctrl-X)
   ↑ ↓ / Enter c     select a call / open its context
   [ ]   r s         previous, next turn   reroll, surgery (coming)
@@ -1346,7 +1519,8 @@ Anywhere
   Ctrl-P            toggle the side panel
   Ctrl-L            event log
   Ctrl-X            X-ray panel
-  Ctrl-R Ctrl-B     reroll, branches (coming)
+  Ctrl-B            branches
+  Ctrl-R            reroll (coming)
   Ctrl-C Ctrl-D     quit
 
 Mouse: wheel scrolls, click focuses. :mouse off (or LOAM_MOUSE=0)
@@ -1531,6 +1705,9 @@ pub(crate) mod tests {
         assert_eq!(app.panel.last().unwrap().cmd, ":log");
         app.on_key(ctrl('r'));
         assert!(app.flash.as_deref().unwrap().contains("Rerolls"));
+        // Not a file save: the tree says there are no branches.
+        app.on_key(ctrl('b'));
+        assert!(app.panel.last().unwrap().text.contains("no branches"));
         assert!(app.outbox.is_empty());
     }
 
@@ -1641,6 +1818,128 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Backspace));
         app.on_key(ctrl('u'));
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn the_branch_tree_switches_and_forks() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        let dir = temp_dir("tui-branches");
+        let main = saved_game(&dir, "mill.db");
+        let world = World::open(&main).unwrap();
+        let branch = dir.join("mill.b1.db");
+        let at = world.last_seq().unwrap();
+        let b = world.fork(at, &branch).unwrap();
+        b.set_label("early").unwrap();
+        drop(b);
+        let mut app = App::new(World::open_read_only(&main).unwrap(), true);
+
+        // Ctrl-B opens the tree on the current save, focused.
+        app.on_key(ctrl('b'));
+        assert_eq!(app.focus, Focus::Panel);
+        let top = app.panel.last().unwrap();
+        assert_eq!(top.cmd, ":branches");
+        assert!(top.text.contains("* 1  mill.db"), "{}", top.text);
+        let line = format!("└─ mill.b1.db “early” · from #{at}");
+        assert!(top.text.contains(&line), "{}", top.text);
+        assert_eq!(app.branch_row(), Some(0));
+        assert!(app.hints().contains("Enter switch"));
+        // Enter on the current save says so; ↓ Enter switches.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.flash.as_deref().unwrap().contains("already playing"));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.branch_row(), Some(1));
+        app.on_key(key(KeyCode::Enter));
+        let canonical = std::fs::canonicalize(&branch).unwrap();
+        assert_eq!(app.outbox, [Command::Switch(canonical.clone())]);
+        assert!(app.busy());
+        // While it switches, more switching and forking are refused.
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(app.flash.as_deref().unwrap().contains("still answering"));
+
+        app.info("left behind");
+        app.on_event(Event::Switched {
+            path: canonical.clone(),
+            outcome: Ok("Drowned Chapel. Water everywhere.".into()),
+        });
+        app.on_event(Event::Ready);
+        assert!(!app.story.iter().any(|e| e.text == "left behind"));
+        assert!(app.story[0].text.contains("flooded chapel"));
+        assert!(
+            app.story
+                .last()
+                .unwrap()
+                .text
+                .starts_with("Switched to mill.b1.db.")
+        );
+        let top = app.panel.last().unwrap();
+        assert!(top.text.contains("* 2  └─ mill.b1.db"), "{}", top.text);
+        assert_eq!(app.branch_row(), Some(1));
+
+        // f forks the branch as it stands into the next free name.
+        app.outbox.clear();
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(
+            app.flash.as_deref().unwrap().contains("mill.b2.db"),
+            "{:?}",
+            app.flash
+        );
+        assert!(dir.join("mill.b2.db").exists());
+        assert!(app.panel.last().unwrap().text.contains("mill.b2.db"));
+        assert!(app.outbox.is_empty());
+
+        // :switch by name goes back.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Input);
+        typed(&mut app, ":switch mill");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.outbox,
+            [Command::Switch(std::fs::canonicalize(&main).unwrap())]
+        );
+        drop((app, world));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_switch_returns_to_the_old_save() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        let dir = temp_dir("tui-switch-fail");
+        let main = saved_game(&dir, "mill.db");
+        let world = World::open(&main).unwrap();
+        let branch = dir.join("mill.b1.db");
+        drop(world.fork(2, &branch).unwrap());
+        let mut app = App::new(World::open_read_only(&main).unwrap(), true);
+        typed(&mut app, ":switch 2");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.view.path(),
+            Some(std::fs::canonicalize(&branch).unwrap())
+        );
+        app.on_event(Event::Switched {
+            path: branch.clone(),
+            outcome: Err("locked".into()),
+        });
+        assert_eq!(app.view.path(), Some(std::fs::canonicalize(&main).unwrap()));
+        assert!(app.story.last().unwrap().text.contains("switch failed"));
+        drop((app, world));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_wrapped_selected_row_is_one_source_line() {
+        let mut app = app();
+        app.open_view(":brain", "", "head\na long row that wraps\nlast".into());
+        app.panel.last_mut().unwrap().selected = Some(1);
+        let rows = app.panel_rows(8);
+        let lit: Vec<&str> = rows
+            .iter()
+            .filter(|(_, s)| *s)
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert!(lit.len() > 1, "{rows:?}");
+        assert_eq!(lit.join(" "), "a long row that wraps");
+        assert_eq!(rows.last().unwrap(), &("last".to_string(), false));
     }
 
     #[test]

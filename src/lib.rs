@@ -1,5 +1,6 @@
 //! Loam: a text adventure whose mechanics grow as you play.
 
+pub mod branches;
 pub mod commands;
 pub mod game;
 pub mod glossary;

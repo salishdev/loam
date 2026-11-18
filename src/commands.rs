@@ -13,6 +13,7 @@ use crate::xray;
 /// Every `:` command, for Tab completion and help.
 pub const COMMANDS: &[&str] = &[
     ":brain",
+    ":branches",
     ":context",
     ":fork",
     ":glossary",
@@ -29,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     ":relations",
     ":rules",
     ":stats",
+    ":switch",
     ":tick",
     ":time",
     ":why",
@@ -38,12 +40,14 @@ pub const COMMANDS: &[&str] = &[
 /// The command list `:help` prints.
 pub const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
-:log #<event>, :fork <event> <path>, :tick, :quit
+:log #<event>, :tick, :quit
 
 Workbench (see and steer the models): :xray [on|off] shows each turn's calls, cache use, \
 cost, refusals, rules and rolls; :context [#turn] lists a turn's calls, :context #turn.N \
 [--raw] shows one call's full context (--raw: its JSON); :brain [<role>=<model>] \
-[effort=<level>] | :brain reset shows or changes each role's model and effort.";
+[effort=<level>] | :brain reset shows or changes each role's model and effort; :branches \
+shows this game's saves as a tree, :switch <n|name> plays another, :fork <event> [path.db] \
+[label] makes a new branch.";
 
 /// The commands that start with `prefix` (which starts with `:`), sorted.
 pub fn complete(prefix: &str) -> Vec<&'static str> {
@@ -76,36 +80,79 @@ pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, Stri
         ":time" => inspect::time(world),
         ":pressures" => inspect::pressures(world),
         ":log" => inspect::log(world, arg),
+        ":branches" => branches(world),
         ":fork" => return Some(fork(world, arg)),
         _ => return None,
     };
     Some(result.map_err(|e| format!("[{cmd} unavailable: {e}]")))
 }
 
-/// `:fork <event> <path>`: branch the session at an event into a new save.
-/// `Ok` is what to tell the player (including usage mistakes); `Err` is an
+/// `:branches`: the tree of saves beside this one that share its lineage.
+pub fn branches(world: &World) -> Result<String, StoreError> {
+    let Some(path) = world.path() else {
+        return Ok("This game isn't saved in a file, so it has no branches.".into());
+    };
+    let tree = crate::branches::tree(&crate::branches::scan(&path)?);
+    Ok(format!(
+        "{tree}\n\n* is the save being played. :switch <n|name> plays another; \
+         :fork <event> [path.db] [label] makes a new branch."
+    ))
+}
+
+/// `:fork <event> [path.db] [label…]`: branch the session at an event into
+/// a new save. Without a path (a word ending in `.db`) the branch is named
+/// `<stem>.b<N>.db` beside this save; any other words are its label. `Ok`
+/// is what to tell the player (including usage mistakes); `Err` is an
 /// engine notice.
 pub fn fork(world: &World, arg: &str) -> Result<String, String> {
-    let mut parts = arg.split_whitespace();
-    let (Some(Ok(at)), Some(path), None) = (
-        parts
-            .next()
-            .map(|n| n.trim_start_matches('#').parse::<i64>()),
-        parts.next(),
-        parts.next(),
-    ) else {
-        return Ok("Usage: :fork <event> <path>".into());
+    const USAGE: &str = "Usage: :fork <event> [path.db] [label]";
+    let mut parts = arg.split_whitespace().peekable();
+    let Some(Ok(at)) = parts
+        .next()
+        .map(|n| n.trim_start_matches('#').parse::<i64>())
+    else {
+        return Ok(USAGE.into());
     };
+    let given = parts.next_if(|p| p.ends_with(".db"));
+    let path = match given {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match world.path() {
+            Some(current) => crate::branches::next_path(&current),
+            None => {
+                return Ok(format!(
+                    "{USAGE} (this game has no save file to name it after)"
+                ));
+            }
+        },
+    };
+    let label = parts.collect::<Vec<_>>().join(" ");
     // Checked first so a bad event number doesn't leave an empty save behind.
     match world.last_seq() {
         Ok(last) if (0..=last).contains(&at) => {}
         Ok(last) => return Ok(format!("No event #{at}: the log ends at #{last}.")),
         Err(e) => return Err(format!("[fork failed: {e}]")),
     }
-    match world.fork(at, path) {
-        Ok(_) => Ok(format!(
-            "Forked at event #{at} into {path}; run `loam {path}` to play it."
-        )),
+    if path.exists() {
+        return Ok(format!(
+            "{} already exists; pick another path.",
+            path.display()
+        ));
+    }
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    // An auto-named branch sits beside the save: its name says enough.
+    let shown = given.map_or_else(|| name.clone(), str::to_string);
+    match world.fork(at, &path) {
+        Ok(branch) => {
+            if let Err(e) = branch.set_label(&label) {
+                return Err(format!("[fork made {shown} but couldn't label it: {e}]"));
+            }
+            Ok(format!(
+                "Forked at event #{at} into {shown}; :switch {name} plays it."
+            ))
+        }
         Err(e) => Err(format!("[fork failed: {e}]")),
     }
 }
@@ -247,6 +294,24 @@ pub fn call_text(
     out.push_str("\n\n");
     out.push_str(&tree.text());
     Ok(out)
+}
+
+/// The save a `:switch <n|name>` argument names. `Err` is what to tell the
+/// player: a usage line, no such branch, or it's already being played.
+pub fn switch_target(world: &World, arg: &str) -> Result<std::path::PathBuf, String> {
+    if arg.trim().is_empty() {
+        return Err("Usage: :switch <n|name>; :branches lists them.".into());
+    }
+    let Some(current) = world.path() else {
+        return Err("This game isn't saved in a file, so it has no branches.".into());
+    };
+    let branches =
+        crate::branches::scan(&current).map_err(|e| format!("[:switch unavailable: {e}]"))?;
+    match crate::branches::resolve(&branches, arg) {
+        None => Err(format!("No branch {arg}; :branches lists them.")),
+        Some(b) if b.current => Err(format!("You're already playing {}.", b.name())),
+        Some(b) => Ok(b.path.clone()),
+    }
 }
 
 /// Something the engine says after a turn.
@@ -405,10 +470,65 @@ mod tests {
         }
         assert_eq!(
             report(world, ":fork", ""),
-            Some(Ok("Usage: :fork <event> <path>".into()))
+            Some(Ok("Usage: :fork <event> [path.db] [label]".into()))
         );
         assert_eq!(report(world, ":tick", ""), None);
         assert_eq!(report(world, ":bogus", ""), None);
+    }
+
+    #[test]
+    fn fork_names_labels_and_refuses_clashes() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        let dir = temp_dir("commands-fork");
+        let main = saved_game(&dir, "mill.db");
+        let world = World::open(&main).unwrap();
+        assert_eq!(
+            fork(&world, "#2 the long way round"),
+            Ok("Forked at event #2 into mill.b1.db; :switch mill.b1.db plays it.".to_string())
+        );
+        let b1 = World::open(dir.join("mill.b1.db")).unwrap();
+        assert_eq!(b1.label().unwrap().as_deref(), Some("the long way round"));
+        assert_eq!(b1.forked_at().unwrap(), Some(2));
+        drop(b1);
+        let alt = dir.join("alt.db").display().to_string();
+        assert!(
+            fork(&world, &format!("1 {alt}"))
+                .unwrap()
+                .contains("alt.db")
+        );
+        assert_eq!(World::open(&alt).unwrap().label().unwrap(), None);
+        assert!(
+            fork(&world, &format!("1 {alt}"))
+                .unwrap()
+                .contains("already exists")
+        );
+        assert!(fork(&world, "999").unwrap().starts_with("No event #999"));
+
+        // Plain mode prints the same tree.
+        let text = branches(&world).unwrap();
+        assert!(text.starts_with("* 1  mill.db"), "{text}");
+        assert!(text.contains("├─ alt.db · from #1"), "{text}");
+        assert!(
+            text.contains("└─ mill.b1.db “the long way round” · from #2"),
+            "{text}"
+        );
+        assert_eq!(
+            switch_target(&world, "the long way round").unwrap(),
+            std::fs::canonicalize(dir.join("mill.b1.db")).unwrap()
+        );
+        assert!(
+            switch_target(&world, "1")
+                .unwrap_err()
+                .contains("already playing")
+        );
+        assert!(
+            switch_target(&world, "9")
+                .unwrap_err()
+                .starts_with("No branch 9")
+        );
+        assert!(switch_target(&world, "").unwrap_err().starts_with("Usage"));
+        drop(world);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

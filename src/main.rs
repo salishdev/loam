@@ -129,7 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker = Worker::spawn(game, Box::new(client));
     // Inspectors read through a second, read-only connection.
-    let view = World::open_read_only(&path)?;
+    let mut view = World::open_read_only(&path)?;
     if tui {
         let mut app = App::new(view, loam::tui::mouse_from_env());
         for line in intro {
@@ -141,7 +141,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         match resume {
             Some(text) => {
-                app.load_recent(RESUME_STORY);
+                app.load_recent(loam::tui::app::RESUME_STORY);
                 app.info(text);
             }
             None => app.send(WorkerCommand::Begin),
@@ -229,6 +229,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(notice) => note(&notice),
                 },
+                ":switch" => match commands::switch_target(&view, arg) {
+                    Ok(target) => {
+                        // The view closes before the worker's writer, so the
+                        // writer checkpoints the old save as it closes.
+                        let from = view.path();
+                        view = World::open_read_only(&target)?;
+                        worker.send(WorkerCommand::Switch(target));
+                        if !await_switch(&worker)
+                            && let Some(from) = from
+                        {
+                            view = World::open_read_only(from)?;
+                        }
+                    }
+                    Err(said) => say(&said),
+                },
                 ":help" => say(commands::HELP),
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
@@ -247,9 +262,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     worker.shut_down();
     Ok(())
 }
-
-/// Story paragraphs a resumed save opens with in the TUI.
-const RESUME_STORY: usize = 20;
 
 /// The TUI unless `--plain`, `LOAM_PLAIN=1` or stdout isn't a terminal.
 fn use_tui(plain_flag: bool, plain_env: Option<&str>, terminal: bool) -> bool {
@@ -293,11 +305,35 @@ fn await_worker(worker: &Worker) -> Option<Result<(), GameError>> {
                 }
             }
             WorkerEvent::TickDone { outcome, .. } => note(&commands::tick_notice(&outcome)),
-            WorkerEvent::RerollProgress { .. } => {}
+            WorkerEvent::Switched { .. } | WorkerEvent::RerollProgress { .. } => {}
             WorkerEvent::Ready => break,
         }
     }
     fatal
+}
+
+/// Plain mode: report a branch switch; `false` if it failed and the old
+/// save is still being played.
+fn await_switch(worker: &Worker) -> bool {
+    let mut switched = false;
+    while let Some(event) = worker.recv() {
+        match event {
+            WorkerEvent::Switched { path, outcome } => match outcome {
+                Ok(look) => {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    say(&format!("Switched to {name}.\n\n{look}"));
+                    switched = true;
+                }
+                Err(e) => note(&format!("[switch failed: {e}]")),
+            },
+            WorkerEvent::Ready => break,
+            _ => {}
+        }
+    }
+    switched
 }
 
 const USAGE: &str = "Usage: loam [--plain] [--seed <name|file> | --prompt <text>] [save.db]

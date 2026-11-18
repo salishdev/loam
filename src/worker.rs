@@ -9,11 +9,13 @@
 //!
 //! [`World::open_read_only`]: crate::world::World::open_read_only
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
 use crate::game::{Game, GameError, TickOutcome, TurnOutcome};
 use crate::llm::{Brains, LlmClient};
+use crate::world::World;
 
 /// What a front end asks the worker to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +32,9 @@ pub enum Command {
     /// model and, unlike the other commands, reports nothing: not even
     /// [`Event::Ready`].
     SetBrains(Brains),
+    /// Close the current save and play the one at this path instead (a
+    /// branch). The game's brains and other session settings carry over.
+    Switch(PathBuf),
     /// Stop the worker; the game and its save are dropped.
     Quit,
 }
@@ -50,6 +55,13 @@ pub enum Event {
     TickDone {
         forced: bool,
         outcome: Result<TickOutcome, GameError>,
+    },
+    /// [`Command::Switch`] finished: what the player sees in the branch
+    /// now (as on resuming), or why it couldn't be opened, in which case
+    /// the old save is still the one being played.
+    Switched {
+        path: PathBuf,
+        outcome: Result<String, String>,
     },
     /// Progress of a reroll's variants (filled in by the reroll work).
     RerollProgress { done: usize, of: usize },
@@ -149,11 +161,30 @@ fn serve(game: Game, client: &dyn LlmClient, inbox: &Receiver<Command>, out: &Se
                     outcome: game.tick(client),
                 });
             }
+            Command::Switch(path) => {
+                let outcome = switch(&mut game, &path);
+                let _ = out.send(Event::Switched { path, outcome });
+            }
         }
         if out.send(Event::Ready).is_err() {
             break;
         }
     }
+}
+
+/// Open the save at `path` and play it in place of the current one; the
+/// text is what the player sees there.
+fn switch(game: &mut Game, path: &std::path::Path) -> Result<String, String> {
+    if !path.is_file() {
+        return Err(format!("no save at {}", path.display()));
+    }
+    let world = World::open(path).map_err(|e| e.to_string())?;
+    // The old save closes here, after the new one opened.
+    drop(game.switch_world(world));
+    // Switched either way; a branch forked before the opening has no scene.
+    Ok(game
+        .look()
+        .unwrap_or_else(|e| format!("[nothing to see here yet: {e}]")))
 }
 
 #[cfg(test)]
@@ -296,6 +327,54 @@ mod tests {
             }
         )));
         worker.shut_down();
+    }
+
+    #[test]
+    fn switch_plays_the_other_save_and_keeps_the_brains() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        use crate::llm::{Brains, Model};
+        let dir = temp_dir("worker-switch");
+        let main = saved_game(&dir, "mill.db");
+        let world = World::open(&main).unwrap();
+        let branch = dir.join("mill.b1.db");
+        drop(world.fork(world.last_seq().unwrap(), &branch).unwrap());
+        let client = ScriptedClient::new([Response::canned_text("Reeds whisper.")]);
+        let worker = Worker::spawn(Game::new(world), Box::new(client));
+        let mut brains = Brains::default();
+        brains.change("director=haiku").unwrap();
+        worker.send(Command::SetBrains(brains));
+
+        // A missing save is refused and the old one is still played.
+        worker.send(Command::Switch(dir.join("nope.db")));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::Switched { outcome: Err(e), .. } if e.contains("no save")),
+            "{events:?}"
+        );
+        assert!(!dir.join("nope.db").exists());
+
+        let before = World::open_read_only(&main).unwrap().last_seq().unwrap();
+        worker.send(Command::Switch(branch.clone()));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::Switched { path, outcome: Ok(look) }
+                if *path == branch && look.contains("Drowned Chapel")),
+            "{events:?}"
+        );
+        worker.send(Command::Turn("listen".into()));
+        until_ready(&worker);
+        worker.shut_down();
+        // The turn went into the branch; the original is unchanged.
+        assert_eq!(World::open(&main).unwrap().last_seq().unwrap(), before);
+        let played = World::open(&branch).unwrap();
+        let log = crate::inspect::log(&played, "narration").unwrap();
+        assert!(log.contains("Reeds whisper"), "{log}");
+        // The brains carried over into the branch's records.
+        let calls = played.calls().unwrap();
+        let director = calls.iter().rfind(|c| c.call.role == "director").unwrap();
+        assert_eq!(director.call.model, Model::Haiku.id());
+        drop(played);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
