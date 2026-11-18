@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{App, Areas, DIRECTOR_MODEL, Focus, KEYS, Kind, PROMPT};
+use super::app::{App, Areas, Focus, KEYS, Kind, PROMPT};
 
 /// Width of the side panel beside the story.
 fn panel_width(total: u16) -> u16 {
@@ -164,15 +164,19 @@ fn draw_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         .map_or(0, |v| v.scroll)
         .min(lines.len().saturating_sub(1));
     let query = search_query(app, Focus::Panel);
+    let selected = app.panel.last().and_then(|v| v.selected);
     let shown: Vec<Line> = lines
         .into_iter()
+        .enumerate()
         .skip(scroll)
         .take(inner.height as usize)
-        .map(|text| {
+        .map(|(i, text)| {
             let hit = query
                 .as_ref()
                 .is_some_and(|q| text.to_lowercase().contains(q));
-            if hit {
+            if selected == Some(i) {
+                Line::styled(text, Style::new().add_modifier(Modifier::REVERSED))
+            } else if hit {
                 Line::styled(text, Style::new().bg(Color::Yellow).fg(Color::Black))
             } else {
                 Line::from(text)
@@ -193,7 +197,7 @@ pub fn status_text(app: &App) -> String {
     if let Some(room) = &s.room {
         parts.push(room.clone());
     }
-    parts.push(format!("director {DIRECTOR_MODEL}"));
+    parts.push(format!("director {}", app.brains.director_model()));
     parts.push(format!("${:.3}", s.cost_usd));
     if app.busy() {
         parts.push("● the world is answering…".into());
@@ -297,6 +301,32 @@ mod tests {
         assert!(rows[0].starts_with("  You wake"), "{}", rows[0]);
         assert!(rows[0].contains(":quests"), "{}", rows[0]);
         assert!(a.areas.story.is_some() && a.areas.panel.is_some());
+    }
+
+    #[test]
+    fn the_brain_panel_shows_the_table_and_the_status_bar_the_director() {
+        let mut a = app();
+        typed(&mut a, ":brain");
+        a.on_key(key(KeyCode::Enter));
+        a.on_key(key(KeyCode::Enter)); // director: sonnet → opus
+        let rows = render(&mut a, 140, 14);
+        let text = screen(&rows);
+        assert!(rows[0].contains(":brain"), "{text}");
+        let director = rows.iter().find(|r| r.contains("director  ")).unwrap();
+        assert!(director.contains("* director   opus    medium"), "{text}");
+        assert!(text.contains("interpret  haiku   default"), "{text}");
+        assert!(text.contains("tick       sonnet  medium"), "{text}");
+        assert!(rows[11].contains("director opus"), "{}", rows[11]);
+        assert!(rows[13].contains("e effort"), "{}", rows[13]);
+
+        // The selected row is drawn reversed.
+        let mut terminal = Terminal::new(TestBackend::new(140, 14)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let y = rows.iter().position(|r| r.contains("* director")).unwrap() as u16;
+        let row = &rows[y as usize];
+        let x = row[..row.find("* director").unwrap()].chars().count() as u16;
+        assert!(buf[(x, y)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

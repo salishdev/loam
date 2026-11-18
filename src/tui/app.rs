@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::{Position, Rect};
 
 use crate::commands::{self, Notice, Recent, Status};
+use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::worker::{Command, Event};
 use crate::world::World;
 
@@ -47,6 +48,8 @@ pub struct PanelView {
     pub text: String,
     /// First visible line.
     pub scroll: usize,
+    /// The highlighted line, in views with rows to pick (`:brain`).
+    pub selected: Option<usize>,
 }
 
 impl PanelView {
@@ -78,15 +81,15 @@ pub struct Areas {
 /// beside it.
 pub const OVERLAY_BELOW: u16 = 120;
 
-/// The director's model, until per-role brains land (loam-68v.3).
-pub const DIRECTOR_MODEL: &str = "sonnet";
-
 pub struct App {
     /// The read-only view of the save.
     view: World,
     /// The last call id before this session, for the session's cost.
     since_call: i64,
     pub status: Status,
+    /// Each role's model and effort this session; the worker gets a copy
+    /// whenever it changes.
+    pub brains: Brains,
     pub story: Vec<Entry>,
     /// Narration is streaming into the last story entry.
     streaming: bool,
@@ -131,6 +134,7 @@ impl App {
             view,
             since_call,
             status: Status::default(),
+            brains: Brains::default(),
             story: Vec::new(),
             streaming: false,
             story_scroll: 0,
@@ -288,6 +292,7 @@ impl App {
             arg: arg.to_string(),
             text,
             scroll: 0,
+            selected: None,
         };
         // The same report again replaces itself rather than stacking.
         if self
@@ -299,6 +304,51 @@ impl App {
         }
         self.panel.push(view);
         self.panel_open = true;
+    }
+
+    /// Open (or redraw) the `:brain` table with `row` selected.
+    fn show_brains(&mut self, row: usize) {
+        self.open_view(":brain", "", self.brains.table());
+        if let Some(v) = self.panel.last_mut() {
+            v.selected = Some(TABLE_HEADER_LINES + row);
+        }
+    }
+
+    /// The selected role's row, while the `:brain` view is on top.
+    fn brain_row(&self) -> Option<usize> {
+        let top = self.panel.last().filter(|v| v.cmd == ":brain")?;
+        top.selected?.checked_sub(TABLE_HEADER_LINES)
+    }
+
+    /// Hand the worker a copy of the changed brains.
+    fn brains_changed(&mut self) {
+        // Not `send`: the worker reports nothing for it, so it isn't pending.
+        self.outbox.push(Command::SetBrains(self.brains.clone()));
+    }
+
+    /// Keys in the `:brain` view; `false` when the key isn't one of them.
+    fn brain_key(&mut self, key: KeyEvent) -> bool {
+        let Some(row) = self.brain_row() else {
+            return false;
+        };
+        let rows = self.brains.iter().count();
+        let row = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => (row + 1).min(rows - 1),
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let role = self.brains.role_at(row).expect("a row per role");
+                if key.code == KeyCode::Enter {
+                    self.brains.cycle_model(role);
+                } else {
+                    self.brains.cycle_effort(role);
+                }
+                self.brains_changed();
+                row
+            }
+            _ => return false,
+        };
+        self.show_brains(row);
+        true
     }
 
     /// Esc or `h` in the panel: back one view; past the first, close it.
@@ -359,6 +409,18 @@ impl App {
             ":quit" | ":q" => self.quit = true,
             ":help" => self.open_view(":help", "", help_text()),
             ":panel" => self.toggle_panel(),
+            ":brain" if arg.is_empty() => {
+                self.show_brains(0);
+                self.focus = Focus::Panel;
+            }
+            ":brain" => match self.brains.change(arg) {
+                Ok(()) => {
+                    self.brains_changed();
+                    let row = self.brain_row().unwrap_or(0);
+                    self.show_brains(row);
+                }
+                Err(e) => self.flash = Some(e),
+            },
             ":mouse" => match arg {
                 "on" => self.mouse = true,
                 "off" => self.mouse = false,
@@ -601,6 +663,9 @@ impl App {
     }
 
     fn panel_key(&mut self, key: KeyEvent) {
+        if self.brain_key(key) {
+            return;
+        }
         let height = self.panel_height.max(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.panel_back(),
@@ -799,6 +864,9 @@ impl App {
             Focus::Story => "j/k scroll · g/G top/bottom · / search · n/N next · Tab focus · \
                              Esc input · ? help"
                 .into(),
+            Focus::Panel if self.brain_row().is_some() => {
+                "↑↓ role · Enter model · e effort · Esc/h back · Tab focus · ? help".into()
+            }
             Focus::Panel => "j/k scroll · g/G top/bottom · / search · n/N next · Esc/h back · \
                              Tab focus · ? help"
                 .into(),
@@ -856,6 +924,11 @@ Story and panel
   Esc h             back (the panel pops one view)
   ?                 this help
 
+:brain panel
+  ↑ ↓  j k          pick a role
+  Enter             next model (haiku → sonnet → opus)
+  e                 next effort (low → medium → high → xhigh → max)
+
 Anywhere
   PgUp PgDn         scroll the story
   Ctrl-P            toggle the side panel
@@ -904,6 +977,50 @@ pub(crate) mod tests {
         assert_eq!(app.input, "open the door");
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn brain_changes_by_command_and_by_key_reach_the_worker() {
+        use crate::llm::{Brains, Effort, Model};
+        let mut app = app();
+        typed(&mut app, ":brain director=opus effort=high");
+        app.on_key(key(KeyCode::Enter));
+        let mut want = Brains::default();
+        want.change("director=opus effort=high").unwrap();
+        assert_eq!(app.outbox, [Command::SetBrains(want.clone())]);
+        assert!(!app.busy(), "SetBrains has no Ready to wait for");
+        assert_eq!(app.panel.last().unwrap().cmd, ":brain");
+
+        // A bad change is reported and changes nothing.
+        typed(&mut app, ":brain director=gpt");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.flash.as_deref().unwrap().starts_with("Unknown model"));
+        assert_eq!(app.brains, want);
+        assert_eq!(app.outbox.len(), 1);
+
+        // Bare :brain focuses the table; ↓ picks the narrator, Enter and e
+        // cycle its model and effort.
+        typed(&mut app, ":brain");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Panel);
+        assert!(app.hints().contains("Enter model"));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('e')));
+        let narrator = app.brains.get("narrator").unwrap();
+        assert_eq!(narrator.model, Model::Opus);
+        assert_eq!(narrator.effort, Some(Effort::Low));
+        assert_eq!(
+            app.outbox.last(),
+            Some(&Command::SetBrains(app.brains.clone()))
+        );
+        // ↑ past the first row stays there; Esc leaves the view.
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Up));
+        }
+        assert_eq!(app.brain_row(), Some(0));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.brain_row(), None);
     }
 
     #[test]

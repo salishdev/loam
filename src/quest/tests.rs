@@ -286,7 +286,8 @@ fn quest_is_spawned_recorded_and_judged_complete() {
     assert_eq!(logged[1]["verdict"], "complete");
     assert_eq!(logged[1]["reason"], "Hal holds the full bucket.");
     assert_eq!(logged[1]["touched"], json!([bucket]));
-    assert_eq!(logged[1]["model"], Model::Haiku.id());
+    // The model the response names (the scripted client's).
+    assert_eq!(logged[1]["model"], "fake");
 
     // A resolved quest is no longer judged, and can't be escalated.
     client.push(Response::canned_tool_use(

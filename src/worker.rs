@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
 use crate::game::{Game, GameError, TickOutcome, TurnOutcome};
-use crate::llm::LlmClient;
+use crate::llm::{Brains, LlmClient};
 
 /// What a front end asks the worker to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +26,10 @@ pub enum Command {
     Turn(String),
     /// Run a world tick now (`:tick`).
     Tick,
+    /// Use these brains from the next command on (`:brain`). Calls no
+    /// model and, unlike the other commands, reports nothing: not even
+    /// [`Event::Ready`].
+    SetBrains(Brains),
     /// Stop the worker; the game and its save are dropped.
     Quit,
 }
@@ -109,6 +113,10 @@ fn serve(game: Game, client: &dyn LlmClient, inbox: &Receiver<Command>, out: &Se
         };
         match command {
             Command::Quit => break,
+            Command::SetBrains(brains) => {
+                game.set_brains(brains);
+                continue;
+            }
             Command::CreateBible(seed) => {
                 let _ = out.send(Event::BibleDone(game.create_bible(client, &seed)));
             }
@@ -196,6 +204,39 @@ mod tests {
             .unwrap();
         assert!(last_text < done, "{events:?}");
         assert!(matches!(events.last(), Some(Event::Ready)));
+        worker.shut_down();
+    }
+
+    #[test]
+    fn set_brains_applies_to_the_next_turn_and_reports_nothing() {
+        use crate::llm::{Brains, Model};
+        use std::sync::{Arc, Mutex};
+        // Shares the scripted client so the test can read what was sent.
+        struct Shared(Arc<Mutex<ScriptedClient>>);
+        impl LlmClient for Shared {
+            fn send(
+                &self,
+                request: &crate::llm::Request,
+                on_text: &mut dyn FnMut(&str),
+            ) -> Result<crate::llm::Response, crate::llm::LlmError> {
+                self.0.lock().unwrap().send(request, on_text)
+            }
+        }
+        let (game, _) = begun();
+        let scripted = Arc::new(Mutex::new(ScriptedClient::new([Response::canned_text(
+            "The candle gutters.",
+        )])));
+        let worker = Worker::spawn(game, Box::new(Shared(scripted.clone())));
+        let mut brains = Brains::default();
+        brains.change("director=haiku").unwrap();
+        worker.send(Command::SetBrains(brains));
+        worker.send(Command::Turn("look".into()));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(events[0], Event::Text(_)),
+            "no event for SetBrains: {events:?}"
+        );
+        assert_eq!(scripted.lock().unwrap().requests()[0].model, Model::Haiku);
         worker.shut_down();
     }
 

@@ -534,6 +534,12 @@ mod tests {
         assert_eq!(sonnet["fallbacks"], "default");
         assert!(sonnet.get("tools").is_none() && sonnet.get("system").is_none());
         assert_eq!(sonnet["cache_control"], json!({"type": "ephemeral"}));
+
+        let opus =
+            request_body(&Request::new(Model::Opus, vec![Message::user("hi")]).effort(Effort::Max));
+        assert_eq!(opus["model"], "claude-opus-5-5");
+        assert_eq!(opus["fallbacks"], "default");
+        assert_eq!(opus["output_config"], json!({"effort": "max"}));
     }
 
     #[test]

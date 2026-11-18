@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use super::exits;
 use super::*;
-use crate::llm::{ContentBlock, Response, ScriptedClient, ToolOutput, ToolUse};
+use crate::llm::{ContentBlock, Model, Response, ScriptedClient, ToolOutput, ToolUse};
 
 const SECRET: &str = "The abbot drowned the bell to hide the ledger";
 
@@ -2899,4 +2899,37 @@ fn calls_made_before_a_turn_fails_are_still_recorded() {
     let calls = game.world().calls().unwrap();
     assert_eq!(calls.len(), before + 1);
     assert_eq!(calls.last().unwrap().call.role, "director");
+}
+
+#[test]
+fn brains_reach_the_request_and_the_call_record() {
+    let (mut game, _) = begun();
+    let mut brains = crate::llm::Brains::default();
+    brains.change("director=opus effort=max").unwrap();
+    game.set_brains(brains);
+    let client = ScriptedClient::new([Response::canned_text("The candle gutters.")]);
+    game.turn(&client, "look", &mut |_| {}).unwrap();
+    let sent = client.requests();
+    assert_eq!(sent[0].model, Model::Opus);
+    assert_eq!(sent[0].effort, Some(crate::llm::Effort::Max));
+    let seq = game
+        .world()
+        .last_event(EventKind::Input)
+        .unwrap()
+        .unwrap()
+        .seq;
+    let calls = game.world().turn_calls(seq).unwrap();
+    assert_eq!(calls[0].call.role, "director");
+    assert_eq!(calls[0].call.model, "claude-opus-5-5");
+    assert_eq!(calls[0].call.effort.as_deref(), Some("max"));
+    assert_eq!(calls[0].call.request["model"], "claude-opus-5-5");
+
+    // Unchanged roles keep their defaults; recording off still applies them.
+    game.set_recording(false);
+    game.set_brains(crate::llm::Brains::default());
+    client.push(Response::canned_text("Still dark."));
+    game.turn(&client, "wait", &mut |_| {}).unwrap();
+    let last = client.requests().pop().unwrap();
+    assert_eq!(last.model, Model::Sonnet);
+    assert_eq!(last.effort, Some(crate::llm::Effort::Medium));
 }

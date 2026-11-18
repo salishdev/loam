@@ -11,6 +11,7 @@ use crate::world::{EventKind, StoreError, World};
 
 /// Every `:` command, for Tab completion and help.
 pub const COMMANDS: &[&str] = &[
+    ":brain",
     ":fork",
     ":glossary",
     ":help",
@@ -34,7 +35,8 @@ pub const COMMANDS: &[&str] = &[
 /// The command list `:help` prints.
 pub const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
-:log #<event>, :fork <event> <path>, :tick, :quit";
+:log #<event>, :fork <event> <path>, :tick, :brain [<role>=<model>] [effort=<level>] | \
+:brain reset, :quit";
 
 /// The commands that start with `prefix` (which starts with `:`), sorted.
 pub fn complete(prefix: &str) -> Vec<&'static str> {

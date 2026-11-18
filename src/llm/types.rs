@@ -14,6 +14,8 @@ pub enum Model {
     Haiku,
     /// Director and narrator.
     Sonnet,
+    /// The most capable; only by `:brain`.
+    Opus,
     /// Any other model ID, passed through as-is.
     Custom(String),
 }
@@ -23,13 +25,32 @@ impl Model {
         match self {
             Model::Haiku => "claude-haiku-5-5",
             Model::Sonnet => "claude-sonnet-5-5",
+            Model::Opus => "claude-opus-5-5",
             Model::Custom(id) => id,
         }
     }
 
+    /// The models `:brain` offers, smallest first.
+    pub const CHOICES: [Model; 3] = [Model::Haiku, Model::Sonnet, Model::Opus];
+
+    /// The short name `:brain` uses (`haiku`), or the id of a custom model.
+    pub fn name(&self) -> &str {
+        match self {
+            Model::Haiku => "haiku",
+            Model::Sonnet => "sonnet",
+            Model::Opus => "opus",
+            Model::Custom(id) => id,
+        }
+    }
+
+    /// One of the short names in [`Model::CHOICES`].
+    pub fn parse(name: &str) -> Option<Model> {
+        Model::CHOICES.into_iter().find(|m| m.name() == name)
+    }
+
     /// Whether the API offers server-side refusal fallback for this model.
     pub(crate) fn supports_server_fallback(&self) -> bool {
-        matches!(self, Model::Sonnet)
+        matches!(self, Model::Sonnet | Model::Opus)
     }
 }
 
@@ -142,15 +163,32 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 impl Effort {
+    /// Every level, lowest first (all of them work on the 5.5 models).
+    pub const ALL: [Effort; 5] = [
+        Effort::Low,
+        Effort::Medium,
+        Effort::High,
+        Effort::Xhigh,
+        Effort::Max,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
         }
+    }
+
+    pub fn parse(name: &str) -> Option<Effort> {
+        Effort::ALL.into_iter().find(|e| e.as_str() == name)
     }
 }
 

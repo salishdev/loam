@@ -5,6 +5,7 @@
 //! (checked 2026-11-13), so this is a thin `reqwest` + `serde` client.
 
 mod anthropic;
+mod brain;
 mod fake;
 mod price;
 mod record;
@@ -12,6 +13,7 @@ mod tool_loop;
 mod types;
 
 pub use anthropic::AnthropicClient;
+pub use brain::{Brain, BrainClient, Brains, TABLE_HEADER_LINES};
 pub use fake::ScriptedClient;
 pub use price::{Price, cost_usd, price};
 pub use record::{CallRecord, RecordingClient};

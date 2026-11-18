@@ -15,7 +15,7 @@ use std::fmt::Write;
 
 use serde_json::{Value, json};
 
-use crate::llm::{Effort, LlmClient, Message, Model, Request, ToolOutput, ToolUse};
+use crate::llm::{LlmClient, Message, Request, ToolOutput, ToolUse};
 use crate::world::{EntityId, EntityRef, Event, EventKind, Patch, StoreError, World};
 
 use super::exits::explored_rooms;
@@ -119,10 +119,8 @@ impl Game {
         let turn = turns_since(&self.world, 0)?;
         let minute = time::now(&self.world)?.0;
         let slice = tick_slice(&self.world)?;
-        let request = Request::new(Model::Sonnet, vec![Message::user(slice)])
+        let request = Request::for_role("tick", vec![Message::user(slice)])
             .system(tick_system())
-            .role("tick")
-            .effort(Effort::Medium)
             .tools(definitions(Phase::Tick));
         let mut changes = Vec::new();
         let outcome = self.run(

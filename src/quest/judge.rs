@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{CONCERNS_REL, Quest, Status, quests, resolve};
-use crate::llm::{LlmClient, Message, Model, Request, ToolDefinition};
+use crate::llm::{LlmClient, Message, Request, ToolDefinition};
 use crate::world::{Cascaded, EntityId, EventKind, StoreError, World};
 
 /// The tool the judge answers with.
@@ -111,19 +111,26 @@ pub fn judge_turn(
     let mut judgments = Vec::new();
     for q in due {
         let prompt = judge_prompt(world, &q, &touched, input, &changes, narration)?;
-        let request = Request::new(Model::Haiku, vec![Message::user(prompt)])
+        let request = Request::for_role("judge", vec![Message::user(prompt)])
             .system(JUDGE_SYSTEM)
-            .role("judge")
             .max_tokens(2_000)
             .tools(vec![judge_tool()]);
+        // The model that answered (`:brain` may have changed the request
+        // on its way); the requested one when the call failed.
+        let mut model = request.model.id().to_owned();
         let (ruling, error) = match client.complete(&request) {
-            Ok(response) => match response.tool_uses().find(|t| t.name == JUDGE_TOOL) {
-                Some(call) => match serde_json::from_value::<JudgeInput>(call.input.clone()) {
-                    Ok(r) => (Some(r), None),
-                    Err(e) => (None, Some(format!("bad verdict: {e}"))),
-                },
-                None => (None, Some("the judge gave no verdict".to_owned())),
-            },
+            Ok(response) => {
+                if !response.model.is_empty() {
+                    model = response.model.clone();
+                }
+                match response.tool_uses().find(|t| t.name == JUDGE_TOOL) {
+                    Some(call) => match serde_json::from_value::<JudgeInput>(call.input.clone()) {
+                        Ok(r) => (Some(r), None),
+                        Err(e) => (None, Some(format!("bad verdict: {e}"))),
+                    },
+                    None => (None, Some("the judge gave no verdict".to_owned())),
+                }
+            }
             Err(e) => (None, Some(format!("judge call failed: {e}"))),
         };
         let (verdict, reason) = match ruling {
@@ -137,7 +144,7 @@ pub fn judge_turn(
             "verdict": verdict.as_str(),
             "reason": reason,
             "touched": q.concerns.iter().filter(|c| touched.contains(c)).collect::<Vec<_>>(),
-            "model": Model::Haiku.id(),
+            "model": model,
         });
         if let Some(error) = &error {
             payload["error"] = json!(error);

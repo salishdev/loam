@@ -7,7 +7,7 @@ use std::fmt::Write;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::llm::{LlmClient, Message, Model, Request, ToolDefinition};
+use crate::llm::{LlmClient, Message, Request, ToolDefinition};
 use crate::rules::{self, Bindings, Refusal, Rule, RuleId, Scope};
 use crate::time::Bucket;
 use crate::world::{EventKind, StoreError, World};
@@ -117,9 +117,8 @@ pub(crate) fn interpret(
         writeln!(prompt, "{}", rule.summary()).unwrap();
     }
     write!(prompt, "\nPlayer input: {input}").unwrap();
-    let request = Request::new(Model::Haiku, vec![Message::user(prompt)])
+    let request = Request::for_role("interpret", vec![Message::user(prompt)])
         .system(INTERPRETER_SYSTEM)
-        .role("interpret")
         .max_tokens(INTERPRETER_MAX_TOKENS)
         .tools(vec![interpret_def()]);
     // The interpreter is an optimisation: if it fails, the director decides.
@@ -334,9 +333,8 @@ pub(crate) fn narrate(
             .unwrap();
         }
     }
-    let request = Request::new(Model::Sonnet, vec![Message::user(prompt)])
+    let request = Request::for_role("narrator", vec![Message::user(prompt)])
         .system(NARRATOR_SYSTEM)
-        .role("narrator")
         .max_tokens(NARRATOR_MAX_TOKENS);
     Ok(client.send(&request, on_text)?)
 }

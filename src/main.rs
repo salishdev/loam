@@ -171,6 +171,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // `:brain` changes, for this session only; the worker gets a copy.
+    let mut brains = loam::llm::Brains::default();
     loop {
         println!();
         let Some(line) = editor.read_line(PROMPT)? else {
@@ -194,6 +196,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":tick" => {
                     worker.send(WorkerCommand::Tick);
                     await_worker(&worker);
+                }
+                ":brain" => {
+                    if !arg.is_empty() {
+                        if let Err(e) = brains.change(arg) {
+                            say(&e);
+                            continue;
+                        }
+                        worker.send(WorkerCommand::SetBrains(brains.clone()));
+                    }
+                    say(&brains.table());
                 }
                 ":help" => say(commands::HELP),
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),

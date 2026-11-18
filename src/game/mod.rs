@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use crate::inventory::{DEFAULT_SLOTS, Inventory};
 use crate::llm::ToolUse;
 use crate::llm::{
-    Effort, LlmClient, LlmError, Message, Model, RecordingClient, Request, StopReason, ToolOutput,
-    run_tool_loop,
+    BrainClient, Brains, LlmClient, LlmError, Message, RecordingClient, Request, StopReason,
+    ToolOutput, run_tool_loop,
 };
 use crate::quest::{self, Judgment, Quest};
 use crate::rules::{self, RuleId, Scope};
@@ -147,6 +147,8 @@ pub struct Game {
     dice_seed: Option<u64>,
     /// Whether model calls are recorded in the store.
     recording: bool,
+    /// Each role's model and effort for this session (`:brain`).
+    brains: Brains,
 }
 
 /// Which turn a batch of model calls belongs to.
@@ -166,7 +168,14 @@ impl Game {
             inventory: Inventory::new(DEFAULT_SLOTS, stats::carry_limit),
             dice_seed: None,
             recording: true,
+            brains: Brains::default(),
         }
+    }
+
+    /// Give each role the model and effort in `brains` from the next call
+    /// on. Session-only: nothing is saved.
+    pub fn set_brains(&mut self, brains: Brains) {
+        self.brains = brains;
     }
 
     /// Turn recording of model calls on or off (on by default; `LOAM_RECORD=0`
@@ -175,7 +184,8 @@ impl Game {
         self.recording = on;
     }
 
-    /// Run `f` with `client` wrapped in a [`RecordingClient`], then store
+    /// Run `f` with `client` wrapped in a [`BrainClient`] (outside a
+    /// [`RecordingClient`], so the records show the brains used), then store
     /// every call it made, even when `f` fails part way.
     fn recorded<T>(
         &mut self,
@@ -183,11 +193,12 @@ impl Game {
         calls_for: CallsFor,
         f: impl FnOnce(&mut Self, &dyn LlmClient) -> Result<T, GameError>,
     ) -> Result<T, GameError> {
+        let brains = self.brains.clone();
         if !self.recording {
-            return f(self, client);
+            return f(self, &BrainClient::new(&brains, client));
         }
         let recorder = RecordingClient::new(client);
-        let result = f(self, &recorder);
+        let result = f(self, &BrainClient::new(&brains, &recorder));
         let calls = recorder.take();
         let stored = match calls_for {
             _ if calls.is_empty() => Ok(()),
@@ -249,10 +260,8 @@ impl Game {
     fn write_bible(&mut self, client: &dyn LlmClient, seed: &str) -> Result<(), GameError> {
         self.world
             .log_event(EventKind::Input, &json!({"text": seed, "seed": true}))?;
-        let request = Request::new(Model::Sonnet, vec![Message::user(seed)])
+        let request = Request::for_role("bible", vec![Message::user(seed)])
             .system(BIBLE_SYSTEM)
-            .role("bible")
-            .effort(Effort::Medium)
             .tools(tools::definitions(Phase::Bible));
         self.run(
             client,
@@ -417,13 +426,11 @@ impl Game {
         // Pressures go to the director only, never to the narrator or the
         // interpreter, which share the slice.
         let pressures = pressure_section(&self.world)?;
-        let request = Request::new(
-            Model::Sonnet,
+        let request = Request::for_role(
+            "director",
             vec![Message::user(format!("{slice}{pressures}\n{instruction}"))],
         )
         .system(DIRECTOR_SYSTEM)
-        .role("director")
-        .effort(Effort::Medium)
         .tools(tools::definitions(Phase::Play));
         let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text, None)?;
         let mut result = self.finish(client, &outcome.final_response, turn)?;

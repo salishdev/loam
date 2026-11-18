@@ -43,6 +43,13 @@ back, and `?` shows every key. The mouse wheel scrolls and a click focuses;
 `:mouse off` or `LOAM_MOUSE=0` gives you back the terminal's own text
 selection.
 
+`:brain` shows which model (haiku, sonnet or opus) and effort each role
+uses: the director, the narrator, the interpreter, the quest judge, world
+ticks and the bible. `:brain director=opus effort=high` or
+`:brain interpret=sonnet` changes a role for this session; in the panel, Enter
+cycles the selected role's model and `e` its effort. `:brain reset` restores
+the defaults, which are also what a new session starts with.
+
 `loam --plain` (or `LOAM_PLAIN=1`, or piping stdout) plays the same game as
 a plain line-by-line prompt.
 
