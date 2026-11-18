@@ -173,6 +173,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // `:brain` changes, for this session only; the worker gets a copy.
     let mut brains = loam::llm::Brains::default();
+    let mut xray_on = commands::xray_from_env(std::env::var("LOAM_XRAY").ok().as_deref());
     loop {
         println!();
         let Some(line) = editor.read_line(PROMPT)? else {
@@ -207,14 +208,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     say(&brains.table());
                 }
+                ":xray" => match commands::xray_switch(arg, xray_on) {
+                    Ok(on) => {
+                        xray_on = on;
+                        say(if on {
+                            "X-ray on: each turn ends with its calls, cost, refusals, rules and rolls."
+                        } else {
+                            "X-ray off."
+                        });
+                    }
+                    Err(usage) => say(usage),
+                },
+                ":context" => match commands::context(&view, arg) {
+                    Ok(commands::ContextReport::Text(text)) => say(&text),
+                    Ok(commands::ContextReport::Call { seq, n, call, raw }) => {
+                        match commands::call_text(&view, seq, n, &call, raw) {
+                            Ok(text) => page(&text),
+                            Err(notice) => note(&notice),
+                        }
+                    }
+                    Err(notice) => note(&notice),
+                },
                 ":help" => say(commands::HELP),
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
             continue;
         }
         println!();
+        let before = loam::xray::latest_turn(&view).ok().flatten();
         worker.send(WorkerCommand::Turn(input.to_string()));
         await_worker(&worker);
+        if let Some(footer) = commands::xray_footer(&view, before, xray_on) {
+            note(&format!("\n{footer}"));
+        }
     }
     // The writer must close last so it checkpoints the WAL into the save.
     drop(view);
@@ -292,6 +318,8 @@ const USAGE: &str = "Usage: loam [--plain] [--seed <name|file> | --prompt <text>
 
   In the TUI the mouse is captured (wheel scrolls, click focuses);
   LOAM_MOUSE=0 or :mouse off restores native text selection.
+
+  LOAM_XRAY=1 starts plain mode with the X-ray footer on (:xray toggles it).
 
   Text wraps at 80 columns or the terminal width, whichever is narrower;
   set LOAM_WIDTH to another width, or to 0 to turn wrapping off.";
@@ -638,6 +666,35 @@ fn say(text: &str) {
         "{}",
         wrap_with_margin(text, output_width(), output_margin())
     );
+}
+
+/// Shows long text through `$PAGER` (default `less -FRX`) when stdout is a
+/// terminal, else prints it.
+fn page(text: &str) {
+    if !io::stdout().is_terminal() {
+        println!("{text}");
+        return;
+    }
+    let pager = std::env::var("PAGER")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "less -FRX".into());
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&pager)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    match child {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                // A pager quit early closes the pipe; that's fine.
+                let _ = stdin.write_all(text.as_bytes());
+                let _ = stdin.write_all(b"\n");
+            }
+            let _ = child.wait();
+        }
+        Err(_) => println!("{text}"),
+    }
 }
 
 /// Prints an engine notice (`[world tick: …]`, failures) on stderr like

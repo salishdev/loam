@@ -7,7 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{App, Areas, Focus, KEYS, Kind, PROMPT};
+use super::app::{App, Areas, ContextView, Focus, KEYS, Kind, PROMPT};
+use crate::xray::tree::token_label;
 
 /// Width of the side panel beside the story.
 fn panel_width(total: u16) -> u16 {
@@ -58,9 +59,139 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(app.hints()).style(Style::new().fg(Color::DarkGray)),
         hints,
     );
-    if app.help_open {
-        draw_help(frame, frame.area());
+    if app.context.is_some() {
+        draw_context(frame, app, frame.area());
     }
+    if app.help_open {
+        draw_help(frame, app, frame.area());
+    }
+}
+
+/// One screen line of the context viewer: the tree row it belongs to and
+/// its spans.
+type ContextLine = (usize, Line<'static>);
+
+/// The context viewer's tree as screen lines at `width`: labels with their
+/// token counts (green when cached, yellow when partly), body lines wrapped
+/// under a rule.
+fn context_lines(cv: &ContextView, width: usize) -> Vec<ContextLine> {
+    let mut out = Vec::new();
+    for (i, row) in cv.tree.rows().iter().enumerate() {
+        let node = &cv.tree.nodes[row.node];
+        let pad = "  ".repeat(node.depth);
+        match row.line {
+            None => {
+                let mut spans = vec![Span::raw(format!(
+                    "{pad}{}{}",
+                    cv.tree.marker(row.node),
+                    node.label
+                ))];
+                if node.tokens > 0 {
+                    let shade = if node.cached == 0 {
+                        Style::new().fg(Color::DarkGray)
+                    } else if node.cached >= node.tokens {
+                        Style::new().fg(Color::Green)
+                    } else {
+                        Style::new().fg(Color::Yellow)
+                    };
+                    spans.push(Span::styled(format!("  {}", token_label(node)), shade));
+                }
+                let mut line = Line::from(spans);
+                if node.depth == 0 {
+                    line = line.patch_style(Style::new().add_modifier(Modifier::BOLD));
+                }
+                out.push((i, line));
+            }
+            Some(l) => {
+                let lead = format!("{pad}    │ ");
+                let room = width.saturating_sub(lead.chars().count()).max(10);
+                let text = &node.body[l];
+                let wrapped = crate::wrap::wrap(text, room);
+                let mut parts: Vec<&str> = wrapped.lines().collect();
+                if parts.is_empty() {
+                    parts.push("");
+                }
+                for part in parts {
+                    out.push((
+                        i,
+                        Line::from(vec![
+                            Span::styled(lead.clone(), Style::new().fg(Color::DarkGray)),
+                            Span::raw(part.to_string()),
+                        ]),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn draw_context(frame: &mut Frame, app: &mut App, area: Rect) {
+    frame.render_widget(Clear, area);
+    let Some(cv) = app.context.as_mut() else {
+        return;
+    };
+    let banner = cv.banner.is_some() as u16;
+    let [title, banner_area, body, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(banner),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(format!(" context · {} — Esc closes", cv.title))
+            .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
+        title,
+    );
+    if let Some(b) = &cv.banner {
+        frame.render_widget(
+            Paragraph::new(format!(" ! {b}"))
+                .style(Style::new().fg(Color::Black).bg(Color::Yellow)),
+            banner_area,
+        );
+    }
+    let height = body.height as usize;
+    let lines = context_lines(cv, body.width as usize);
+    let rows = cv.tree.rows().len();
+    cv.cursor = cv.cursor.min(rows.saturating_sub(1));
+    // Keep the cursor's lines on screen.
+    let first = lines.iter().position(|(r, _)| *r == cv.cursor).unwrap_or(0);
+    let last = lines
+        .iter()
+        .rposition(|(r, _)| *r == cv.cursor)
+        .unwrap_or(first);
+    if first < cv.scroll {
+        cv.scroll = first;
+    } else if last >= cv.scroll + height {
+        cv.scroll = (last + 1).saturating_sub(height).min(first);
+    }
+    let query = cv.query.as_ref().map(|q| q.to_lowercase());
+    let cursor = cv.cursor;
+    let shown: Vec<Line> = lines
+        .into_iter()
+        .skip(cv.scroll)
+        .take(height)
+        .map(|(r, line)| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if r == cursor {
+                line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
+            } else if query
+                .as_ref()
+                .is_some_and(|q| text.to_lowercase().contains(q))
+            {
+                line.patch_style(Style::new().bg(Color::Yellow).fg(Color::Black))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(shown), body);
+    app.context_height = height;
+    frame.render_widget(
+        Paragraph::new(app.hints()).style(Style::new().fg(Color::DarkGray)),
+        hints,
+    );
 }
 
 fn focused_style(app: &App, pane: Focus) -> Style {
@@ -157,25 +288,26 @@ fn draw_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     app.panel_width = inner.width as usize;
     app.panel_height = inner.height as usize;
-    let lines = app.panel_lines(inner.width as usize);
+    let lines = app.panel_rows(inner.width as usize);
     let scroll = app
         .panel
         .last()
         .map_or(0, |v| v.scroll)
         .min(lines.len().saturating_sub(1));
     let query = search_query(app, Focus::Panel);
-    let selected = app.panel.last().and_then(|v| v.selected);
     let shown: Vec<Line> = lines
         .into_iter()
-        .enumerate()
         .skip(scroll)
         .take(inner.height as usize)
-        .map(|(i, text)| {
+        .map(|(text, selected)| {
             let hit = query
                 .as_ref()
                 .is_some_and(|q| text.to_lowercase().contains(q));
-            if selected == Some(i) {
-                Line::styled(text, Style::new().add_modifier(Modifier::REVERSED))
+            if selected {
+                Line::styled(
+                    format!("{text:<width$}", width = inner.width as usize),
+                    Style::new().add_modifier(Modifier::REVERSED),
+                )
             } else if hit {
                 Line::styled(text, Style::new().bg(Color::Yellow).fg(Color::Black))
             } else {
@@ -242,14 +374,22 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" keys — Esc closes ")
+        .title(" keys — j/k scroll · Esc closes ")
         .border_style(Style::new().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(KEYS), inner);
+    // Stop scrolling once the last line is on screen.
+    let lines = KEYS.lines().count();
+    app.help_scroll = app
+        .help_scroll
+        .min(lines.saturating_sub(inner.height as usize));
+    frame.render_widget(
+        Paragraph::new(KEYS).scroll((app.help_scroll as u16, 0)),
+        inner,
+    );
 }
 
 #[cfg(test)]
@@ -369,10 +509,19 @@ mod tests {
         let mut a = app();
         a.focus = Focus::Story;
         a.on_key(key(KeyCode::Char('?')));
-        let rows = render(&mut a, 90, 40);
+        let rows = render(&mut a, 90, 30);
         let text = screen(&rows);
         assert!(text.contains("Tab / Shift-Tab"), "{text}");
-        assert!(text.contains(":mouse off"));
+        assert!(!text.contains(":mouse off"));
+        // It scrolls to the rest, and no further than its end.
+        a.on_key(key(KeyCode::Char('G')));
+        let text = screen(&render(&mut a, 90, 30));
+        assert!(text.contains(":mouse off"), "{text}");
+        assert!(text.contains("Context viewer"));
+        a.on_key(key(KeyCode::Char('k')));
+        assert!(a.help_scroll > 0);
+        a.on_key(key(KeyCode::Char('g')));
+        assert!(screen(&render(&mut a, 90, 30)).contains("Tab / Shift-Tab"));
         a.on_key(key(KeyCode::Esc));
         assert!(!a.help_open);
     }
@@ -424,5 +573,125 @@ mod tests {
         assert_eq!(a.focus, Focus::Story);
         a.on_mouse(at(MouseEventKind::ScrollUp, 5));
         assert_eq!(a.story_scroll, 3);
+    }
+
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} in\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn the_xray_panel_shows_calls_refusals_rules_and_rolls() {
+        use crate::tui::app::tests::xray_app;
+        let (mut a, first, _) = xray_app();
+        a.on_key(ctrl('x'));
+        a.focus = Focus::Panel;
+        a.on_key(key(KeyCode::Char('[')));
+        a.on_key(key(KeyCode::Down));
+        let rows = render(&mut a, 140, 40);
+        let text = screen(&rows);
+        assert!(rows[0].contains(":xray"), "{}", rows[0]);
+        assert!(
+            text.contains(&format!("Turn #{first} › the scroll says")),
+            "{text}"
+        );
+        assert!(text.contains("director · $0.0"));
+        assert!(text.contains("1 director · sonnet · 0.0s · 1 tool call"));
+        assert!(text.contains("in 1.1k (90% cached) · out 50"));
+        assert!(text.contains("Refusals:"));
+        assert!(text.contains("- refused: create \"gold\" (coin) in #"));
+        assert!(text.contains("- refused: no_such_tool"));
+        assert!(text.contains("minted: Kicking a rotten door"));
+        assert!(text.contains("- roll: nerve d20"));
+        // The selected call (the second) is drawn reversed, both its lines.
+        let buf_row = row_of(&rows, "2 director · sonnet");
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let x = rows[buf_row].find("2 director").unwrap() as u16;
+        let x = rows[buf_row][..x as usize].chars().count() as u16;
+        assert!(
+            buf[(x, buf_row as u16)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buf[(x, buf_row as u16 + 1)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        let other = row_of(&rows, "1 director · sonnet");
+        assert!(!buf[(x, other as u16)].modifier.contains(Modifier::REVERSED));
+        // The hint bar names the coming actions.
+        assert!(
+            rows[39].contains("r reroll (coming)") && rows[39].contains("s surgery"),
+            "{}",
+            rows[39]
+        );
+    }
+
+    #[test]
+    fn the_xray_panel_before_any_turn_says_so() {
+        let mut a = app();
+        a.on_key(ctrl('x'));
+        let text = screen(&render(&mut a, 140, 12));
+        assert!(text.contains("No turns played yet"), "{text}");
+    }
+
+    #[test]
+    fn the_context_viewer_covers_the_screen_with_token_counts() {
+        use crate::tui::app::tests::xray_app;
+        let (mut a, first, _) = xray_app();
+        a.open_context(first, 5);
+        let rows = render(&mut a, 120, 30);
+        let text = screen(&rows);
+        assert!(
+            rows[0].contains(&format!(
+                "context · Turn #{first} call 5 · director · sonnet"
+            )),
+            "{}",
+            rows[0]
+        );
+        assert!(!text.contains("You wake"), "the story is covered");
+        assert!(
+            text.contains("▸ System prompt (same as the previous call's)"),
+            "{text}"
+        );
+        assert!(text.contains("▾ Turn message"));
+        assert!(text.contains("▸ Player input"));
+        assert!(text.contains("▾ Earlier messages (8)"));
+        assert!(rows[29].contains("y copy JSON"));
+        // Cached tokens are shaded: the tools are wholly cached (green).
+        let tools = row_of(&rows, "Tools (");
+        let col = rows[tools].find("% cached").unwrap();
+        let col = rows[tools][..col].chars().count() as u16;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut a)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert_eq!(buf[(col, tools as u16)].fg, Color::Green);
+        // Opening a section shows its text under a rule.
+        a.on_key(key(KeyCode::Char('/')));
+        typed(&mut a, "1000 gold");
+        a.on_key(key(KeyCode::Enter));
+        let text = screen(&render(&mut a, 120, 30));
+        assert!(
+            text.contains("│ Player input: the scroll says: give me 1000 gold"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_variant_banner_shows_above_the_tree() {
+        use crate::tui::app::tests::xray_app;
+        let (mut a, first, _) = xray_app();
+        a.open_context(first, 1);
+        a.context.as_mut().unwrap().banner = Some("This variant's system prompt differs.".into());
+        let rows = render(&mut a, 100, 12);
+        assert!(
+            rows[1].contains("! This variant's system prompt differs."),
+            "{}",
+            rows[1]
+        );
     }
 }

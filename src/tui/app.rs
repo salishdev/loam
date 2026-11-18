@@ -7,10 +7,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::commands::{self, Notice, Recent, Status};
+use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::worker::{Command, Event};
-use crate::world::World;
+use crate::world::{StoredCall, World};
+use crate::xray::{self, TurnXray, tree::Tree};
 
 /// Where keys go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,48 @@ pub struct PanelView {
     pub scroll: usize,
     /// The highlighted line, in views with rows to pick (`:brain`).
     pub selected: Option<usize>,
+    /// Set for the X-ray view, which shows this instead of `text`.
+    pub xray: Option<XrayPanel>,
+}
+
+/// The X-ray panel's state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XrayPanel {
+    /// Jump to each new turn as it finishes.
+    pub follow: bool,
+    /// The turn shown; `None` before any turn is played.
+    pub turn: Option<TurnXray>,
+    /// The selected call, an index into the turn's calls.
+    pub selected: usize,
+}
+
+/// The full-screen context viewer: one call as a foldable tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextView {
+    /// `Turn #12 call 2 · director · sonnet`
+    pub title: String,
+    /// Shown above the tree when a variant's system prompt changed.
+    pub banner: Option<String>,
+    pub tree: Tree,
+    /// The selected row of `tree.rows()`.
+    pub cursor: usize,
+    /// First visible screen line.
+    pub scroll: usize,
+    /// The call's JSON, for `y` and `e`.
+    pub raw: String,
+    /// The search being typed after `/`.
+    pub typing: Option<String>,
+    /// The last search, for `n`/`N`.
+    pub query: Option<String>,
+}
+
+/// Something only the terminal can do, done by the event loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TermAction {
+    /// Copy text to the clipboard with OSC 52.
+    Copy(String),
+    /// Open text in `$EDITOR` (read-only use: edits are discarded).
+    Edit(String),
 }
 
 impl PanelView {
@@ -106,6 +149,8 @@ pub struct App {
     pub panel: Vec<PanelView>,
     pub panel_open: bool,
     pub help_open: bool,
+    /// First line of the help overlay on screen.
+    pub help_scroll: usize,
     pub search: Option<Search>,
     /// The last search, for `n`/`N` and highlighting.
     pub last_search: Option<(Focus, String)>,
@@ -117,12 +162,17 @@ pub struct App {
     pub outbox: Vec<Command>,
     pub mouse: bool,
     pub quit: bool,
+    /// The context viewer, while open; it covers the screen.
+    pub context: Option<ContextView>,
+    /// A terminal action for the event loop to perform.
+    pub action: Option<TermAction>,
     /// Set by the last draw.
     pub areas: Areas,
     pub(crate) story_height: usize,
     pub(crate) story_width: usize,
     pub(crate) panel_height: usize,
     pub(crate) panel_width: usize,
+    pub(crate) context_height: usize,
 }
 
 impl App {
@@ -147,6 +197,7 @@ impl App {
             panel: Vec::new(),
             panel_open: false,
             help_open: false,
+            help_scroll: 0,
             search: None,
             last_search: None,
             flash: None,
@@ -154,11 +205,14 @@ impl App {
             outbox: Vec::new(),
             mouse,
             quit: false,
+            context: None,
+            action: None,
             areas: Areas::default(),
             story_height: 20,
             story_width: 80,
             panel_height: 20,
             panel_width: 40,
+            context_height: 20,
         };
         app.refresh_status();
         app
@@ -278,6 +332,14 @@ impl App {
         let Some(top) = self.panel.last() else {
             return;
         };
+        if let Some(x) = &top.xray {
+            let seq = match (&x.turn, x.follow) {
+                (Some(t), false) => Some(t.seq),
+                _ => xray::latest_turn(&self.view).ok().flatten(),
+            };
+            self.show_turn(seq);
+            return;
+        }
         if let Some(Ok(text)) = commands::report(&self.view, &top.cmd, &top.arg)
             && let Some(top) = self.panel.last_mut()
         {
@@ -293,6 +355,7 @@ impl App {
             text,
             scroll: 0,
             selected: None,
+            xray: None,
         };
         // The same report again replaces itself rather than stacking.
         if self
@@ -351,9 +414,253 @@ impl App {
         true
     }
 
+    /// Ctrl-X or `:xray`: open the X-ray panel on the latest turn, or close
+    /// it when it is the view on top.
+    pub fn toggle_xray(&mut self) {
+        if self.xray_on_top() {
+            self.panel_back();
+        } else {
+            self.open_xray(None);
+        }
+    }
+
+    fn xray_on_top(&self) -> bool {
+        self.panel_open && self.panel.last().is_some_and(|v| v.xray.is_some())
+    }
+
+    /// Open the X-ray panel on turn `seq`, or following the latest turn.
+    pub fn open_xray(&mut self, seq: Option<i64>) {
+        self.open_view(":xray", "", String::new());
+        if let Some(top) = self.panel.last_mut() {
+            top.xray = Some(XrayPanel {
+                follow: seq.is_none(),
+                turn: None,
+                selected: 0,
+            });
+        }
+        let seq = seq.or_else(|| xray::latest_turn(&self.view).ok().flatten());
+        self.show_turn(seq);
+    }
+
+    /// Show turn `seq` in the X-ray panel on top, keeping the selection
+    /// when it is the same turn.
+    fn show_turn(&mut self, seq: Option<i64>) {
+        let turn = match seq {
+            Some(seq) => match xray::turn(&self.view, seq) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.flash = Some(format!("[:xray unavailable: {e}]"));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let Some(top) = self.panel.last_mut() else {
+            return;
+        };
+        let Some(x) = top.xray.as_mut() else {
+            return;
+        };
+        let same = x.turn.as_ref().map(|t| t.seq) == turn.as_ref().map(|t| t.seq);
+        if !same {
+            x.selected = 0;
+            top.scroll = 0;
+        }
+        let calls = turn.as_ref().map_or(0, |t| t.calls.len());
+        x.selected = x.selected.min(calls.saturating_sub(1));
+        x.turn = turn;
+    }
+
+    /// Keys for the X-ray panel; `false` leaves the key to the panel.
+    fn xray_key(&mut self, key: KeyEvent) -> bool {
+        let Some(x) = self.panel.last().and_then(|v| v.xray.as_ref()) else {
+            return false;
+        };
+        let seq = x.turn.as_ref().map(|t| t.seq);
+        let calls = x.turn.as_ref().map_or(0, |t| t.calls.len());
+        let selected = x.selected;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.select_call(selected.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.select_call((selected + 1).min(calls.saturating_sub(1)))
+            }
+            KeyCode::Enter | KeyCode::Char('c') => match seq {
+                Some(seq) if calls > 0 => self.open_context(seq, selected + 1),
+                _ => self.flash = Some("This turn has no recorded calls.".into()),
+            },
+            KeyCode::Char(c @ ('[' | ']')) => {
+                let Some(seq) = seq else {
+                    return true;
+                };
+                match xray::step_turn(&self.view, seq, c == '[') {
+                    Ok(Some(next)) => {
+                        let latest = xray::latest_turn(&self.view).ok().flatten();
+                        if let Some(x) = self.panel.last_mut().and_then(|v| v.xray.as_mut()) {
+                            x.follow = Some(next) == latest;
+                        }
+                        self.show_turn(Some(next));
+                    }
+                    Ok(None) if c == '[' => self.flash = Some("This is the first turn.".into()),
+                    Ok(None) => {
+                        self.flash =
+                            Some("This is the latest turn; X-ray follows new ones.".into());
+                        if let Some(x) = self.panel.last_mut().and_then(|v| v.xray.as_mut()) {
+                            x.follow = true;
+                        }
+                    }
+                    Err(e) => self.flash = Some(format!("[:xray unavailable: {e}]")),
+                }
+            }
+            KeyCode::Char('r') => self.flash = Some("Rerolls aren't built yet (coming).".into()),
+            KeyCode::Char('s') => self.flash = Some("Surgery isn't built yet (coming).".into()),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Select call `i` in the X-ray panel and scroll it into view.
+    fn select_call(&mut self, i: usize) {
+        if let Some(x) = self.panel.last_mut().and_then(|v| v.xray.as_mut()) {
+            x.selected = i;
+        }
+        let rows = self.panel_rows(self.panel_width);
+        let Some(first) = rows.iter().position(|(_, sel)| *sel) else {
+            return;
+        };
+        let last = rows.iter().rposition(|(_, sel)| *sel).unwrap_or(first);
+        let height = self.panel_height.max(1);
+        if let Some(v) = self.panel.last_mut() {
+            if first < v.scroll {
+                v.scroll = first;
+            } else if last >= v.scroll + height {
+                v.scroll = (last + 1).saturating_sub(height).min(first);
+            }
+        }
+    }
+
+    /// Open the context viewer on call `n` of turn `seq`.
+    pub fn open_context(&mut self, seq: i64, n: usize) {
+        match xray::turn_call(&self.view, seq, n) {
+            Ok(Some(call)) => self.view_call(seq, n, &call),
+            Ok(None) => self.flash = Some(format!("Turn #{seq} has no call {n}.")),
+            Err(e) => self.flash = Some(format!("[:context unavailable: {e}]")),
+        }
+    }
+
+    fn view_call(&mut self, seq: i64, n: usize, call: &StoredCall) {
+        match xray::call_tree(&self.view, call) {
+            Ok((tree, banner)) => {
+                self.context = Some(ContextView {
+                    title: commands::call_title(seq, n, call),
+                    banner,
+                    tree,
+                    cursor: 0,
+                    scroll: 0,
+                    raw: xray::tree::raw_json(call),
+                    typing: None,
+                    query: None,
+                })
+            }
+            Err(e) => self.flash = Some(format!("[:context unavailable: {e}]")),
+        }
+    }
+
+    /// Keys while the context viewer is open.
+    fn context_key(&mut self, key: KeyEvent) {
+        let height = self.context_height.max(1);
+        let Some(cv) = self.context.as_mut() else {
+            return;
+        };
+        if let Some(q) = cv.typing.as_mut() {
+            match key.code {
+                KeyCode::Esc => cv.typing = None,
+                KeyCode::Backspace => {
+                    q.pop();
+                }
+                KeyCode::Char(c) => q.push(c),
+                KeyCode::Enter => {
+                    let q = cv.typing.take().unwrap_or_default();
+                    if !q.is_empty() {
+                        cv.query = Some(q);
+                        self.context_search(true);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let rows = cv.tree.rows().len();
+        let last = rows.saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.context = None,
+            KeyCode::Up | KeyCode::Char('k') => cv.cursor = cv.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => cv.cursor = (cv.cursor + 1).min(last),
+            KeyCode::PageUp => cv.cursor = cv.cursor.saturating_sub(height),
+            KeyCode::PageDown => cv.cursor = (cv.cursor + height).min(last),
+            KeyCode::Char('g') | KeyCode::Home => cv.cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => cv.cursor = last,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(row) = cv.tree.rows().get(cv.cursor).copied() {
+                    cv.tree.toggle(row.node);
+                    // Folding from a body line lands on the node's label.
+                    if let Some(at) = cv
+                        .tree
+                        .rows()
+                        .iter()
+                        .position(|r| r.node == row.node && r.line.is_none())
+                    {
+                        cv.cursor = at;
+                    }
+                }
+            }
+            KeyCode::Char('/') => cv.typing = Some(String::new()),
+            KeyCode::Char('n') => self.context_search(true),
+            KeyCode::Char('N') => self.context_search(false),
+            KeyCode::Char('y') => {
+                self.action = Some(TermAction::Copy(cv.raw.clone()));
+                self.flash = Some("Copied the call's JSON to the clipboard (OSC 52).".into());
+            }
+            KeyCode::Char('e') => self.action = Some(TermAction::Edit(cv.raw.clone())),
+            KeyCode::Char('?') => self.help_open = true,
+            _ => {}
+        }
+    }
+
+    /// Move the viewer's cursor to the next (or previous) node matching the
+    /// last search, opening what hides it.
+    fn context_search(&mut self, forward: bool) {
+        let Some(cv) = self.context.as_mut() else {
+            return;
+        };
+        let Some(query) = cv.query.clone() else {
+            return;
+        };
+        let hits = cv.tree.search(&query);
+        let here = cv.tree.rows().get(cv.cursor).map_or(0, |r| r.node);
+        let found = if forward {
+            hits.iter().find(|&&n| n > here).or(hits.first())
+        } else {
+            hits.iter().rev().find(|&&n| n < here).or(hits.last())
+        };
+        let Some(&node) = found else {
+            self.flash = Some(format!("No match for {query}."));
+            return;
+        };
+        cv.tree.reveal(node, &query);
+        if let Some(at) = cv
+            .tree
+            .rows()
+            .iter()
+            .position(|r| r.node == node && r.line.is_none())
+        {
+            cv.cursor = at;
+        }
+    }
+
     /// Esc or `h` in the panel: back one view; past the first, close it.
     fn panel_back(&mut self) {
         self.panel.pop();
+        self.refresh_panel();
         if self.panel.is_empty() {
             self.panel_open = false;
         }
@@ -398,6 +705,27 @@ impl App {
 
     fn command(&mut self, line: &str) {
         let (cmd, arg) = commands::split(line);
+        match cmd {
+            ":xray" => {
+                match arg {
+                    "on" if !self.xray_on_top() => self.open_xray(None),
+                    "off" if self.xray_on_top() => self.panel_back(),
+                    "on" | "off" => {}
+                    "" => self.toggle_xray(),
+                    _ => self.flash = Some("Usage: :xray [on|off]".into()),
+                }
+                return;
+            }
+            ":context" => {
+                match commands::context(&self.view, arg) {
+                    Ok(ContextReport::Text(text)) => self.open_view(cmd, arg, text),
+                    Ok(ContextReport::Call { seq, n, call, .. }) => self.view_call(seq, n, &call),
+                    Err(notice) => self.flash = Some(notice),
+                }
+                return;
+            }
+            _ => {}
+        }
         if let Some(report) = commands::report(&self.view, cmd, arg) {
             match report {
                 Ok(text) => self.open_view(cmd, arg, text),
@@ -448,6 +776,10 @@ impl App {
                 self.quit = true;
                 return;
             }
+            _ if self.context.is_some() && !self.help_open => {
+                self.context_key(key);
+                return;
+            }
             KeyCode::Char('l') if ctrl => {
                 self.command(":log");
                 return;
@@ -456,9 +788,12 @@ impl App {
                 self.toggle_panel();
                 return;
             }
-            KeyCode::Char(c @ ('x' | 'r' | 'b')) if ctrl => {
+            KeyCode::Char('x') if ctrl => {
+                self.toggle_xray();
+                return;
+            }
+            KeyCode::Char(c @ ('r' | 'b')) if ctrl => {
                 let what = match c {
-                    'x' => "The X-ray panel",
                     'r' => "Rerolls",
                     _ => "The branch tree",
                 };
@@ -480,9 +815,22 @@ impl App {
             return;
         }
         if self.help_open {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
-                self.help_open = false;
+            let last = KEYS.lines().count().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?' | 'q') => {
+                    self.help_open = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Char(' ') => self.help_scroll += 10,
+                KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::Char('G') => self.help_scroll = last,
+                _ => {}
             }
+            self.help_scroll = self.help_scroll.min(last);
             return;
         }
         match key.code {
@@ -663,7 +1011,7 @@ impl App {
     }
 
     fn panel_key(&mut self, key: KeyEvent) {
-        if self.brain_key(key) {
+        if self.brain_key(key) || self.xray_key(key) {
             return;
         }
         let height = self.panel_height.max(1);
@@ -814,17 +1162,55 @@ impl App {
 
     /// The top panel view wrapped at `width`.
     pub fn panel_lines(&self, width: usize) -> Vec<String> {
-        match self.panel.last() {
-            Some(v) => crate::wrap::wrap(&v.text, width.max(1))
+        self.panel_rows(width).into_iter().map(|(l, _)| l).collect()
+    }
+
+    /// The top panel view wrapped at `width`, each line marked when it
+    /// belongs to the X-ray's selected call.
+    pub fn panel_rows(&self, width: usize) -> Vec<(String, bool)> {
+        let wrap = |text: &str| -> Vec<String> {
+            crate::wrap::wrap(text, width.max(1))
                 .lines()
                 .map(str::to_string)
+                .collect()
+        };
+        match self.panel.last() {
+            Some(PanelView { xray: Some(x), .. }) => match &x.turn {
+                None => wrap(NO_TURN_YET).into_iter().map(|l| (l, false)).collect(),
+                Some(turn) => xray::panel_lines(turn)
+                    .into_iter()
+                    .flat_map(|(line, call)| {
+                        let selected = call == Some(x.selected);
+                        let lines = if line.is_empty() {
+                            vec![line]
+                        } else {
+                            wrap(&line)
+                        };
+                        lines.into_iter().map(move |l| (l, selected))
+                    })
+                    .collect(),
+            },
+            Some(v) => wrap(&v.text)
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (l, v.selected == Some(i)))
                 .collect(),
-            None => vec![EMPTY_PANEL.to_string()],
+            None => vec![(EMPTY_PANEL.to_string(), false)],
         }
     }
 
     /// The mouse: the wheel scrolls the pane under it, a click focuses it.
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        // The context viewer covers everything: the wheel moves its cursor.
+        if let Some(cv) = self.context.as_mut() {
+            let last = cv.tree.rows().len().saturating_sub(1);
+            match m.kind {
+                MouseEventKind::ScrollUp => cv.cursor = cv.cursor.saturating_sub(3),
+                MouseEventKind::ScrollDown => cv.cursor = (cv.cursor + 3).min(last),
+                _ => {}
+            }
+            return;
+        }
         let at = Position::new(m.column, m.row);
         let over = |r: Option<Rect>| r.is_some_and(|r| r.contains(at));
         let pane = if over(self.areas.panel) {
@@ -855,7 +1241,20 @@ impl App {
             return "type to search · Enter find · Esc cancel".into();
         }
         if self.help_open {
-            return "Esc close help".into();
+            return "j/k scroll · Space page · g/G top/bottom · Esc close help".into();
+        }
+        if let Some(cv) = &self.context {
+            return match &cv.typing {
+                Some(q) => format!("/{q}  · Enter find · Esc cancel"),
+                None => "↑↓ j/k move · Enter/Space fold · / search · n/N next · \
+                         y copy JSON · e $EDITOR · Esc close"
+                    .into(),
+            };
+        }
+        if self.focus == Focus::Panel && self.xray_on_top() {
+            return "↑↓ select call · Enter/c context · [ ] turn · r reroll (coming) · \
+                    s surgery (coming) · Esc back · Tab focus"
+                .into();
         }
         match self.focus {
             Focus::Input => "Enter send · ↑↓ history · :cmd Tab completes · Tab focus · \
@@ -879,6 +1278,10 @@ pub const PROMPT: &str = "› ";
 /// Story text's left margin, in columns.
 pub const MARGIN: usize = crate::wrap::DEFAULT_MARGIN;
 
+/// What the X-ray says before any turn is played.
+pub const NO_TURN_YET: &str = "No turns played yet. The X-ray shows each turn's model calls, \
+cost, cache use, refusals, rules and rolls once you play one.";
+
 /// What an empty panel says.
 pub const EMPTY_PANEL: &str = "Nothing open. Try :rules, :quests, :npcs, :stats or :log.";
 
@@ -899,7 +1302,8 @@ fn text_width(width: usize) -> usize {
 /// `:help` in the TUI: the commands and where the keys are.
 pub fn help_text() -> String {
     format!(
-        "{}\n\nTUI: :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
+        "{}\n\nTUI: Ctrl-X (or :xray) toggles the X-ray panel; in it ↑↓ select a call, \
+         Enter opens its context and [ ] step turns. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
          capture (off restores native text selection; Shift-drag selects while it's on). \
          Press ? outside the input line for the keys.",
         commands::HELP
@@ -929,11 +1333,20 @@ Story and panel
   Enter             next model (haiku → sonnet → opus)
   e                 next effort (low → medium → high → xhigh → max)
 
+X-ray panel (Ctrl-X)
+  ↑ ↓ / Enter c     select a call / open its context
+  [ ]   r s         previous, next turn   reroll, surgery (coming)
+
+Context viewer
+  Enter Space  / n N    fold, unfold   search, next, previous
+  y   e   Esc q         copy JSON (OSC 52)   open it in $EDITOR   close
+
 Anywhere
   PgUp PgDn         scroll the story
   Ctrl-P            toggle the side panel
   Ctrl-L            event log
-  Ctrl-X Ctrl-R Ctrl-B   X-ray, reroll, branches (coming)
+  Ctrl-X            X-ray panel
+  Ctrl-R Ctrl-B     reroll, branches (coming)
   Ctrl-C Ctrl-D     quit
 
 Mouse: wheel scrolls, click focuses. :mouse off (or LOAM_MOUSE=0)
@@ -1116,8 +1529,8 @@ pub(crate) mod tests {
         let mut app = app();
         app.on_key(ctrl('l'));
         assert_eq!(app.panel.last().unwrap().cmd, ":log");
-        app.on_key(ctrl('x'));
-        assert!(app.flash.as_deref().unwrap().contains("X-ray"));
+        app.on_key(ctrl('r'));
+        assert!(app.flash.as_deref().unwrap().contains("Rerolls"));
         assert!(app.outbox.is_empty());
     }
 
@@ -1235,5 +1648,197 @@ pub(crate) mod tests {
         let mut app = app();
         app.load_recent(10);
         assert_eq!(app.story[0].text, "You wake in a flooded chapel.");
+    }
+
+    /// An app over a save with two played turns (the first from
+    /// [`crate::xray::tests::played`]); returns their input events.
+    pub(crate) fn xray_app() -> (App, i64, i64) {
+        use crate::llm::{Response, ScriptedClient};
+        let (mut game, first) = crate::xray::tests::played();
+        let client = ScriptedClient::new([
+            Response::canned_tool_use(
+                "i",
+                "interpret",
+                serde_json::json!({"matches": [], "clean": false}),
+            ),
+            Response::canned_text("Nothing stirs."),
+        ]);
+        game.turn(&client, "wait", &mut |_| {}).unwrap();
+        let second = crate::xray::latest_turn(game.world()).unwrap().unwrap();
+        (App::new(game.into_world(), true), first, second)
+    }
+
+    fn xray_turn(app: &App) -> Option<i64> {
+        app.panel
+            .last()
+            .and_then(|v| v.xray.as_ref())
+            .and_then(|x| x.turn.as_ref())
+            .map(|t| t.seq)
+    }
+
+    #[test]
+    fn ctrl_x_toggles_the_xray_on_the_latest_turn() {
+        let (mut app, _, second) = xray_app();
+        app.on_key(ctrl('x'));
+        assert!(app.panel_open);
+        assert_eq!(xray_turn(&app), Some(second));
+        let x = app.panel.last().unwrap().xray.as_ref().unwrap();
+        assert!(x.follow);
+        assert_eq!(x.turn.as_ref().unwrap().calls[0].role, "interpret");
+        app.on_key(ctrl('x'));
+        assert!(!app.panel_open);
+        typed(&mut app, ":xray");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(xray_turn(&app), Some(second));
+        typed(&mut app, ":xray on");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.len(), 1);
+        typed(&mut app, ":xray off");
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.panel_open);
+    }
+
+    #[test]
+    fn brackets_step_turns_and_the_latest_follows_again() {
+        let (mut app, first, second) = xray_app();
+        app.on_key(ctrl('x'));
+        app.focus = Focus::Panel;
+        app.on_key(key(KeyCode::Char('[')));
+        assert_eq!(xray_turn(&app), Some(first));
+        assert!(!app.panel.last().unwrap().xray.as_ref().unwrap().follow);
+        app.on_key(key(KeyCode::Char('[')));
+        assert!(app.flash.as_deref().unwrap().contains("first turn"));
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(xray_turn(&app), Some(second));
+        assert!(app.panel.last().unwrap().xray.as_ref().unwrap().follow);
+        app.on_key(key(KeyCode::Char(']')));
+        assert!(app.flash.as_deref().unwrap().contains("latest turn"));
+    }
+
+    #[test]
+    fn arrows_select_a_call_and_enter_opens_its_context() {
+        let (mut app, first, _) = xray_app();
+        app.on_key(ctrl('x'));
+        app.focus = Focus::Panel;
+        app.on_key(key(KeyCode::Char('[')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.panel.last().unwrap().xray.as_ref().unwrap().selected, 1);
+        for _ in 0..10 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.panel.last().unwrap().xray.as_ref().unwrap().selected, 4);
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Enter));
+        let cv = app.context.as_ref().unwrap();
+        assert_eq!(
+            cv.title,
+            format!("Turn #{first} call 4 · director · sonnet")
+        );
+        assert!(app.hints().contains("Enter/Space fold"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.context.is_none());
+        app.on_key(key(KeyCode::Char('c')));
+        assert!(app.context.is_some());
+        // Rerolls and surgery are announced, not yet wired.
+        app.context = None;
+        app.on_key(key(KeyCode::Char('r')));
+        assert!(app.flash.as_deref().unwrap().contains("coming"));
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.flash.as_deref().unwrap().contains("Surgery"));
+        assert!(app.outbox.is_empty());
+    }
+
+    #[test]
+    fn the_context_viewer_folds_searches_copies_and_edits() {
+        let (mut app, first, _) = xray_app();
+        app.open_context(first, 5);
+        let rows = |app: &App| app.context.as_ref().unwrap().tree.rows().len();
+        let before = rows(&app);
+        // Move to "Turn message" and fold it.
+        let at = {
+            let cv = app.context.as_ref().unwrap();
+            cv.tree
+                .rows()
+                .iter()
+                .position(|r| cv.tree.nodes[r.node].label == "Turn message")
+                .unwrap()
+        };
+        for _ in 0..at {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(rows(&app) < before);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(rows(&app), before);
+        // Search opens the folded section holding the match.
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "1000 gold");
+        assert!(app.hints().starts_with("/1000 gold"));
+        app.on_key(key(KeyCode::Enter));
+        let cv = app.context.as_ref().unwrap();
+        let row = cv.tree.rows()[cv.cursor];
+        assert_eq!(cv.tree.nodes[row.node].label, "Player input");
+        assert!(!cv.tree.nodes[row.node].folded);
+        app.on_key(key(KeyCode::Char('/')));
+        typed(&mut app, "no such words");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.flash.as_deref().unwrap().starts_with("No match"));
+        app.on_key(key(KeyCode::Char('y')));
+        match &app.action {
+            Some(TermAction::Copy(json)) => assert!(json.contains("\"role\": \"director\"")),
+            other => panic!("expected a copy, got {other:?}"),
+        }
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(matches!(app.action, Some(TermAction::Edit(_))));
+        // Keys don't leak to the input line underneath.
+        typed(&mut app, "zz");
+        assert!(app.input.is_empty());
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.context.is_none());
+    }
+
+    #[test]
+    fn the_wheel_moves_the_viewer_not_the_story_beneath() {
+        use crossterm::event::MouseEvent;
+        let (mut app, first, _) = xray_app();
+        app.open_context(first, 5);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.context.as_ref().unwrap().cursor, 3);
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.context.as_ref().unwrap().cursor, 0);
+        assert_eq!(app.story_scroll, 0);
+    }
+
+    #[test]
+    fn context_commands_open_the_list_or_the_viewer() {
+        let (mut app, first, _) = xray_app();
+        typed(&mut app, &format!(":context #{first}"));
+        app.on_key(key(KeyCode::Enter));
+        let top = app.panel.last().unwrap();
+        assert_eq!(top.cmd, ":context");
+        assert!(top.text.contains(&format!("#{first}.5 director")));
+        typed(&mut app, &format!(":context #{first}.2"));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.context.as_ref().unwrap().title.contains("call 2"));
+    }
+
+    #[test]
+    fn help_lists_the_workbench() {
+        let mut app = app();
+        typed(&mut app, ":help");
+        app.on_key(key(KeyCode::Enter));
+        let text = &app.panel.last().unwrap().text;
+        assert!(
+            text.contains("Workbench") && text.contains("Ctrl-X"),
+            "{text}"
+        );
     }
 }

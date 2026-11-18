@@ -944,7 +944,7 @@ fn condition(c: &Condition) -> String {
 
 /// One op in words. `ids` are the entities it touched, as from
 /// [`Event::patch_touches`]; a create shows the id it got.
-fn render_op(op: &Op, ids: &[EntityId]) -> String {
+pub(crate) fn render_op(op: &Op, ids: &[EntityId]) -> String {
     match op {
         Op::Create {
             name,

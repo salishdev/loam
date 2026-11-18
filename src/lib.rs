@@ -15,3 +15,4 @@ pub mod tui;
 pub mod worker;
 pub mod world;
 pub mod wrap;
+pub mod xray;

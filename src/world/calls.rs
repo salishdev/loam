@@ -96,6 +96,58 @@ impl World {
         self.query_calls("turn_seq = ?1 AND reroll_id IS NULL", [turn_seq])
     }
 
+    /// One recorded call by id.
+    pub fn call(&self, id: i64) -> Result<Option<StoredCall>, StoreError> {
+        Ok(self.query_calls("id = ?1", [id])?.into_iter().next())
+    }
+
+    /// The latest call before call `id` made for the same role, if any.
+    pub fn previous_call(&self, id: i64, role: &str) -> Result<Option<StoredCall>, StoreError> {
+        Ok(self
+            .query_calls(
+                "id = (SELECT MAX(id) FROM llm_calls WHERE id < ?1 AND role = ?2)",
+                params![id, role],
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// The `input` events of played turns (the seed left out), in order.
+    pub fn turn_seqs(&self) -> Result<Vec<i64>, StoreError> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT seq FROM events WHERE kind = 'input'
+                   AND COALESCE(json_extract(payload, '$.seed'), 0) != 1 ORDER BY seq",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Say that recording began at event `seq`, as an upgrade from schema 5
+    /// does; tests use it to make older turns.
+    #[cfg(test)]
+    pub(crate) fn set_recorded_from(&self, seq: i64) {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('recorded_from', ?1)",
+                [seq.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// Mark call `id` as variant `variant` of reroll `reroll`, for tests
+    /// until rerolls record their own calls.
+    #[cfg(test)]
+    pub(crate) fn mark_variant(&self, id: i64, reroll: i64, variant: i64) {
+        self.conn
+            .execute(
+                "UPDATE llm_calls SET reroll_id = ?2, variant = ?3 WHERE id = ?1",
+                params![id, reroll, variant],
+            )
+            .unwrap();
+    }
+
     /// The first event that can have call records: events before it were
     /// logged before this save was upgraded to schema 6.
     pub fn recorded_from(&self) -> Result<i64, StoreError> {

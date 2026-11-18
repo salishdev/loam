@@ -556,7 +556,7 @@ fn kick_mint(target: i64) -> Response {
     Response::canned_tool_use("k1", "mint_rule", kick_mint_input(target))
 }
 
-fn kick_mint_input(target: i64) -> Value {
+pub(crate) fn kick_mint_input(target: i64) -> Value {
     json!({
         "name": "Kicking a rotten door",
         "trigger": "kick, shoulder or force <target>",
