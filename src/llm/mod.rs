@@ -6,11 +6,15 @@
 
 mod anthropic;
 mod fake;
+mod price;
+mod record;
 mod tool_loop;
 mod types;
 
 pub use anthropic::AnthropicClient;
 pub use fake::ScriptedClient;
+pub use price::{Price, cost_usd, price};
+pub use record::{CallRecord, RecordingClient};
 pub use tool_loop::{ToolLoopOutcome, ToolOutput, run_tool_loop};
 pub use types::*;
 

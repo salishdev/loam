@@ -21,7 +21,7 @@ use crate::world::{EntityId, EntityRef, Event, EventKind, Patch, StoreError, Wor
 use super::exits::explored_rooms;
 use super::npcs::{enclosing_room, npcs, player_room};
 use super::tools::{Phase, definitions, op_refs};
-use super::{Game, GameError, bible_id};
+use super::{CallsFor, Game, GameError, bible_id};
 use crate::time;
 
 /// A tick is due after this many minutes of world time without one.
@@ -103,8 +103,15 @@ impl Game {
     }
 
     /// Run a world tick now: one batched director call that advances
-    /// off-screen arcs with ordinary patches. Nothing is streamed.
+    /// off-screen arcs with ordinary patches. Nothing is streamed. Its model
+    /// calls are recorded against the last turn.
     pub fn tick(&mut self, client: &dyn LlmClient) -> Result<TickOutcome, GameError> {
+        self.recorded(client, CallsFor::LastTurn, |game, client| {
+            game.run_tick(client)
+        })
+    }
+
+    fn run_tick(&mut self, client: &dyn LlmClient) -> Result<TickOutcome, GameError> {
         if bible_id(&self.world)?.is_none() {
             return Err(GameError::NotStarted);
         }
@@ -114,6 +121,7 @@ impl Game {
         let slice = tick_slice(&self.world)?;
         let request = Request::new(Model::Sonnet, vec![Message::user(slice)])
             .system(tick_system())
+            .role("tick")
             .effort(Effort::Medium)
             .tools(definitions(Phase::Tick));
         let mut changes = Vec::new();

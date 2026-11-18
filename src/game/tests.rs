@@ -2756,3 +2756,147 @@ fn an_overdue_pressure_on_a_quest_puts_escalate_quest_in_the_director_slice() {
     );
     assert_eq!(q.status, crate::quest::Status::Open);
 }
+
+// ---- call records ------------------------------------------------------------
+
+fn with_usage(mut response: Response, input: u64, output: u64, read: u64) -> Response {
+    response.usage = crate::llm::Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: read,
+    };
+    response
+}
+
+fn roles(calls: &[crate::world::StoredCall]) -> Vec<&str> {
+    calls.iter().map(|c| c.call.role.as_str()).collect()
+}
+
+#[test]
+fn every_model_call_is_recorded_with_its_role_usage_and_cost() {
+    let (mut game, client, oak, elm) = with_doors();
+    // The bible and the opening belong to no turn.
+    let early = game.world().calls().unwrap();
+    assert_eq!(
+        roles(&early),
+        ["bible", "bible", "director", "director", "director"]
+    );
+    assert!(early.iter().all(|c| c.turn_seq.is_none()));
+
+    // A director turn: one row per call of the tool loop.
+    client.push(kick_mint(oak));
+    client.push(with_usage(
+        Response::canned_text("The oak door bursts."),
+        300,
+        80,
+        4000,
+    ));
+    game.turn(&client, "kick the oak door", &mut |_| {})
+        .unwrap();
+    let first = game
+        .world()
+        .last_event(EventKind::Input)
+        .unwrap()
+        .unwrap()
+        .seq;
+    let calls = game.world().turn_calls(first).unwrap();
+    assert_eq!(roles(&calls), ["director", "director"]);
+    let last = &calls[1].call;
+    assert_eq!(last.model, "claude-sonnet-5-5");
+    assert_eq!(last.effort.as_deref(), Some("medium"));
+    assert_eq!(last.usage.cache_read_input_tokens, 4000);
+    // 300 in at $2, 80 out at $10, 4000 cache reads at $0.10 per million.
+    assert!((last.cost_usd.unwrap() - 0.0018).abs() < 1e-12);
+    assert_eq!(last.response["content"][0]["text"], "The oak door bursts.");
+    // The second call carries the first call's tool use and its result.
+    assert_eq!(last.request["messages"].as_array().unwrap().len(), 3);
+    assert!(last.request.get("system").is_none());
+
+    // A fast-path turn with a quest to judge: interpreter, streamed
+    // narrator (recorded once the stream ends), judge.
+    let rule = crate::rules::active_world(game.world()).unwrap()[0].id;
+    let q = crate::quest::spawn(&mut game.world, "Through", "It bars the way", &[elm]).unwrap();
+    crate::quest::reveal_goal(&mut game.world, q, "Break the elm door", &[elm]).unwrap();
+    client.push(with_usage(
+        interpret(json!([{"rule": rule, "bindings": {"target": elm}}]), true),
+        900,
+        40,
+        0,
+    ));
+    client.push(Response::canned_text("The elm door gives way."));
+    client.push(Response::canned_tool_use(
+        "j",
+        crate::quest::JUDGE_TOOL,
+        json!({"verdict": "ongoing", "reason": "not yet"}),
+    ));
+    game.turn(&client, "kick the elm door", &mut |_| {})
+        .unwrap();
+    let second = game
+        .world()
+        .last_event(EventKind::Input)
+        .unwrap()
+        .unwrap()
+        .seq;
+    let calls = game.world().turn_calls(second).unwrap();
+    assert_eq!(roles(&calls), ["interpret", "narrator", "judge"]);
+    assert_eq!(calls[0].call.model, "claude-haiku-5-5");
+    assert!((calls[0].call.cost_usd.unwrap() - (0.00009 + 0.00002)).abs() < 1e-12);
+    assert_eq!(
+        calls[1].call.response["content"][0]["text"],
+        "The elm door gives way."
+    );
+
+    // A tick is recorded against the turn before it.
+    client.push(Response::canned_text("Nothing stirs."));
+    game.tick(&client).unwrap();
+    let calls = game.world().turn_calls(second).unwrap();
+    assert_eq!(roles(&calls), ["interpret", "narrator", "judge", "tick"]);
+
+    // Each system prompt is stored once however often it was sent.
+    let all = game.world().calls().unwrap();
+    let mut hashes: Vec<_> = all.iter().filter_map(|c| c.system_hash.clone()).collect();
+    hashes.sort();
+    hashes.dedup();
+    let director = all.iter().filter(|c| c.call.role == "director").count();
+    assert!(director >= 5);
+    assert_eq!(
+        hashes.len(),
+        6,
+        "bible, director, interpret, narrator, judge, tick"
+    );
+
+    // Records aren't events: replay is unaffected and copies none.
+    let replayed = game.world().replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), game.world().state().unwrap());
+    assert!(replayed.calls().unwrap().is_empty());
+    // A fork at the first turn's last event keeps the records up to it.
+    let branch = game.world().fork_in_memory(second - 1).unwrap();
+    assert_eq!(branch.calls().unwrap().len(), early.len() + 2);
+}
+
+#[test]
+fn recording_can_be_turned_off() {
+    let client = ScriptedClient::new([bible_call(), Response::canned_text("")]);
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.set_recording(false);
+    game.create_bible(&client, "A drowned abbey.").unwrap();
+    assert_eq!(client.remaining(), 0);
+    assert!(game.world().calls().unwrap().is_empty());
+}
+
+#[test]
+fn calls_made_before_a_turn_fails_are_still_recorded() {
+    let (mut game, client) = begun();
+    let before = game.world().calls().unwrap().len();
+    // The director makes one call, then the script runs dry.
+    client.push(Response::canned_tool_use(
+        "q",
+        "query_entity",
+        json!({"id": 1}),
+    ));
+    assert!(game.turn(&client, "look", &mut |_| {}).is_err());
+    let calls = game.world().calls().unwrap();
+    assert_eq!(calls.len(), before + 1);
+    assert_eq!(calls.last().unwrap().call.role, "director");
+}

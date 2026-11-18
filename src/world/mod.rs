@@ -1,6 +1,7 @@
 //! The world store: entities in a containment tree, open key/value props,
 //! validated patches and an append-only event log, all in SQLite.
 
+mod calls;
 mod component;
 mod log;
 mod patch;
@@ -10,6 +11,7 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
+pub use calls::StoredCall;
 pub use component::Component;
 pub(crate) use component::{get_in, prop, remove_op, set_op};
 pub use log::{Event, EventKind};
@@ -63,6 +65,44 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS llm_prompts (
+    hash TEXT PRIMARY KEY,
+    text TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rerolls (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_seq   INTEGER NOT NULL,
+    n          INTEGER NOT NULL,
+    knobs      TEXT NOT NULL DEFAULT '{}',
+    dice       TEXT NOT NULL,
+    summary    TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_seq              INTEGER,
+    reroll_id             INTEGER,
+    variant               INTEGER,
+    log_seq               INTEGER NOT NULL,
+    role                  TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    effort                TEXT,
+    system_hash           TEXT REFERENCES llm_prompts(hash),
+    tools_hash            TEXT REFERENCES llm_prompts(hash),
+    request               TEXT NOT NULL,
+    response              TEXT NOT NULL,
+    input_tokens          INTEGER NOT NULL,
+    output_tokens         INTEGER NOT NULL,
+    cache_creation_tokens INTEGER NOT NULL,
+    cache_read_tokens     INTEGER NOT NULL,
+    latency_ms            INTEGER NOT NULL,
+    cost_usd              REAL,
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS llm_calls_turn ON llm_calls(turn_seq);
 ";
 
 /// An entity: engine-owned core plus open props.
@@ -105,9 +145,14 @@ pub enum StoreError {
 }
 
 /// Version of the store layout, recorded in `meta` as `schema_version`.
-/// Stores with another version (or none, from before versioning) can't be
-/// opened: saves are not migrated.
-pub const SCHEMA_VERSION: i64 = 5;
+/// A store one additive bump behind ([`UPGRADABLE_FROM`]) is upgraded in
+/// place when opened; any other version (or none, from before versioning)
+/// is refused.
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// The oldest schema [`World::open`] upgrades in place. v5 → v6 only adds
+/// tables (model-call records, rerolls) and meta keys (`lineage`, …).
+pub const UPGRADABLE_FROM: i64 = 5;
 
 /// Result of an applied patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,9 +259,32 @@ impl World {
 
     fn init(conn: Connection) -> Result<World, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch(SCHEMA)?;
-        check_schema_version(&conn)?;
+        // One transaction, so a refused store is left exactly as it was.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        check_schema_version(&tx)?;
+        tx.commit()?;
         Ok(World { conn })
+    }
+
+    /// A `meta` value, if set.
+    pub(crate) fn meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The random id every branch of one game shares (meta `lineage`).
+    pub fn lineage(&self) -> Result<String, StoreError> {
+        self.meta("lineage")?
+            .ok_or_else(|| StoreError::Corrupt("meta lineage is missing".into()))
+    }
+
+    /// The save this one was forked from (meta `parent`), if it is a branch
+    /// of a save file.
+    pub fn parent(&self) -> Result<Option<String>, StoreError> {
+        self.meta("parent")
     }
 
     /// Validate and apply a patch atomically, logging it as a `patch` event
@@ -377,6 +445,20 @@ impl World {
             .query_row(
                 "SELECT seq, kind, payload, at FROM events WHERE seq = ?1",
                 [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(seq, kind, payload, at)| parse_event(seq, kind, payload, at))
+            .transpose()
+    }
+
+    /// The latest event of `kind`, if there is one.
+    pub fn last_event(&self, kind: EventKind) -> Result<Option<Event>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT seq, kind, payload, at FROM events WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
+                [kind.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
@@ -570,19 +652,56 @@ fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
             return Err(incompatible("an older loam (before schema versions)"));
         }
         conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
-            [SCHEMA_VERSION.to_string()],
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1), ('lineage', ?2)",
+            params![SCHEMA_VERSION.to_string(), new_lineage()],
         )?;
         return Ok(());
     };
     match stored.parse::<i64>() {
         Ok(SCHEMA_VERSION) => Ok(()),
+        Ok(UPGRADABLE_FROM) => upgrade(conn),
         Ok(v) if v > SCHEMA_VERSION => Err(incompatible(&format!("a newer loam (schema {v})"))),
         Ok(v) => Err(incompatible(&format!("an older loam (schema {v})"))),
         Err(_) => Err(StoreError::Corrupt(format!(
             "meta schema_version = {stored:?}"
         ))),
     }
+}
+
+/// Upgrade a v5 store in place. The tables already exist (the schema is
+/// created before the version check); this stamps the version, mints a
+/// lineage and records `recorded_from`, the first event that can have
+/// model-call records, so older turns can say they have none.
+fn upgrade(conn: &Connection) -> Result<(), StoreError> {
+    let next: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
+        r.get(0)
+    })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES
+            ('schema_version', ?1), ('recorded_from', ?2)",
+        params![SCHEMA_VERSION.to_string(), next.to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('lineage', ?1)",
+        [new_lineage()],
+    )?;
+    Ok(())
+}
+
+/// A fresh random lineage id: 128 bits as hex, from the standard library's
+/// randomly keyed hasher.
+fn new_lineage() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let part = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(), part())
 }
 
 fn incompatible(made_by: &str) -> StoreError {

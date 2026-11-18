@@ -113,6 +113,7 @@ pub fn judge_turn(
         let prompt = judge_prompt(world, &q, &touched, input, &changes, narration)?;
         let request = Request::new(Model::Haiku, vec![Message::user(prompt)])
             .system(JUDGE_SYSTEM)
+            .role("judge")
             .max_tokens(2_000)
             .tools(vec![judge_tool()]);
         let (ruling, error) = match client.complete(&request) {

@@ -119,6 +119,7 @@ pub(crate) fn interpret(
     write!(prompt, "\nPlayer input: {input}").unwrap();
     let request = Request::new(Model::Haiku, vec![Message::user(prompt)])
         .system(INTERPRETER_SYSTEM)
+        .role("interpret")
         .max_tokens(INTERPRETER_MAX_TOKENS)
         .tools(vec![interpret_def()]);
     // The interpreter is an optimisation: if it fails, the director decides.
@@ -335,6 +336,7 @@ pub(crate) fn narrate(
     }
     let request = Request::new(Model::Sonnet, vec![Message::user(prompt)])
         .system(NARRATOR_SYSTEM)
+        .role("narrator")
         .max_tokens(NARRATOR_MAX_TOKENS);
     Ok(client.send(&request, on_text)?)
 }

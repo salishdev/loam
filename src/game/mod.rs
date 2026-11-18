@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 use crate::inventory::{DEFAULT_SLOTS, Inventory};
 use crate::llm::ToolUse;
 use crate::llm::{
-    Effort, LlmClient, LlmError, Message, Model, Request, StopReason, ToolOutput, run_tool_loop,
+    Effort, LlmClient, LlmError, Message, Model, RecordingClient, Request, StopReason, ToolOutput,
+    run_tool_loop,
 };
 use crate::quest::{self, Judgment, Quest};
 use crate::rules::{self, RuleId, Scope};
@@ -144,6 +145,17 @@ pub struct Game {
     inventory: Inventory,
     /// Seeds the dice when the stat sheet is written; random when `None`.
     dice_seed: Option<u64>,
+    /// Whether model calls are recorded in the store.
+    recording: bool,
+}
+
+/// Which turn a batch of model calls belongs to.
+#[derive(Debug, Clone, Copy)]
+enum CallsFor {
+    /// No turn: the bible and the opening scene.
+    NoTurn,
+    /// The latest player input (a turn just logged it; a tick follows it).
+    LastTurn,
 }
 
 impl Game {
@@ -153,7 +165,40 @@ impl Game {
             // The player's carry limit follows the sheet's capacity rule.
             inventory: Inventory::new(DEFAULT_SLOTS, stats::carry_limit),
             dice_seed: None,
+            recording: true,
         }
+    }
+
+    /// Turn recording of model calls on or off (on by default; `LOAM_RECORD=0`
+    /// turns it off in the REPL).
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on;
+    }
+
+    /// Run `f` with `client` wrapped in a [`RecordingClient`], then store
+    /// every call it made, even when `f` fails part way.
+    fn recorded<T>(
+        &mut self,
+        client: &dyn LlmClient,
+        calls_for: CallsFor,
+        f: impl FnOnce(&mut Self, &dyn LlmClient) -> Result<T, GameError>,
+    ) -> Result<T, GameError> {
+        if !self.recording {
+            return f(self, client);
+        }
+        let recorder = RecordingClient::new(client);
+        let result = f(self, &recorder);
+        let calls = recorder.take();
+        let stored = match calls_for {
+            _ if calls.is_empty() => Ok(()),
+            CallsFor::NoTurn => self.world.record_calls(None, &calls),
+            CallsFor::LastTurn => {
+                last_turn(&self.world).and_then(|seq| self.world.record_calls(seq, &calls))
+            }
+        };
+        let value = result?;
+        stored?;
+        Ok(value)
     }
 
     /// Fix the seed the dice get when the stat sheet is written, so a game
@@ -196,10 +241,17 @@ impl Game {
 
     /// Build the world bible and the stat sheet from a seed prompt.
     pub fn create_bible(&mut self, client: &dyn LlmClient, seed: &str) -> Result<(), GameError> {
+        self.recorded(client, CallsFor::NoTurn, |game, client| {
+            game.write_bible(client, seed)
+        })
+    }
+
+    fn write_bible(&mut self, client: &dyn LlmClient, seed: &str) -> Result<(), GameError> {
         self.world
             .log_event(EventKind::Input, &json!({"text": seed, "seed": true}))?;
         let request = Request::new(Model::Sonnet, vec![Message::user(seed)])
             .system(BIBLE_SYSTEM)
+            .role("bible")
             .effort(Effort::Medium)
             .tools(tools::definitions(Phase::Bible));
         self.run(
@@ -225,6 +277,16 @@ impl Game {
         client: &dyn LlmClient,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<TurnOutcome, GameError> {
+        self.recorded(client, CallsFor::NoTurn, |game, client| {
+            game.opening(client, on_text)
+        })
+    }
+
+    fn opening(
+        &mut self,
+        client: &dyn LlmClient,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, GameError> {
         if !self.has_bible()? {
             return Err(GameError::NotStarted);
         }
@@ -245,7 +307,21 @@ impl Game {
     /// describes the result (the fast path). Otherwise the director
     /// interprets the input, patches the world through tools and narrates,
     /// told why the rules didn't settle it.
+    ///
+    /// Every model call the turn makes is recorded against its input event
+    /// (see [`World::turn_calls`]).
     pub fn turn(
+        &mut self,
+        client: &dyn LlmClient,
+        input: &str,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<TurnOutcome, GameError> {
+        self.recorded(client, CallsFor::LastTurn, |game, client| {
+            game.play(client, input, on_text)
+        })
+    }
+
+    fn play(
         &mut self,
         client: &dyn LlmClient,
         input: &str,
@@ -346,6 +422,7 @@ impl Game {
             vec![Message::user(format!("{slice}{pressures}\n{instruction}"))],
         )
         .system(DIRECTOR_SYSTEM)
+        .role("director")
         .effort(Effort::Medium)
         .tools(tools::definitions(Phase::Play));
         let outcome = self.run(client, request, Phase::Play, MAX_TURN_CALLS, on_text, None)?;
@@ -525,6 +602,15 @@ fn untimed_mints(calls: &[(String, Value, Value)]) -> Vec<RuleId> {
         })
         .filter_map(|(.., result)| result["rule"].as_i64())
         .collect()
+}
+
+/// The latest player input event, if a turn has been played. The seed's
+/// input is not a turn.
+fn last_turn(world: &World) -> Result<Option<i64>, StoreError> {
+    Ok(world
+        .last_event(EventKind::Input)?
+        .filter(|e| e.payload["seed"] != json!(true))
+        .map(|e| e.seq))
 }
 
 /// A fresh dice seed from the clock and the process id.

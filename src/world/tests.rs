@@ -599,6 +599,203 @@ fn stores_from_other_schema_versions_are_refused() {
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
+/// Turn a fresh v6 store at `path` into what loam 0.2 (schema 5) wrote:
+/// no call tables, no lineage.
+fn make_v5(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE llm_calls; DROP TABLE llm_prompts; DROP TABLE rerolls;
+         DELETE FROM meta WHERE key = 'lineage';
+         UPDATE meta SET value = '5' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+}
+
+fn tables(path: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn v5_stores_upgrade_in_place_and_get_a_lineage() {
+    let path = temp_store("v5");
+    let mut w = World::open(&path).unwrap();
+    w.apply_engine_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .unwrap();
+    drop(w);
+    make_v5(&path);
+    assert!(!tables(&path).contains(&"llm_calls".to_owned()));
+
+    let w = World::open(&path).unwrap();
+    assert_eq!(schema_version(&w), SCHEMA_VERSION.to_string());
+    assert_eq!(w.lineage().unwrap().len(), 32);
+    assert_eq!(w.entities_of_kind("room").unwrap().len(), 1);
+    // The one event before the upgrade has no call records.
+    assert_eq!(w.recorded_from().unwrap(), 2);
+    assert!(w.calls().unwrap().is_empty());
+    let lineage = w.lineage().unwrap();
+    drop(w);
+    for table in ["llm_calls", "llm_prompts", "rerolls"] {
+        assert!(tables(&path).contains(&table.to_owned()), "{table}");
+    }
+    // Reopening keeps the lineage and the upgrade point.
+    let w = World::open(&path).unwrap();
+    assert_eq!(w.lineage().unwrap(), lineage);
+    assert_eq!(w.recorded_from().unwrap(), 2);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn refused_stores_are_left_untouched() {
+    let path = temp_store("v4");
+    World::open(&path).unwrap();
+    make_v5(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let err = World::open(&path).err().expect("refused").to_string();
+    assert!(err.contains("older loam (schema 4)"), "{err}");
+    assert!(!tables(&path).contains(&"llm_calls".to_owned()));
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn new_stores_get_distinct_lineages() {
+    let a = World::open_in_memory().unwrap().lineage().unwrap();
+    let b = World::open_in_memory().unwrap().lineage().unwrap();
+    assert_eq!(a.len(), 32);
+    assert_ne!(a, b);
+}
+
+// ---- call records ----
+
+fn call(role: &str, system: &str) -> crate::llm::CallRecord {
+    use crate::llm::{Message, Model, Request, Response, Usage};
+    let request = Request::new(Model::Sonnet, vec![Message::user("look")])
+        .system(system)
+        .role("x");
+    let mut response = Response::canned_text("You look.");
+    response.usage = Usage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 100,
+        cache_read_input_tokens: 0,
+    };
+    let mut record = crate::llm::CallRecord::new(&request, &response, 42);
+    record.role = role.into();
+    record
+}
+
+fn prompt_count(w: &World) -> i64 {
+    w.conn
+        .query_row("SELECT COUNT(*) FROM llm_prompts", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn call_records_round_trip_and_share_system_prompts() {
+    let w = World::open_in_memory().unwrap();
+    let seq = w
+        .log_event(EventKind::Input, &json!({"text": "look"}))
+        .unwrap();
+    w.record_calls(
+        Some(seq),
+        &[call("interpret", "S1"), call("director", "S1")],
+    )
+    .unwrap();
+    w.record_calls(Some(seq), &[call("judge", "S2")]).unwrap();
+    assert_eq!(prompt_count(&w), 2, "each system prompt stored once");
+
+    let calls = w.turn_calls(seq).unwrap();
+    let roles: Vec<_> = calls.iter().map(|c| c.call.role.as_str()).collect();
+    assert_eq!(roles, ["interpret", "director", "judge"]);
+    let first = &calls[0];
+    assert_eq!(first.call, call("interpret", "S1"));
+    assert_eq!(first.system_hash, calls[1].system_hash);
+    assert_ne!(first.system_hash, calls[2].system_hash);
+    assert_eq!(first.turn_seq, Some(seq));
+    assert_eq!(first.log_seq, seq);
+    assert_eq!(first.reroll_id, None);
+    assert_eq!(first.call.latency_ms, 42);
+    assert!(first.call.cost_usd.unwrap() > 0.0);
+    assert!(w.turn_calls(seq + 1).unwrap().is_empty());
+}
+
+#[test]
+fn fork_copies_call_records_up_to_the_fork_point() {
+    let mut w = World::open_in_memory().unwrap();
+    // The bible's calls follow the seed's input event.
+    w.log_event(EventKind::Input, &json!({"text": "seed", "seed": true}))
+        .unwrap();
+    w.record_calls(None, &[call("bible", "B")]).unwrap();
+    w.apply_engine_patch(&Patch::new(vec![create("hall", "Hall", "room", None)]))
+        .unwrap();
+    let first = w
+        .log_event(EventKind::Input, &json!({"text": "a"}))
+        .unwrap();
+    w.record_calls(Some(first), &[call("director", "D")])
+        .unwrap();
+    let second = w
+        .log_event(EventKind::Input, &json!({"text": "b"}))
+        .unwrap();
+    w.record_calls(Some(second), &[call("director", "D2")])
+        .unwrap();
+
+    let branch = w.fork_in_memory(first).unwrap();
+    let roles: Vec<_> = branch
+        .calls()
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.call.role, c.turn_seq))
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            ("bible".to_owned(), None),
+            ("director".to_owned(), Some(first))
+        ]
+    );
+    assert_eq!(prompt_count(&branch), 2, "only the prompts the copies use");
+    assert_eq!(branch.calls().unwrap()[1].call.system.as_deref(), Some("D"));
+    assert_eq!(branch.lineage().unwrap(), w.lineage().unwrap());
+
+    // A fork before any record copies none; a replay ignores them.
+    assert!(w.fork_in_memory(0).unwrap().calls().unwrap().is_empty());
+    let replayed = w.replay_in_memory().unwrap();
+    assert_eq!(replayed.state().unwrap(), w.state().unwrap());
+    assert!(replayed.calls().unwrap().is_empty());
+}
+
+#[test]
+fn file_forks_name_their_parent() {
+    let path = temp_store("parent");
+    let w = World::open(&path).unwrap();
+    w.log_event(EventKind::Input, &json!({"text": "a"}))
+        .unwrap();
+    let branch_path = path.with_file_name("branch.db");
+    let _ = std::fs::remove_file(&branch_path);
+    let branch = w.fork(1, &branch_path).unwrap();
+    let parent = branch.parent().unwrap().expect("parent");
+    assert!(parent.ends_with("save.db"), "{parent}");
+    assert_eq!(branch.lineage().unwrap(), w.lineage().unwrap());
+    // A replay of the branch is the same branch, with the same parent.
+    assert_eq!(
+        branch.replay_in_memory().unwrap().parent().unwrap(),
+        Some(parent)
+    );
+    assert_eq!(w.parent().unwrap(), None);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
 // ---- relations ----
 
 fn relate(subject: impl Into<EntityRef>, rel: &str, object: impl Into<EntityRef>) -> Op {

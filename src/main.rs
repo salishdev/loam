@@ -16,6 +16,9 @@
 //! terminal the prompt is coloured, typed input is bold and the engine's
 //! bracketed notices are dim; `NO_COLOR` turns colour off.
 //!
+//! Every model call is recorded in the save (request, response, usage,
+//! latency, cost); `LOAM_RECORD=0` turns recording off.
+//!
 //! Variables such as `ANTHROPIC_API_KEY` can live in a `.env` file, read from
 //! the current directory and then the repo root; real environment variables
 //! win.
@@ -69,6 +72,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = args.save;
     let client = AnthropicClient::from_env()?;
     let mut game = Game::new(World::open(&path)?);
+    game.set_recording(std::env::var("LOAM_RECORD").map_or(true, |v| v.trim() != "0"));
     if seed_file.is_some() && game.has_bible()? {
         note(&format!(
             "[{path} already has a world; the seed is ignored]"

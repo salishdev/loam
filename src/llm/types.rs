@@ -144,6 +144,16 @@ pub enum Effort {
     High,
 }
 
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
 /// One Messages API call. Thinking is left at the model default (adaptive).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
@@ -153,6 +163,9 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub effort: Option<Effort>,
+    /// What the call is for (`director`, `interpret`, `judge`…), for the
+    /// call records. Never sent to the API.
+    pub role: Option<&'static str>,
 }
 
 impl Request {
@@ -164,6 +177,7 @@ impl Request {
             messages,
             tools: Vec::new(),
             effort: None,
+            role: None,
         }
     }
 
@@ -186,9 +200,15 @@ impl Request {
         self.effort = Some(effort);
         self
     }
+
+    /// Label the call's role for the call records.
+    pub fn role(mut self, role: &'static str) -> Self {
+        self.role = Some(role);
+        self
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -201,7 +221,7 @@ pub enum StopReason {
     Other(String),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -216,7 +236,7 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Response {
     pub id: String,
     /// The model that actually answered (may differ after a refusal fallback).

@@ -62,22 +62,26 @@ impl World {
         let target = World::open_in_memory()?;
         // A full replay of a branch is still that branch.
         let branch_point = self.forked_at()?;
-        self.rebuild_into(self.last_seq()?, branch_point, target)
+        self.rebuild_into(self.last_seq()?, branch_point, false, target)
     }
 
     /// Branch this session at event `at`: a new in-memory world holding the
     /// log up to and including `at` and the state those events produce.
     /// `at = 0` gives an empty world. This world is left untouched.
+    ///
+    /// The branch shares this world's lineage, names this save as its
+    /// `parent` when it is a file, and gets copies of the call records
+    /// written up to `at`.
     pub fn fork_in_memory(&self, at: i64) -> Result<World, ReplayError> {
         let target = World::open_in_memory()?;
-        self.rebuild_into(at, Some(at), target)
+        self.rebuild_into(at, Some(at), true, target)
     }
 
     /// Like [`fork_in_memory`](Self::fork_in_memory), but the branch is a
     /// new SQLite file at `path`, which must not already hold a world.
     pub fn fork(&self, at: i64, path: impl AsRef<Path>) -> Result<World, ReplayError> {
         let target = World::open(path)?;
-        self.rebuild_into(at, Some(at), target)
+        self.rebuild_into(at, Some(at), true, target)
     }
 
     /// The event this world was forked at, if it is a branch.
@@ -133,11 +137,15 @@ impl World {
     }
 
     /// Replay events up to `at` into the empty `target`, recording
-    /// `branch_point` as where it was forked.
+    /// `branch_point` as where it was forked. The target takes this world's
+    /// lineage. A new branch (`fork`) also gets this save as `parent` and
+    /// the call records written up to `at`; a replay keeps this world's
+    /// parent and ignores call records.
     fn rebuild_into(
         &self,
         at: i64,
         branch_point: Option<i64>,
+        fork: bool,
         mut target: World,
     ) -> Result<World, ReplayError> {
         let last = self.last_seq()?;
@@ -152,11 +160,30 @@ impl World {
         for event in &events {
             replay_event(&tx, event)?;
         }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('lineage', ?1)",
+            [self.lineage()?],
+        )?;
         if let Some(point) = branch_point {
             tx.execute(
                 "INSERT INTO meta (key, value) VALUES ('forked_at', ?1)",
                 [point.to_string()],
             )?;
+        }
+        let parent = match self.conn.path().filter(|p| !p.is_empty()) {
+            Some(path) if fork => Some(path.to_owned()),
+            // A replay, or a branch of a world held in memory, keeps its
+            // parent.
+            _ => self.parent()?,
+        };
+        if let Some(parent) = parent {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('parent', ?1)",
+                [parent],
+            )?;
+        }
+        if fork {
+            super::calls::copy_calls(&self.conn, &tx, at)?;
         }
         tx.commit()?;
         Ok(target)
@@ -167,7 +194,8 @@ impl World {
             "SELECT NOT EXISTS (SELECT 1 FROM events)
                 AND NOT EXISTS (SELECT 1 FROM entities)
                 AND NOT EXISTS (SELECT 1 FROM relations)
-                AND NOT EXISTS (SELECT 1 FROM meta WHERE key != 'schema_version')",
+                AND NOT EXISTS (SELECT 1 FROM meta
+                    WHERE key NOT IN ('schema_version', 'lineage'))",
             [],
             |r| r.get(0),
         )?)
