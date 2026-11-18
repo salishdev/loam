@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
+use crate::explain::{self, Notes, Topic};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::reroll::{self, Head, VariantView};
 use crate::worker::{Command, Event};
@@ -144,6 +145,15 @@ impl RerollScreen {
     }
 }
 
+/// Where a first-time note shows: at the top of the side panel or of a
+/// full-screen view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotePlace {
+    Panel,
+    Context,
+    Reroll,
+}
+
 /// Something only the terminal can do, done by the event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermAction {
@@ -237,6 +247,10 @@ pub struct App {
     pub reroll_open: bool,
     /// A terminal action for the event loop to perform.
     pub action: Option<TermAction>,
+    /// The topics this save has explained, this session included.
+    explained: Notes,
+    /// First-time notes waiting to be dismissed, oldest first.
+    pub notes: Vec<(NotePlace, Topic)>,
     /// Set by the last draw.
     pub areas: Areas,
     pub(crate) story_height: usize,
@@ -284,6 +298,8 @@ impl App {
             reroll: None,
             reroll_open: false,
             action: None,
+            explained: Notes::default(),
+            notes: Vec::new(),
             areas: Areas::default(),
             story_height: 20,
             story_width: 80,
@@ -291,8 +307,71 @@ impl App {
             panel_width: 40,
             context_height: 20,
         };
+        app.explained = Notes::load(&app.view);
         app.refresh_status();
         app
+    }
+
+    /// Queue the notes of `topics` this save hasn't shown yet at `place`,
+    /// and have the worker record them as shown.
+    fn explain_first(&mut self, place: NotePlace, topics: impl IntoIterator<Item = Topic>) {
+        let fresh = self.explained.fresh(topics);
+        if fresh.is_empty() {
+            return;
+        }
+        self.notes.extend(fresh.iter().map(|t| (place, *t)));
+        // Not `send`: the worker reports nothing for it.
+        self.outbox.push(Command::Explained(fresh));
+    }
+
+    /// The place on top of the screen that can show a note.
+    fn note_place(&self) -> Option<NotePlace> {
+        if self.help_open {
+            None
+        } else if self.context.is_some() {
+            Some(NotePlace::Context)
+        } else if self.reroll_open && self.reroll.is_some() {
+            Some(NotePlace::Reroll)
+        } else if self.panel_open {
+            Some(NotePlace::Panel)
+        } else {
+            None
+        }
+    }
+
+    /// The note `place` shows, if it is on screen: the oldest waiting
+    /// there, and how many more wait behind it.
+    pub fn note_at(&self, place: NotePlace) -> Option<(Topic, usize)> {
+        if self.note_place() != Some(place) {
+            return None;
+        }
+        let mut waiting = self.notes.iter().filter(|(p, _)| *p == place);
+        let (_, first) = waiting.next()?;
+        Some((*first, waiting.count()))
+    }
+
+    /// The note's text as shown, `more` waiting behind it.
+    pub fn note_text(topic: Topic, more: usize) -> String {
+        let more = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        format!("ⓘ {}{more}", topic.line())
+    }
+
+    /// Dismiss the note on screen; `false` when none is shown.
+    fn dismiss_note(&mut self) -> bool {
+        let Some(place) = self.note_place() else {
+            return false;
+        };
+        match self.notes.iter().position(|(p, _)| *p == place) {
+            Some(i) => {
+                self.notes.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The worker is running something.
@@ -409,6 +488,11 @@ impl App {
                 self.refresh_status();
             }
             Event::RerollDone(outcome) => {
+                let topics = match (&outcome, &self.reroll) {
+                    (Ok(()), Some(r)) => explain::reroll_topics(&reroll::summarize(&r.variants)),
+                    _ => Vec::new(),
+                };
+                self.explain_first(NotePlace::Reroll, topics);
                 if let Some(screen) = self.reroll.as_mut() {
                     screen.running = false;
                     if let Err(e) = outcome {
@@ -490,6 +574,7 @@ impl App {
     /// Open (or redraw) the `:brain` table with `row` selected.
     fn show_brains(&mut self, row: usize) {
         self.open_view(":brain", "", self.brains.table());
+        self.explain_first(NotePlace::Panel, [Topic::Brain]);
         if let Some(v) = self.panel.last_mut() {
             v.selected = Some(TABLE_HEADER_LINES + row);
         }
@@ -586,7 +671,9 @@ impl App {
         }
         let calls = turn.as_ref().map_or(0, |t| t.calls.len());
         x.selected = x.selected.min(calls.saturating_sub(1));
+        let topics = turn.as_ref().map(explain::turn_topics).unwrap_or_default();
         x.turn = turn;
+        self.explain_first(NotePlace::Panel, topics);
     }
 
     /// Keys for the X-ray panel; `false` leaves the key to the panel.
@@ -680,7 +767,8 @@ impl App {
                     raw: xray::tree::raw_json(call),
                     typing: None,
                     query: None,
-                })
+                });
+                self.explain_first(NotePlace::Context, [Topic::Context]);
             }
             Err(e) => self.flash = Some(format!("[:context unavailable: {e}]")),
         }
@@ -688,6 +776,10 @@ impl App {
 
     /// Keys while the context viewer is open.
     fn context_key(&mut self, key: KeyEvent) {
+        let typing = self.context.as_ref().is_some_and(|cv| cv.typing.is_some());
+        if !typing && key.code == KeyCode::Char('x') && self.dismiss_note() {
+            return;
+        }
         let height = self.context_height.max(1);
         let Some(cv) = self.context.as_mut() else {
             return;
@@ -798,6 +890,7 @@ impl App {
             .unwrap_or(0)
             .min(self.branches.len().saturating_sub(1));
         self.open_view(":branches", "", text);
+        self.explain_first(NotePlace::Panel, [Topic::Branch]);
         if let Some(v) = self.panel.last_mut()
             && !self.branches.is_empty()
         {
@@ -884,6 +977,9 @@ impl App {
 
     /// Keys while the reroll view is open.
     fn reroll_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('x') && self.dismiss_note() {
+            return;
+        }
         let height = self.story_height.max(1);
         let Some(screen) = self.reroll.as_mut() else {
             self.reroll_open = false;
@@ -1008,6 +1104,10 @@ impl App {
         let from = self.switching_from.take();
         match outcome {
             Ok(look) => {
+                // Another save: its own notes (a new branch keeps its
+                // parent's).
+                self.explained = Notes::load(&self.view);
+                self.explain_first(NotePlace::Panel, [Topic::Branch]);
                 self.story.clear();
                 self.streaming = false;
                 self.story_scroll = 0;
@@ -1111,7 +1211,10 @@ impl App {
             }
             ":context" => {
                 match commands::context(&self.view, arg) {
-                    Ok(ContextReport::Text(text)) => self.open_view(cmd, arg, text),
+                    Ok(ContextReport::Text(text)) => {
+                        self.open_view(cmd, arg, text);
+                        self.explain_first(NotePlace::Panel, [Topic::Context]);
+                    }
                     Ok(ContextReport::Call { seq, n, call, .. }) => self.view_call(seq, n, &call),
                     Ok(ContextReport::VariantCall {
                         reroll,
@@ -1128,7 +1231,11 @@ impl App {
         }
         if let Some(report) = commands::report(&self.view, cmd, arg) {
             match report {
-                Ok(text) => self.open_view(cmd, arg, text),
+                Ok(text) => {
+                    self.open_view(cmd, arg, text);
+                    let topics = commands::command_topics(cmd).iter().copied();
+                    self.explain_first(NotePlace::Panel, topics);
+                }
                 Err(notice) => self.flash = Some(notice),
             }
             return;
@@ -1190,6 +1297,12 @@ impl App {
         match key.code {
             KeyCode::Char('c' | 'd') if ctrl => {
                 self.quit = true;
+                return;
+            }
+            KeyCode::Char('n') if ctrl => {
+                if !self.dismiss_note() {
+                    self.flash = Some("No note to dismiss.".into());
+                }
                 return;
             }
             _ if self.context.is_some() && !self.help_open => {
@@ -1431,6 +1544,9 @@ impl App {
     }
 
     fn panel_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('x') && self.dismiss_note() {
+            return;
+        }
         if self.brain_key(key) || self.xray_key(key) || self.branch_key(key) {
             return;
         }
@@ -1677,6 +1793,14 @@ impl App {
         if let Some(f) = &self.flash {
             return f.clone();
         }
+        let hints = self.focus_hints();
+        match self.note_place().and_then(|p| self.note_at(p)) {
+            Some(_) if self.search.is_none() => format!("Ctrl-N dismiss note · {hints}"),
+            _ => hints,
+        }
+    }
+
+    fn focus_hints(&self) -> String {
         if self.search.is_some() {
             return "type to search · Enter find · Esc cancel".into();
         }
@@ -1764,7 +1888,8 @@ pub fn help_text() -> String {
     format!(
         "{}\n\nTUI: Ctrl-X (or :xray) toggles the X-ray panel; in it ↑↓ select a call, \
          Enter opens its context, [ ] step turns and r rerolls the turn. Ctrl-R (or :reroll) \
-         rerolls the last turn into a full-screen view of variants. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
+         rerolls the last turn into a full-screen view of variants. Ctrl-N dismisses a \
+         first-time note. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
          capture (off restores native text selection; Shift-drag selects while it's on). \
          Press ? outside the input line for the keys.",
         commands::HELP
@@ -1821,6 +1946,8 @@ Anywhere
   Ctrl-X            X-ray panel
   Ctrl-B            branches
   Ctrl-R            reroll the last turn
+  Ctrl-N            dismiss the note at the top of the panel or view
+                    (x too, while it has focus); :explain repeats any
   Ctrl-C Ctrl-D     quit
 
 Mouse: wheel scrolls, click focuses. :mouse off (or LOAM_MOUSE=0)
@@ -1834,7 +1961,20 @@ pub(crate) mod tests {
 
     pub(crate) fn app() -> App {
         let (game, _) = begun();
-        App::new(game.into_world(), true)
+        seen_notes(App::new(game.into_world(), true))
+    }
+
+    /// `app` with every first-time note already shown, so tests about
+    /// something else don't meet one.
+    pub(crate) fn seen_notes(mut app: App) -> App {
+        app.explained = Notes::all();
+        app
+    }
+
+    /// `app` as a new save sees it: no notes shown yet.
+    pub(crate) fn fresh_notes(mut app: App) -> App {
+        app.explained = Notes::default();
+        app
     }
 
     pub(crate) fn key(code: KeyCode) -> KeyEvent {
@@ -2129,7 +2269,7 @@ pub(crate) mod tests {
         let b = world.fork(at, &branch).unwrap();
         b.set_label("early").unwrap();
         drop(b);
-        let mut app = App::new(World::open_read_only(&main).unwrap(), true);
+        let mut app = seen_notes(App::new(World::open_read_only(&main).unwrap(), true));
 
         // Ctrl-B opens the tree on the current save, focused.
         app.on_key(ctrl('b'));
@@ -2207,7 +2347,7 @@ pub(crate) mod tests {
         let world = World::open(&main).unwrap();
         let branch = dir.join("mill.b1.db");
         drop(world.fork(2, &branch).unwrap());
-        let mut app = App::new(World::open_read_only(&main).unwrap(), true);
+        let mut app = seen_notes(App::new(World::open_read_only(&main).unwrap(), true));
         typed(&mut app, ":switch 2");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(
@@ -2262,7 +2402,7 @@ pub(crate) mod tests {
         ]);
         game.turn(&client, "wait", &mut |_| {}).unwrap();
         let second = crate::xray::latest_turn(game.world()).unwrap().unwrap();
-        (App::new(game.into_world(), true), first, second)
+        (seen_notes(App::new(game.into_world(), true)), first, second)
     }
 
     /// A reroll's head and a finished variant `n`, as the worker sends them.
@@ -2409,7 +2549,7 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        let mut app = App::new(game.into_world(), true);
+        let mut app = seen_notes(App::new(game.into_world(), true));
         app.on_key(ctrl('r'));
         app.on_event(Event::RerollStarted(started.unwrap()));
         app.on_event(Event::RerollProgress(done.remove(0)));
@@ -2433,6 +2573,111 @@ pub(crate) mod tests {
             .and_then(|v| v.xray.as_ref())
             .and_then(|x| x.turn.as_ref())
             .map(|t| t.seq)
+    }
+
+    #[test]
+    fn xray_notes_show_once_per_save_and_ctrl_n_or_x_dismisses_them() {
+        let (app, first, _) = xray_app();
+        let mut app = fresh_notes(app);
+        // Off, the X-ray explains nothing.
+        assert!(app.notes.is_empty());
+        app.on_key(ctrl('x'));
+        // The latest turn went to the director.
+        assert_eq!(app.note_at(NotePlace::Panel).unwrap().0, Topic::Director);
+        assert_eq!(
+            app.outbox,
+            [Command::Explained(vec![Topic::Director])],
+            "recorded through the worker"
+        );
+        assert!(app.hints().starts_with("Ctrl-N dismiss note"));
+        // Stepping back to the first turn adds what it shows.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Panel);
+        app.on_key(key(KeyCode::Char('[')));
+        assert_eq!(xray_turn(&app), Some(first));
+        let queued: Vec<Topic> = app.notes.iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            queued,
+            [
+                Topic::Director,
+                Topic::Cache,
+                Topic::Cost,
+                Topic::Refusal,
+                Topic::Rule
+            ]
+        );
+        assert_eq!(app.note_at(NotePlace::Panel), Some((Topic::Director, 4)));
+        app.on_key(ctrl('n'));
+        assert_eq!(app.note_at(NotePlace::Panel), Some((Topic::Cache, 3)));
+        // `x` dismisses too while the panel has focus.
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.note_at(NotePlace::Panel).unwrap().0, Topic::Cost);
+        // Nothing new turns up for topics already shown.
+        app.outbox.clear();
+        app.on_key(key(KeyCode::Char(']')));
+        app.on_key(key(KeyCode::Char('[')));
+        assert!(app.outbox.is_empty());
+        app.notes.clear();
+        app.on_key(ctrl('n'));
+        assert_eq!(app.flash.as_deref(), Some("No note to dismiss."));
+    }
+
+    #[test]
+    fn views_explain_themselves_where_they_open() {
+        let (app, first, _) = xray_app();
+        let mut app = fresh_notes(app);
+        app.open_context(first, 1);
+        assert_eq!(app.note_at(NotePlace::Context), Some((Topic::Context, 0)));
+        // The viewer covers the panel, whose notes wait.
+        assert_eq!(app.note_at(NotePlace::Panel), None);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.notes.is_empty());
+        app.on_key(key(KeyCode::Esc));
+        typed(&mut app, ":context");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.notes.is_empty(), "context was explained already");
+        typed(&mut app, ":brain");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.note_at(NotePlace::Panel), Some((Topic::Brain, 0)));
+        app.notes.clear();
+        app.focus = Focus::Input;
+        typed(&mut app, ":fork 1");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.note_at(NotePlace::Panel), Some((Topic::Branch, 0)));
+
+        // A reroll whose variants disagree explains the split.
+        let mut app = fresh_notes(seen_notes(app));
+        app.notes.clear();
+        app.on_key(ctrl('r'));
+        let (head, variants) = reroll_events(2);
+        app.on_event(Event::RerollStarted(head));
+        for v in variants {
+            app.on_event(Event::RerollProgress(v));
+        }
+        assert!(app.notes.is_empty(), "nothing until it finishes");
+        app.on_event(Event::RerollDone(Ok(())));
+        assert_eq!(
+            app.note_at(NotePlace::Reroll),
+            Some((Topic::RerollSplit, 1))
+        );
+        assert!(
+            App::note_text(Topic::RerollSplit, 1).starts_with("ⓘ reroll-split: The same moment")
+                && App::note_text(Topic::RerollSplit, 1).ends_with("(+1 more)")
+        );
+    }
+
+    #[test]
+    fn explain_opens_in_the_panel() {
+        let mut app = app();
+        typed(&mut app, ":explain");
+        app.on_key(key(KeyCode::Enter));
+        let top = app.panel.last().unwrap();
+        assert!(app.panel_open && top.text.starts_with("Topics"));
+        typed(&mut app, ":explain refusal");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().text, Topic::Refusal.line());
+        assert_eq!(app.panel.last().unwrap().title(), ":explain refusal");
     }
 
     #[test]

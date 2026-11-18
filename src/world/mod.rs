@@ -317,6 +317,15 @@ impl World {
             .optional()?)
     }
 
+    /// Set a `meta` value.
+    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
     /// The random id every branch of one game shares (meta `lineage`).
     pub fn lineage(&self) -> Result<String, StoreError> {
         self.meta("lineage")?

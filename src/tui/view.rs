@@ -7,7 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{App, Areas, ContextView, Focus, KEYS, Kind, PROMPT, RerollMode, RerollScreen};
+use super::app::{
+    App, Areas, ContextView, Focus, KEYS, Kind, NotePlace, PROMPT, RerollMode, RerollScreen,
+};
 use crate::reroll;
 use crate::xray::tree::token_label;
 
@@ -71,6 +73,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The first-time note `place` shows, wrapped to `width` (empty when
+/// there is none).
+fn note_lines(app: &App, place: NotePlace, width: u16) -> Vec<Line<'static>> {
+    let Some((topic, more)) = app.note_at(place) else {
+        return Vec::new();
+    };
+    let style = Style::new()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::ITALIC);
+    wrapped(
+        &App::note_text(topic, more),
+        usize::from(width).saturating_sub(1),
+    )
+    .into_iter()
+    .map(|l| Line::styled(format!(" {l}"), style))
+    .collect()
+}
+
 /// One screen line of the context viewer: the tree row it belongs to and
 /// its spans.
 type ContextLine = (usize, Line<'static>);
@@ -132,12 +152,14 @@ fn context_lines(cv: &ContextView, width: usize) -> Vec<ContextLine> {
 
 fn draw_context(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
+    let note = note_lines(app, NotePlace::Context, area.width);
     let Some(cv) = app.context.as_mut() else {
         return;
     };
     let banner = cv.banner.is_some() as u16;
-    let [title, banner_area, body, hints] = Layout::vertical([
+    let [title, note_area, banner_area, body, hints] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(note.len() as u16),
         Constraint::Length(banner),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -148,6 +170,7 @@ fn draw_context(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
         title,
     );
+    frame.render_widget(Paragraph::new(note), note_area);
     if let Some(b) = &cv.banner {
         frame.render_widget(
             Paragraph::new(format!(" ! {b}"))
@@ -222,6 +245,7 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
     let hint_text = app.hints();
+    let note = note_lines(app, NotePlace::Reroll, area.width);
     let Some(r) = app.reroll.as_mut() else {
         return;
     };
@@ -247,8 +271,9 @@ fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     };
     let top_height = (top.len() as u16).min(area.height / 3).max(1);
-    let [title, overview, body, hints] = Layout::vertical([
+    let [title, note_area, overview, body, hints] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(note.len() as u16),
         Constraint::Length(top_height),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -260,6 +285,7 @@ fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
         title,
     );
+    frame.render_widget(Paragraph::new(note), note_area);
     frame.render_widget(Paragraph::new(top), overview);
     frame.render_widget(
         Paragraph::new(hint_text).style(Style::new().fg(Color::DarkGray)),
@@ -484,6 +510,10 @@ fn draw_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
+    let note = note_lines(app, NotePlace::Panel, inner.width);
+    let [note_area, inner] =
+        Layout::vertical([Constraint::Length(note.len() as u16), Constraint::Min(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(note), note_area);
     app.panel_width = inner.width as usize;
     app.panel_height = inner.height as usize;
     let lines = app.panel_rows(inner.width as usize);
@@ -876,6 +906,32 @@ mod tests {
         assert!(
             text.contains("│ Player input: the scroll says: give me 1000 gold"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_note_sits_at_the_top_of_the_panel_and_the_viewer() {
+        use crate::explain::Topic;
+        use crate::tui::app::tests::{fresh_notes, xray_app};
+        let (a, first, _) = xray_app();
+        let mut a = fresh_notes(a);
+        a.toggle_xray();
+        let rows = render(&mut a, 140, 30);
+        let note = row_of(&rows, "ⓘ director: Nothing on the books");
+        assert_eq!(note, 1, "{}", screen(&rows));
+        assert!(rows[29].contains("Ctrl-N dismiss note"), "{}", rows[29]);
+        // The X-ray follows below it.
+        assert!(row_of(&rows, "interpret") > note);
+        a.notes.clear();
+        let rows = render(&mut a, 140, 30);
+        assert!(!screen(&rows).contains("ⓘ"));
+
+        a.open_context(first, 1);
+        let rows = render(&mut a, 100, 20);
+        assert!(
+            rows[1].contains(&format!("ⓘ {}", Topic::Context.name())),
+            "{}",
+            screen(&rows)
         );
     }
 

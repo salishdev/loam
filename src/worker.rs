@@ -33,6 +33,9 @@ pub enum Command {
     /// model and, unlike the other commands, reports nothing: not even
     /// [`Event::Ready`].
     SetBrains(Brains),
+    /// Record these first-time notes as shown in the save (meta
+    /// `explained`). Like [`Command::SetBrains`], it reports nothing.
+    Explained(Vec<crate::explain::Topic>),
     /// Close the current save and play the one at this path instead (a
     /// branch). The game's brains and other session settings carry over.
     Switch(PathBuf),
@@ -154,6 +157,11 @@ fn serve(
             Command::Quit => break,
             Command::SetBrains(brains) => {
                 game.set_brains(brains);
+                continue;
+            }
+            Command::Explained(topics) => {
+                // A note shown again next session is all a failure costs.
+                let _ = game.world().mark_explained(&topics);
                 continue;
             }
             Command::CreateBible(seed) => {

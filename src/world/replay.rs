@@ -197,6 +197,13 @@ impl World {
         }
         if fork {
             super::calls::copy_calls(&self.conn, &tx, at)?;
+            // The player has read these notes, whichever branch they're on.
+            if let Some(explained) = self.meta("explained")? {
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES ('explained', ?1)",
+                    [explained],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(target)

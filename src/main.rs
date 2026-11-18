@@ -174,6 +174,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `:brain` changes, for this session only; the worker gets a copy.
     let mut brains = loam::llm::Brains::default();
     let mut xray_on = commands::xray_from_env(std::env::var("LOAM_XRAY").ok().as_deref());
+    // Which first-time notes this save has shown.
+    let mut notes = loam::explain::Notes::load(&view);
     // The latest reroll's variants, for `:reroll show`.
     let mut last_reroll: Option<(loam::reroll::Head, Vec<loam::reroll::VariantView>)> = None;
     loop {
@@ -189,7 +191,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (cmd, arg) = commands::split(input);
             if let Some(report) = commands::report(&view, cmd, arg) {
                 match report {
-                    Ok(text) => say(&text),
+                    Ok(text) => {
+                        say(&text);
+                        show_notes(&mut notes, &worker, commands::command_topics(cmd).to_vec());
+                    }
                     Err(notice) => note(&notice),
                 }
                 continue;
@@ -225,6 +230,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let (title, call, raw) = match commands::context(&view, arg) {
                         Ok(commands::ContextReport::Text(text)) => {
                             say(&text);
+                            show_notes(&mut notes, &worker, [loam::explain::Topic::Context]);
                             continue;
                         }
                         Ok(commands::ContextReport::Call { seq, n, call, raw }) => {
@@ -270,6 +276,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(spec) => {
                         worker.send(WorkerCommand::Reroll(spec));
                         if let Some(done) = await_reroll(&worker) {
+                            let summary = loam::reroll::summarize(&done.1);
+                            show_notes(&mut notes, &worker, loam::explain::reroll_topics(&summary));
                             last_reroll = Some(done);
                         }
                     }
@@ -289,20 +297,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ":help" => say(commands::HELP),
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
+            if matches!(cmd, ":switch" | ":adopt") {
+                // Another save: its own notes.
+                notes = loam::explain::Notes::load(&view);
+            }
+            show_notes(&mut notes, &worker, commands::command_topics(cmd).to_vec());
             continue;
         }
         println!();
         let before = loam::xray::latest_turn(&view).ok().flatten();
         worker.send(WorkerCommand::Turn(input.to_string()));
         await_worker(&worker);
-        if let Some(footer) = commands::xray_footer(&view, before, xray_on) {
-            note(&format!("\n{footer}"));
+        if let Some(x) = commands::new_turn_xray(&view, before, xray_on) {
+            note(&format!("\n{}", loam::xray::footer(&x)));
+            show_notes(&mut notes, &worker, loam::explain::turn_topics(&x));
         }
     }
     // The writer must close last so it checkpoints the WAL into the save.
     drop(view);
     worker.shut_down();
     Ok(())
+}
+
+/// Plain mode: print the notes of `topics` this save hasn't shown yet, as
+/// dim lines, and have the worker record them.
+fn show_notes(
+    notes: &mut loam::explain::Notes,
+    worker: &Worker,
+    topics: impl IntoIterator<Item = loam::explain::Topic>,
+) {
+    let fresh = notes.fresh(topics);
+    if fresh.is_empty() {
+        return;
+    }
+    for t in &fresh {
+        note(&commands::note_line(*t));
+    }
+    worker.send(WorkerCommand::Explained(fresh));
 }
 
 /// The TUI unless `--plain`, `LOAM_PLAIN=1` or stdout isn't a terminal.

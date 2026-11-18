@@ -4,6 +4,7 @@
 //! Inspector commands read only the store, through whatever [`World`] they
 //! are given (the front ends pass their read-only view), never a model.
 
+use crate::explain::Topic;
 use crate::game::{GameError, TickOutcome, TurnOutcome};
 use crate::inspect;
 use crate::quest::Verdict;
@@ -16,6 +17,7 @@ pub const COMMANDS: &[&str] = &[
     ":brain",
     ":branches",
     ":context",
+    ":explain",
     ":fork",
     ":glossary",
     ":help",
@@ -53,7 +55,8 @@ shows this game's saves as a tree, :switch <n|name> plays another, :fork <event>
 [label] makes a new branch; :reroll [#turn] [n] [director=<model>] [effort=<level>] \
 [dice=fresh] reruns a turn n times (default 3, max 8) without touching the save and compares \
 the variants, :reroll show <n> reads one, :adopt <n> plays it as a new branch; :rerolls lists \
-past rerolls, :context r<id>.<n>[.<k>] shows a variant's calls.";
+past rerolls, :context r<id>.<n>[.<k>] shows a variant's calls; :explain [topic] explains \
+the workbench's ideas (a note also explains each the first time it turns up).";
 
 /// The commands that start with `prefix` (which starts with `:`), sorted.
 pub fn complete(prefix: &str) -> Vec<&'static str> {
@@ -89,9 +92,25 @@ pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, Stri
         ":branches" => branches(world),
         ":rerolls" => crate::reroll::list(world),
         ":fork" => return Some(fork(world, arg)),
+        ":explain" => return Some(Ok(crate::explain::explain(arg))),
         _ => return None,
     };
     Some(result.map_err(|e| format!("[{cmd} unavailable: {e}]")))
+}
+
+/// The topics a workbench command's view involves, for first-time notes.
+pub fn command_topics(cmd: &str) -> &'static [Topic] {
+    match cmd {
+        ":context" => &[Topic::Context],
+        ":brain" => &[Topic::Brain],
+        ":branches" | ":switch" | ":fork" | ":adopt" => &[Topic::Branch],
+        _ => &[],
+    }
+}
+
+/// A first-time note as plain mode prints it (dim).
+pub fn note_line(topic: Topic) -> String {
+    format!("[note · {}]", topic.line())
 }
 
 /// `:branches`: the tree of saves beside this one that share its lineage.
@@ -184,6 +203,12 @@ pub fn xray_from_env(value: Option<&str>) -> bool {
 /// X-ray is `on` and a turn was played after `before` (the latest turn
 /// before the command ran).
 pub fn xray_footer(world: &World, before: Option<i64>, on: bool) -> Option<String> {
+    new_turn_xray(world, before, on).map(|x| xray::footer(&x))
+}
+
+/// The X-ray of the latest turn, if X-ray is `on` and a turn was played
+/// after `before`.
+pub fn new_turn_xray(world: &World, before: Option<i64>, on: bool) -> Option<xray::TurnXray> {
     if !on {
         return None;
     }
@@ -191,10 +216,7 @@ pub fn xray_footer(world: &World, before: Option<i64>, on: bool) -> Option<Strin
     if before.is_some_and(|b| b >= seq) {
         return None;
     }
-    xray::turn(world, seq)
-        .ok()
-        .flatten()
-        .map(|x| xray::footer(&x))
+    xray::turn(world, seq).ok().flatten()
 }
 
 /// What `:context` asked for.
@@ -763,6 +785,44 @@ mod tests {
         assert!(
             matches!(context(world, "rx"), Ok(ContextReport::Text(t)) if t.starts_with("Usage"))
         );
+    }
+
+    #[test]
+    fn explain_prints_in_plain_mode_and_notes_follow_views_and_the_xray() {
+        use crate::explain::{Notes, Topic, turn_topics};
+        let (game, seq) = crate::xray::tests::played();
+        let world = game.world();
+        let Some(Ok(list)) = report(world, ":explain", "") else {
+            panic!("a report");
+        };
+        assert!(
+            list.starts_with("Topics (:explain <topic> for one):"),
+            "{list}"
+        );
+        assert_eq!(
+            report(world, ":explain", "cost"),
+            Some(Ok(Topic::Cost.line()))
+        );
+        assert_eq!(complete(":ex"), [":explain"]);
+        assert!(HELP.contains(":explain [topic]"));
+
+        // What plain mode prints after a turn with X-ray on, once per save.
+        let mut notes = Notes::load(world);
+        let x = new_turn_xray(world, Some(seq - 1), true).unwrap();
+        assert_eq!(new_turn_xray(world, Some(seq - 1), false), None);
+        let fresh = notes.fresh(turn_topics(&x));
+        assert_eq!(fresh[0], Topic::Director);
+        assert_eq!(
+            note_line(fresh[0]),
+            format!("[note · director: {}]", Topic::Director.text())
+        );
+        assert!(notes.fresh(turn_topics(&x)).is_empty());
+        assert_eq!(
+            notes.fresh(command_topics(":brain").to_vec()),
+            [Topic::Brain]
+        );
+        assert_eq!(command_topics(":adopt"), [Topic::Branch]);
+        assert!(command_topics(":rules").is_empty());
     }
 
     #[test]

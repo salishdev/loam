@@ -2,6 +2,7 @@
 
 pub mod branches;
 pub mod commands;
+pub mod explain;
 pub mod game;
 pub mod glossary;
 pub mod inspect;
