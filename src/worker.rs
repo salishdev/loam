@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 
 use crate::game::{Game, GameError, TickOutcome, TurnOutcome};
 use crate::llm::{Brains, LlmClient};
+use crate::reroll::{self, Head, Progress, Reroll, VariantView};
 use crate::world::World;
 
 /// What a front end asks the worker to do.
@@ -35,6 +36,14 @@ pub enum Command {
     /// Close the current save and play the one at this path instead (a
     /// branch). The game's brains and other session settings carry over.
     Switch(PathBuf),
+    /// Rerun a turn several times without touching the save
+    /// ([`crate::reroll`]). No tick follows. The finished reroll is kept
+    /// for [`Command::Adopt`] until the next reroll or switch.
+    Reroll(reroll::Spec),
+    /// Write variant `n` of the latest reroll into a new branch save beside
+    /// this one. It doesn't switch: the front end does, as for `:switch`,
+    /// so its read-only view closes before the writer.
+    Adopt(usize),
     /// Stop the worker; the game and its save are dropped.
     Quit,
 }
@@ -63,8 +72,19 @@ pub enum Event {
         path: PathBuf,
         outcome: Result<String, String>,
     },
-    /// Progress of a reroll's variants (filled in by the reroll work).
-    RerollProgress { done: usize, of: usize },
+    /// A reroll started: what it reruns and how.
+    RerollStarted(Head),
+    /// One of the reroll's variants finished.
+    RerollProgress(VariantView),
+    /// The reroll finished, or why it couldn't run (what to tell the
+    /// player).
+    RerollDone(Result<(), String>),
+    /// [`Command::Adopt`] finished: the new branch's path, or what to tell
+    /// the player.
+    Adopted {
+        variant: usize,
+        outcome: Result<PathBuf, String>,
+    },
     /// The worker finished a command and waits for the next.
     Ready,
 }
@@ -78,7 +98,7 @@ pub struct Worker {
 
 impl Worker {
     /// Start a worker that plays `game` against `client`.
-    pub fn spawn(game: Game, client: Box<dyn LlmClient + Send>) -> Worker {
+    pub fn spawn(game: Game, client: Box<dyn LlmClient + Send + Sync>) -> Worker {
         let (commands, inbox) = channel();
         let (outbox, events) = channel();
         let thread = std::thread::Builder::new()
@@ -117,8 +137,15 @@ impl Worker {
     }
 }
 
-fn serve(game: Game, client: &dyn LlmClient, inbox: &Receiver<Command>, out: &Sender<Event>) {
+fn serve(
+    game: Game,
+    client: &(dyn LlmClient + Sync),
+    inbox: &Receiver<Command>,
+    out: &Sender<Event>,
+) {
     let mut game = game;
+    // The latest reroll, for adopting one of its variants.
+    let mut latest: Option<Reroll> = None;
     while let Ok(command) = inbox.recv() {
         let mut stream = |t: &str| {
             let _ = out.send(Event::Text(t.to_string()));
@@ -163,7 +190,27 @@ fn serve(game: Game, client: &dyn LlmClient, inbox: &Receiver<Command>, out: &Se
             }
             Command::Switch(path) => {
                 let outcome = switch(&mut game, &path);
+                if outcome.is_ok() {
+                    latest = None;
+                }
                 let _ = out.send(Event::Switched { path, outcome });
+            }
+            Command::Reroll(spec) => {
+                latest = None;
+                let outcome =
+                    reroll::run(game.world(), &spec, game.brains(), &|_| client, &mut |p| {
+                        let _ = out.send(match p {
+                            Progress::Started(head) => Event::RerollStarted(head.clone()),
+                            Progress::Variant(v) => Event::RerollProgress(v.clone()),
+                        });
+                    });
+                let _ = out.send(Event::RerollDone(outcome.map(|r| {
+                    latest = Some(r);
+                })));
+            }
+            Command::Adopt(variant) => {
+                let outcome = adopt(&game, latest.as_ref(), variant);
+                let _ = out.send(Event::Adopted { variant, outcome });
             }
         }
         if out.send(Event::Ready).is_err() {
@@ -185,6 +232,22 @@ fn switch(game: &mut Game, path: &std::path::Path) -> Result<String, String> {
     Ok(game
         .look()
         .unwrap_or_else(|e| format!("[nothing to see here yet: {e}]")))
+}
+
+/// Write variant `n` of `latest` into the next free branch path beside
+/// the save being played.
+fn adopt(game: &Game, latest: Option<&Reroll>, n: usize) -> Result<PathBuf, String> {
+    let Some(reroll) = latest else {
+        return Err(
+            "No reroll to adopt from: :reroll first (only the latest can be adopted).".into(),
+        );
+    };
+    let Some(current) = game.world().path() else {
+        return Err("This game isn't saved in a file, so it can't have branches.".into());
+    };
+    let path = crate::branches::next_path(&current);
+    reroll.adopt(n, &path)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -374,6 +437,88 @@ mod tests {
         let director = calls.iter().rfind(|c| c.call.role == "director").unwrap();
         assert_eq!(director.call.model, Model::Haiku.id());
         drop(played);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reroll_reports_each_variant_then_adopt_writes_a_branch() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        let dir = temp_dir("worker-reroll");
+        let main = saved_game(&dir, "mill.db");
+        // One turn, then three variants of it, all text: any order works.
+        let client = ScriptedClient::new(["You wait.", "A", "A", "A"].map(Response::canned_text));
+        let worker = Worker::spawn(Game::new(World::open(&main).unwrap()), Box::new(client));
+        worker.send(Command::Adopt(1));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::Adopted { outcome: Err(e), .. } if e.contains("No reroll")),
+            "{events:?}"
+        );
+        worker.send(Command::Turn("wait".into()));
+        until_ready(&worker);
+        let before = World::open_read_only(&main).unwrap().last_seq().unwrap();
+
+        worker.send(Command::Reroll(reroll::Spec::default()));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::RerollStarted(h) if h.n == 3),
+            "{events:?}"
+        );
+        let mut seen: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::RerollProgress(v) => Some(v.n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen[0], 1, "variant 1 first");
+        seen.sort();
+        assert_eq!(seen, [1, 2, 3]);
+        assert!(matches!(
+            events[events.len() - 2],
+            Event::RerollDone(Ok(()))
+        ));
+        // No narration streamed into the story, and no tick.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Text(_) | Event::TickDone { .. }))
+        );
+        assert_eq!(
+            World::open_read_only(&main).unwrap().last_seq().unwrap(),
+            before
+        );
+
+        worker.send(Command::Adopt(2));
+        let events = until_ready(&worker);
+        let Event::Adopted {
+            variant: 2,
+            outcome: Ok(path),
+        } = &events[0]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(*path, dir.join("mill.b1.db"));
+        worker.send(Command::Switch(path.clone()));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(&events[0], Event::Switched { outcome: Ok(_), .. }),
+            "{events:?}"
+        );
+        // Switching drops the reroll: its variants belong to the old save.
+        worker.send(Command::Adopt(3));
+        let events = until_ready(&worker);
+        assert!(
+            matches!(
+                &events[0],
+                Event::Adopted {
+                    outcome: Err(_),
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
+        worker.shut_down();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

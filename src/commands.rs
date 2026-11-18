@@ -12,6 +12,7 @@ use crate::xray;
 
 /// Every `:` command, for Tab completion and help.
 pub const COMMANDS: &[&str] = &[
+    ":adopt",
     ":brain",
     ":branches",
     ":context",
@@ -28,6 +29,8 @@ pub const COMMANDS: &[&str] = &[
     ":quests",
     ":quit",
     ":relations",
+    ":reroll",
+    ":rerolls",
     ":rules",
     ":stats",
     ":switch",
@@ -47,7 +50,10 @@ cost, refusals, rules and rolls; :context [#turn] lists a turn's calls, :context
 [--raw] shows one call's full context (--raw: its JSON); :brain [<role>=<model>] \
 [effort=<level>] | :brain reset shows or changes each role's model and effort; :branches \
 shows this game's saves as a tree, :switch <n|name> plays another, :fork <event> [path.db] \
-[label] makes a new branch.";
+[label] makes a new branch; :reroll [#turn] [n] [director=<model>] [effort=<level>] \
+[dice=fresh] reruns a turn n times (default 3, max 8) without touching the save and compares \
+the variants, :reroll show <n> reads one, :adopt <n> plays it as a new branch; :rerolls lists \
+past rerolls, :context r<id>.<n>[.<k>] shows a variant's calls.";
 
 /// The commands that start with `prefix` (which starts with `:`), sorted.
 pub fn complete(prefix: &str) -> Vec<&'static str> {
@@ -81,6 +87,7 @@ pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, Stri
         ":pressures" => inspect::pressures(world),
         ":log" => inspect::log(world, arg),
         ":branches" => branches(world),
+        ":rerolls" => crate::reroll::list(world),
         ":fork" => return Some(fork(world, arg)),
         _ => return None,
     };
@@ -202,13 +209,24 @@ pub enum ContextReport {
         call: Box<StoredCall>,
         raw: bool,
     },
+    /// Call `k` of variant `variant` of reroll `reroll`.
+    VariantCall {
+        reroll: i64,
+        variant: usize,
+        k: usize,
+        call: Box<StoredCall>,
+        raw: bool,
+    },
 }
 
-/// `:context [#seq | #seq.N] [--raw]`: the latest turn's (or turn `seq`'s)
-/// calls, or one call. `Err` is an engine notice.
+/// `:context [#seq | #seq.N | r<id>.<n>[.<k>]] [--raw]`: the latest
+/// turn's (or turn `seq`'s, or a reroll variant's) calls, or one call.
+/// `Err` is an engine notice.
 pub fn context(world: &World, arg: &str) -> Result<ContextReport, String> {
     let failed = |e: StoreError| format!("[:context unavailable: {e}]");
-    let usage = || ContextReport::Text("Usage: :context [#turn | #turn.N] [--raw]".into());
+    let usage = || {
+        ContextReport::Text("Usage: :context [#turn | #turn.N | r<id>.<n>[.<k>]] [--raw]".into())
+    };
     let mut raw = false;
     let mut target = None;
     for word in arg.split_whitespace() {
@@ -217,6 +235,14 @@ pub fn context(world: &World, arg: &str) -> Result<ContextReport, String> {
             _ if target.is_none() => target = Some(word),
             _ => return Ok(usage()),
         }
+    }
+    if let Some(variant) = target.and_then(|t| t.strip_prefix('r')) {
+        let parts: Option<Vec<usize>> = variant.split('.').map(|p| p.parse().ok()).collect();
+        return match parts.as_deref() {
+            Some(&[id, n]) => variant_context(world, id as i64, n, None, raw).map_err(failed),
+            Some(&[id, n, k]) => variant_context(world, id as i64, n, Some(k), raw).map_err(failed),
+            _ => Ok(usage()),
+        };
     }
     let (seq, n) = match target {
         None => match xray::latest_turn(world).map_err(failed)? {
@@ -264,6 +290,52 @@ pub fn context(world: &World, arg: &str) -> Result<ContextReport, String> {
     }
 }
 
+/// `:context r<id>.<n>`: variant `n` of reroll `id`'s calls, or call `k`.
+fn variant_context(
+    world: &World,
+    id: i64,
+    n: usize,
+    k: Option<usize>,
+    raw: bool,
+) -> Result<ContextReport, StoreError> {
+    let calls = world.variant_calls(id, n as i64)?;
+    if calls.is_empty() {
+        return Ok(ContextReport::Text(format!(
+            "Reroll r{id} has no recorded calls for variant {n}; :rerolls lists rerolls."
+        )));
+    }
+    let Some(k) = k else {
+        let mut out = format!("Reroll r{id} variant {n}:");
+        for (i, c) in calls.iter().enumerate() {
+            let line = xray::CallLine::new(i + 1, c);
+            out.push_str(&format!("\n  {}  {}", line.head(), line.usage()));
+        }
+        out.push_str(&format!("\n\n:context r{id}.{n}.<k> shows one call."));
+        return Ok(ContextReport::Text(out));
+    };
+    Ok(
+        match k.checked_sub(1).and_then(|i| calls.into_iter().nth(i)) {
+            Some(call) => ContextReport::VariantCall {
+                reroll: id,
+                variant: n,
+                k,
+                call: Box::new(call),
+                raw,
+            },
+            None => ContextReport::Text(format!("Reroll r{id} variant {n} has no call {k}.")),
+        },
+    )
+}
+
+/// A variant call's heading line: `Reroll r3 variant 2 call 1 · director · haiku`.
+pub fn variant_call_title(reroll: i64, n: usize, k: usize, call: &StoredCall) -> String {
+    format!(
+        "Reroll r{reroll} variant {n} call {k} · {} · {}",
+        call.call.role,
+        xray::short_model(&call.call.model)
+    )
+}
+
 /// A call's heading line: `Turn #12 call 2 · director · sonnet`.
 pub fn call_title(seq: i64, n: usize, call: &StoredCall) -> String {
     format!(
@@ -273,12 +345,11 @@ pub fn call_title(seq: i64, n: usize, call: &StoredCall) -> String {
     )
 }
 
-/// Plain mode's `:context #seq.N`: the call's whole context tree as text,
+/// Plain mode's `:context #seq.N` (under `title`): the call's whole context tree as text,
 /// or its JSON with `raw`.
 pub fn call_text(
     world: &World,
-    seq: i64,
-    n: usize,
+    title: &str,
     call: &StoredCall,
     raw: bool,
 ) -> Result<String, String> {
@@ -287,7 +358,7 @@ pub fn call_text(
     }
     let (tree, banner) =
         xray::call_tree(world, call).map_err(|e| format!("[:context unavailable: {e}]"))?;
-    let mut out = call_title(seq, n, call);
+    let mut out = title.to_owned();
     if let Some(b) = banner {
         out.push_str(&format!("\n! {b}"));
     }
@@ -583,7 +654,7 @@ mod tests {
             panic!("expected a call");
         };
         assert_eq!((n, raw), (2, false));
-        let text = call_text(world, seq, n, &call, false).unwrap();
+        let text = call_text(world, &call_title(seq, n, &call), &call, false).unwrap();
         assert!(
             text.starts_with(&format!("Turn #{seq} call 2 · director · sonnet\n\n")),
             "{text}"
@@ -596,7 +667,7 @@ mod tests {
         };
         assert!(raw);
         let json: serde_json::Value =
-            serde_json::from_str(&call_text(world, seq, 2, &call, true).unwrap()).unwrap();
+            serde_json::from_str(&call_text(world, "", &call, true).unwrap()).unwrap();
         assert_eq!(json["role"], "director");
     }
 
@@ -635,6 +706,63 @@ mod tests {
             panic!("expected text");
         };
         assert_eq!(one, format!("Turn #{seq}: {}.", crate::xray::PRE_RECORDING));
+    }
+
+    #[test]
+    fn context_and_rerolls_reach_a_variants_calls() {
+        use crate::llm::{LlmClient, Response, ScriptedClient};
+        use crate::reroll;
+        let (game, _) = crate::xray::tests::played();
+        let world = game.world();
+        assert!(reroll::list(world).unwrap().contains("No rerolls yet"));
+        let scripts = [ScriptedClient::new([Response::canned_text("Again.")])];
+        let r = reroll::run(
+            world,
+            &reroll::Spec::parse("1 director=haiku").unwrap(),
+            game.brains(),
+            &|n| &scripts[n - 1] as &(dyn LlmClient + Sync),
+            &mut |_| {},
+        )
+        .unwrap();
+        let id = r.head.id;
+        let listed = report(world, ":rerolls", "").unwrap().unwrap();
+        assert!(
+            listed.contains(&format!("r{id} · turn #{}", r.head.turn_seq))
+                && listed.contains("director haiku · same dice")
+                && listed.contains("route: director 1/1"),
+            "{listed}"
+        );
+        let ContextReport::Text(list) = context(world, &format!("r{id}.1")).unwrap() else {
+            panic!("a list");
+        };
+        assert!(
+            list.contains(&format!("Reroll r{id} variant 1:")) && list.contains("director"),
+            "{list}"
+        );
+        let Ok(ContextReport::VariantCall {
+            reroll,
+            variant,
+            k,
+            call,
+            raw,
+        }) = context(world, &format!("r{id}.1.1 --raw"))
+        else {
+            panic!("one call");
+        };
+        assert_eq!((reroll, variant, k, raw), (id, 1, 1, true));
+        assert_eq!(
+            variant_call_title(reroll, variant, k, &call),
+            format!("Reroll r{id} variant 1 call 1 · director · haiku")
+        );
+        assert!(
+            matches!(context(world, &format!("r{id}.1.9")), Ok(ContextReport::Text(t)) if t.contains("no call 9"))
+        );
+        assert!(
+            matches!(context(world, "r99.1"), Ok(ContextReport::Text(t)) if t.contains("no recorded calls"))
+        );
+        assert!(
+            matches!(context(world, "rx"), Ok(ContextReport::Text(t)) if t.starts_with("Usage"))
+        );
     }
 
     #[test]

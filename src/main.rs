@@ -174,6 +174,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `:brain` changes, for this session only; the worker gets a copy.
     let mut brains = loam::llm::Brains::default();
     let mut xray_on = commands::xray_from_env(std::env::var("LOAM_XRAY").ok().as_deref());
+    // The latest reroll's variants, for `:reroll show`.
+    let mut last_reroll: Option<(loam::reroll::Head, Vec<loam::reroll::VariantView>)> = None;
     loop {
         println!();
         let Some(line) = editor.read_line(PROMPT)? else {
@@ -219,31 +221,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(usage) => say(usage),
                 },
-                ":context" => match commands::context(&view, arg) {
-                    Ok(commands::ContextReport::Text(text)) => say(&text),
-                    Ok(commands::ContextReport::Call { seq, n, call, raw }) => {
-                        match commands::call_text(&view, seq, n, &call, raw) {
-                            Ok(text) => page(&text),
-                            Err(notice) => note(&notice),
+                ":context" => {
+                    let (title, call, raw) = match commands::context(&view, arg) {
+                        Ok(commands::ContextReport::Text(text)) => {
+                            say(&text);
+                            continue;
                         }
+                        Ok(commands::ContextReport::Call { seq, n, call, raw }) => {
+                            (commands::call_title(seq, n, &call), call, raw)
+                        }
+                        Ok(commands::ContextReport::VariantCall {
+                            reroll,
+                            variant,
+                            k,
+                            call,
+                            raw,
+                        }) => (
+                            commands::variant_call_title(reroll, variant, k, &call),
+                            call,
+                            raw,
+                        ),
+                        Err(notice) => {
+                            note(&notice);
+                            continue;
+                        }
+                    };
+                    match commands::call_text(&view, &title, &call, raw) {
+                        Ok(text) => page(&text),
+                        Err(notice) => note(&notice),
                     }
-                    Err(notice) => note(&notice),
-                },
+                }
                 ":switch" => match commands::switch_target(&view, arg) {
-                    Ok(target) => {
-                        // The view closes before the worker's writer, so the
-                        // writer checkpoints the old save as it closes.
-                        let from = view.path();
-                        view = World::open_read_only(&target)?;
-                        worker.send(WorkerCommand::Switch(target));
-                        if !await_switch(&worker)
-                            && let Some(from) = from
-                        {
-                            view = World::open_read_only(from)?;
-                        }
-                    }
+                    Ok(target) => switch_plain(&mut view, &worker, target)?,
                     Err(said) => say(&said),
                 },
+                ":reroll" if arg.starts_with("show") => {
+                    let Some((_, variants)) = &last_reroll else {
+                        say("No reroll this session; :reroll runs one.");
+                        continue;
+                    };
+                    let n = arg["show".len()..].trim().parse::<usize>().ok();
+                    match n.and_then(|n| variants.iter().find(|v| v.n == n)) {
+                        Some(v) => say(&loam::reroll::variant_text(v)),
+                        None => say(&format!("Usage: :reroll show <1-{}>", variants.len())),
+                    }
+                }
+                ":reroll" => match loam::reroll::Spec::parse(arg) {
+                    Ok(spec) => {
+                        worker.send(WorkerCommand::Reroll(spec));
+                        if let Some(done) = await_reroll(&worker) {
+                            last_reroll = Some(done);
+                        }
+                    }
+                    Err(e) => say(&e),
+                },
+                ":adopt" => {
+                    let Ok(n) = arg.trim().parse::<usize>() else {
+                        say("Usage: :adopt <n> (a variant of the latest reroll)");
+                        continue;
+                    };
+                    worker.send(WorkerCommand::Adopt(n));
+                    if let Some(path) = await_adopt(&worker) {
+                        last_reroll = None;
+                        switch_plain(&mut view, &worker, path)?;
+                    }
+                }
                 ":help" => say(commands::HELP),
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
@@ -305,11 +347,82 @@ fn await_worker(worker: &Worker) -> Option<Result<(), GameError>> {
                 }
             }
             WorkerEvent::TickDone { outcome, .. } => note(&commands::tick_notice(&outcome)),
-            WorkerEvent::Switched { .. } | WorkerEvent::RerollProgress { .. } => {}
             WorkerEvent::Ready => break,
+            _ => {}
         }
     }
     fatal
+}
+
+/// Plain mode: play the branch at `target`. The view closes before the
+/// worker's writer, so the writer checkpoints the old save as it closes;
+/// if the switch fails the view goes back to the old save.
+fn switch_plain(view: &mut World, worker: &Worker, target: PathBuf) -> io::Result<()> {
+    let from = view.path();
+    *view = World::open_read_only(&target).map_err(io::Error::other)?;
+    worker.send(WorkerCommand::Switch(target));
+    if !await_switch(worker)
+        && let Some(from) = from
+    {
+        *view = World::open_read_only(from).map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Plain mode: report a reroll as it runs (a line per variant), then its
+/// summary and the variants stacked. Returns what it ran, if it started.
+fn await_reroll(worker: &Worker) -> Option<(loam::reroll::Head, Vec<loam::reroll::VariantView>)> {
+    let mut head = None;
+    let mut variants = Vec::new();
+    while let Some(event) = worker.recv() {
+        match event {
+            WorkerEvent::RerollStarted(h) => {
+                note(&format!("[{} …]", h.title()));
+                head = Some(h);
+            }
+            WorkerEvent::RerollProgress(v) => {
+                note(&format!("[{}]", loam::reroll::variant_heading(&v)));
+                variants.push(v);
+            }
+            WorkerEvent::RerollDone(outcome) => {
+                if let Err(e) = &outcome {
+                    note(&format!("[reroll: {e}]"));
+                }
+                if let Some(h) = &head {
+                    say(&format!("\n{}", loam::reroll::report_text(h, &variants)));
+                }
+            }
+            WorkerEvent::Ready => break,
+            _ => {}
+        }
+    }
+    head.map(|h| (h, variants))
+}
+
+/// Plain mode: the branch an `:adopt` made, or `None` after saying why
+/// it couldn't.
+fn await_adopt(worker: &Worker) -> Option<PathBuf> {
+    let mut made = None;
+    while let Some(event) = worker.recv() {
+        match event {
+            WorkerEvent::Adopted { variant, outcome } => match outcome {
+                Ok(path) => {
+                    say(&format!(
+                        "Adopted variant {variant} as {}.",
+                        path.file_name().map_or_else(
+                            || path.display().to_string(),
+                            |n| n.to_string_lossy().into_owned()
+                        )
+                    ));
+                    made = Some(path);
+                }
+                Err(e) => say(&e),
+            },
+            WorkerEvent::Ready => break,
+            _ => {}
+        }
+    }
+    made
 }
 
 /// Plain mode: report a branch switch; `false` if it failed and the old

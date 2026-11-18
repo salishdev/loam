@@ -1,7 +1,7 @@
 //! A scripted [`LlmClient`] for tests: no network, canned responses in order.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use super::{ContentBlock, LlmClient, LlmError, Request, Response};
 
@@ -11,41 +11,45 @@ use super::{ContentBlock, LlmClient, LlmError, Request, Response};
 /// exercised the same way the real client exercises them.
 #[derive(Debug, Default)]
 pub struct ScriptedClient {
-    script: RefCell<VecDeque<Response>>,
-    requests: RefCell<Vec<Request>>,
+    script: Mutex<VecDeque<Response>>,
+    requests: Mutex<Vec<Request>>,
 }
 
 impl ScriptedClient {
     pub fn new(responses: impl IntoIterator<Item = Response>) -> Self {
         ScriptedClient {
-            script: RefCell::new(responses.into_iter().collect()),
-            requests: RefCell::default(),
+            script: Mutex::new(responses.into_iter().collect()),
+            requests: Mutex::default(),
         }
     }
 
     /// Queue another response.
     pub fn push(&self, response: Response) {
-        self.script.borrow_mut().push_back(response);
+        self.script.lock().unwrap().push_back(response);
     }
 
     /// Every request received so far, in order.
     pub fn requests(&self) -> Vec<Request> {
-        self.requests.borrow().clone()
+        self.requests.lock().unwrap().clone()
     }
 
     /// Responses not yet consumed.
     pub fn remaining(&self) -> usize {
-        self.script.borrow().len()
+        self.script.lock().unwrap().len()
     }
 }
 
 impl LlmClient for ScriptedClient {
     fn send(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Response, LlmError> {
-        self.requests.borrow_mut().push(request.clone());
-        let n = self.requests.borrow().len();
+        let n = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            requests.len()
+        };
         let response = self
             .script
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .pop_front()
             .ok_or(LlmError::ScriptExhausted(n))?;
         for block in &response.content {

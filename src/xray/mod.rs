@@ -54,7 +54,7 @@ pub struct CallLine {
 }
 
 impl CallLine {
-    fn new(n: usize, stored: &StoredCall) -> CallLine {
+    pub fn new(n: usize, stored: &StoredCall) -> CallLine {
         let c = &stored.call;
         let u = &c.usage;
         let tool_calls = c.response["content"].as_array().map_or(0, |blocks| {
@@ -308,7 +308,7 @@ fn turn_events(world: &World, seq: i64) -> Result<Vec<Event>, StoreError> {
 }
 
 /// `refused: create "gold" (item) in #1 — not a container`
-fn refusal(e: &Event) -> Result<String, StoreError> {
+pub(crate) fn refusal(e: &Event) -> Result<String, StoreError> {
     let p = &e.payload;
     let reason = p["reason"].as_str().unwrap_or("refused").trim();
     let op = p["op"].as_u64().map(|i| i as usize);
@@ -480,7 +480,7 @@ fn dollars(cost: Option<f64>) -> String {
     }
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     let s = s.trim();
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),

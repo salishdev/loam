@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
+use crate::reroll::{self, Head, VariantView};
 use crate::worker::{Command, Event};
 use crate::world::{StoredCall, World};
 use crate::xray::{self, TurnXray, tree::Tree};
@@ -90,6 +91,59 @@ pub struct ContextView {
     pub query: Option<String>,
 }
 
+/// The full-screen reroll view: the latest reroll's summary and variants.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerollScreen {
+    /// `None` until the worker says the reroll started.
+    pub head: Option<Head>,
+    /// Finished variants, in the order they arrived.
+    pub variants: Vec<VariantView>,
+    /// The selected variant's number, from 1.
+    pub selected: usize,
+    pub mode: RerollMode,
+    /// First line shown in the narration and diff modes.
+    pub scroll: usize,
+    /// The worker is still running variants.
+    pub running: bool,
+    /// Why the reroll failed, if it did.
+    pub error: Option<String>,
+}
+
+/// What the reroll view shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerollMode {
+    /// Every variant side by side (or as tabs when they don't fit).
+    Columns,
+    /// The selected variant's whole narration.
+    Narration,
+    /// The selected variant's full diff, engine bookkeeping included.
+    Diff,
+}
+
+impl RerollScreen {
+    fn new() -> RerollScreen {
+        RerollScreen {
+            head: None,
+            variants: Vec::new(),
+            selected: 1,
+            mode: RerollMode::Columns,
+            scroll: 0,
+            running: true,
+            error: None,
+        }
+    }
+
+    /// Variant `n` (from 1), once it finished.
+    pub fn variant(&self, n: usize) -> Option<&VariantView> {
+        self.variants.iter().find(|v| v.n == n)
+    }
+
+    /// How many variants the reroll runs.
+    pub fn n(&self) -> usize {
+        self.head.as_ref().map_or(0, |h| h.n)
+    }
+}
+
 /// Something only the terminal can do, done by the event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TermAction {
@@ -138,6 +192,8 @@ pub struct App {
     cost_carried: f64,
     /// The save being left, until the worker confirms a switch.
     switching_from: Option<PathBuf>,
+    /// Said in the story once the switch under way lands (an adoption).
+    after_switch: Option<String>,
     /// The rows of the `:branches` view, as last scanned.
     branches: Vec<Branch>,
     pub status: Status,
@@ -175,6 +231,10 @@ pub struct App {
     pub quit: bool,
     /// The context viewer, while open; it covers the screen.
     pub context: Option<ContextView>,
+    /// The latest reroll's view, kept after closing for `:reroll show`.
+    pub reroll: Option<RerollScreen>,
+    /// The reroll view covers the screen.
+    pub reroll_open: bool,
     /// A terminal action for the event loop to perform.
     pub action: Option<TermAction>,
     /// Set by the last draw.
@@ -196,6 +256,7 @@ impl App {
             since_call,
             cost_carried: 0.0,
             switching_from: None,
+            after_switch: None,
             branches: Vec::new(),
             status: Status::default(),
             brains: Brains::default(),
@@ -220,6 +281,8 @@ impl App {
             mouse,
             quit: false,
             context: None,
+            reroll: None,
+            reroll_open: false,
             action: None,
             areas: Areas::default(),
             story_height: 20,
@@ -335,7 +398,46 @@ impl App {
                 self.refresh_panel();
             }
             Event::Switched { path, outcome } => self.switched(path, outcome),
-            Event::RerollProgress { .. } => {}
+            Event::RerollStarted(head) => {
+                let screen = self.reroll.get_or_insert_with(RerollScreen::new);
+                screen.head = Some(head);
+            }
+            Event::RerollProgress(v) => {
+                if let Some(screen) = self.reroll.as_mut() {
+                    screen.variants.push(v);
+                }
+                self.refresh_status();
+            }
+            Event::RerollDone(outcome) => {
+                if let Some(screen) = self.reroll.as_mut() {
+                    screen.running = false;
+                    if let Err(e) = outcome {
+                        if screen.head.is_none() {
+                            // Nothing ran: say why where the player is.
+                            self.reroll = None;
+                            self.reroll_open = false;
+                            self.flash = Some(e);
+                        } else {
+                            screen.error = Some(e);
+                        }
+                    }
+                }
+                self.refresh_status();
+            }
+            Event::Adopted { variant, outcome } => match outcome {
+                Ok(path) => {
+                    self.reroll_open = false;
+                    // Its variants belong to the save being left.
+                    self.reroll = None;
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    self.after_switch = Some(format!("Adopted variant {variant} as {name}."));
+                    self.switch_to(path);
+                }
+                Err(e) => self.flash = Some(e),
+            },
             Event::Ready => {
                 self.pending = self.pending.saturating_sub(1);
                 self.streaming = false;
@@ -527,7 +629,10 @@ impl App {
                     Err(e) => self.flash = Some(format!("[:xray unavailable: {e}]")),
                 }
             }
-            KeyCode::Char('r') => self.flash = Some("Rerolls aren't built yet (coming).".into()),
+            KeyCode::Char('r') => match seq {
+                Some(seq) => self.command(&format!(":reroll #{seq}")),
+                None => self.flash = Some("No turn to reroll yet.".into()),
+            },
             KeyCode::Char('s') => self.flash = Some("Surgery isn't built yet (coming).".into()),
             _ => return false,
         }
@@ -731,6 +836,146 @@ impl App {
         true
     }
 
+    /// `:reroll [#turn] [n] [knobs…]` starts a reroll and opens its view;
+    /// `:reroll show <n>` reopens the latest one on variant `n`.
+    fn reroll_command(&mut self, arg: &str) {
+        if let Some(rest) = arg.strip_prefix("show") {
+            let Some(screen) = self.reroll.as_mut() else {
+                self.flash = Some("No reroll this session; :reroll runs one.".into());
+                return;
+            };
+            match rest.trim().parse::<usize>() {
+                Ok(n) if (1..=screen.n()).contains(&n) => {
+                    screen.selected = n;
+                    screen.mode = RerollMode::Narration;
+                    screen.scroll = 0;
+                    self.reroll_open = true;
+                }
+                Ok(_) | Err(_) if rest.trim().is_empty() => self.reroll_open = true,
+                _ => self.flash = Some(format!("Usage: :reroll show <1-{}>", screen.n())),
+            }
+            return;
+        }
+        if self.refuse_while_busy() {
+            return;
+        }
+        match reroll::Spec::parse(arg) {
+            Ok(spec) => {
+                self.reroll = Some(RerollScreen::new());
+                self.reroll_open = true;
+                self.send(Command::Reroll(spec));
+            }
+            Err(e) => self.flash = Some(e),
+        }
+    }
+
+    /// `a` or `:adopt <n>`: make variant `n` of the latest reroll a new
+    /// branch, then switch to it.
+    fn adopt(&mut self, n: usize) {
+        if self.reroll.as_ref().is_some_and(|r| r.running) {
+            self.flash = Some("The reroll is still running; wait for it.".into());
+            return;
+        }
+        if self.refuse_while_busy() {
+            return;
+        }
+        self.send(Command::Adopt(n));
+    }
+
+    /// Keys while the reroll view is open.
+    fn reroll_key(&mut self, key: KeyEvent) {
+        let height = self.story_height.max(1);
+        let Some(screen) = self.reroll.as_mut() else {
+            self.reroll_open = false;
+            return;
+        };
+        let n = screen.n().max(1);
+        match (screen.mode, key.code) {
+            (RerollMode::Columns, KeyCode::Esc | KeyCode::Char('q')) => self.reroll_open = false,
+            (_, KeyCode::Esc | KeyCode::Char('q')) => {
+                screen.mode = RerollMode::Columns;
+                screen.scroll = 0;
+            }
+            (_, KeyCode::Left | KeyCode::Char('h')) => {
+                screen.selected = screen.selected.saturating_sub(1).max(1);
+                screen.scroll = 0;
+            }
+            (_, KeyCode::Right | KeyCode::Char('l')) => {
+                screen.selected = (screen.selected + 1).min(n);
+                screen.scroll = 0;
+            }
+            (_, KeyCode::Char(c @ '1'..='8')) => {
+                let pick = c as usize - '0' as usize;
+                if pick <= n {
+                    screen.selected = pick;
+                    screen.scroll = 0;
+                }
+            }
+            (_, KeyCode::Enter) => {
+                screen.mode = RerollMode::Narration;
+                screen.scroll = 0;
+            }
+            (_, KeyCode::Char('d')) => {
+                screen.mode = RerollMode::Diff;
+                screen.scroll = 0;
+            }
+            (_, KeyCode::Down | KeyCode::Char('j')) => screen.scroll += 1,
+            (_, KeyCode::Up | KeyCode::Char('k')) => {
+                screen.scroll = screen.scroll.saturating_sub(1)
+            }
+            (_, KeyCode::PageDown | KeyCode::Char(' ')) => screen.scroll += height,
+            (_, KeyCode::PageUp) => screen.scroll = screen.scroll.saturating_sub(height),
+            (_, KeyCode::Char('g')) => screen.scroll = 0,
+            (_, KeyCode::Char('c')) => {
+                let selected = screen.selected;
+                self.open_variant_context(selected);
+            }
+            (_, KeyCode::Char('a')) => {
+                let selected = screen.selected;
+                self.adopt(selected);
+            }
+            (_, KeyCode::Char('?')) => self.help_open = true,
+            _ => {}
+        }
+    }
+
+    /// Open the context viewer on variant `n`'s director call (or its
+    /// first call, on the fast path).
+    fn open_variant_context(&mut self, n: usize) {
+        let Some(id) = self
+            .reroll
+            .as_ref()
+            .and_then(|r| r.head.as_ref())
+            .map(|h| h.id)
+        else {
+            return;
+        };
+        let calls = match self.view.variant_calls(id, n as i64) {
+            Ok(c) => c,
+            Err(e) => {
+                self.flash = Some(format!("[:context unavailable: {e}]"));
+                return;
+            }
+        };
+        let Some(at) = calls
+            .iter()
+            .position(|c| c.call.role == "director")
+            .or((!calls.is_empty()).then_some(0))
+        else {
+            self.flash = Some(format!("Variant {n} has no recorded calls (yet)."));
+            return;
+        };
+        self.view_variant_call(id, n, at + 1, &calls[at]);
+    }
+
+    fn view_variant_call(&mut self, reroll: i64, n: usize, k: usize, call: &StoredCall) {
+        let seq = call.turn_seq.unwrap_or(0);
+        self.view_call(seq, k, call);
+        if let Some(cv) = self.context.as_mut() {
+            cv.title = commands::variant_call_title(reroll, n, k, call);
+        }
+    }
+
     /// Says so and returns `true` while the worker is busy.
     fn refuse_while_busy(&mut self) -> bool {
         if self.busy() {
@@ -771,9 +1016,13 @@ impl App {
                     || path.display().to_string(),
                     |n| n.to_string_lossy().into_owned(),
                 );
+                if let Some(said) = self.after_switch.take() {
+                    self.info(said);
+                }
                 self.info(format!("Switched to {name}.\n\n{look}"));
             }
             Err(e) => {
+                self.after_switch = None;
                 if let Some(from) = from
                     && let Ok(view) = World::open_read_only(&from)
                 {
@@ -864,6 +1113,13 @@ impl App {
                 match commands::context(&self.view, arg) {
                     Ok(ContextReport::Text(text)) => self.open_view(cmd, arg, text),
                     Ok(ContextReport::Call { seq, n, call, .. }) => self.view_call(seq, n, &call),
+                    Ok(ContextReport::VariantCall {
+                        reroll,
+                        variant,
+                        k,
+                        call,
+                        ..
+                    }) => self.view_variant_call(reroll, variant, k, &call),
                     Err(notice) => self.flash = Some(notice),
                 }
                 return;
@@ -908,6 +1164,13 @@ impl App {
                     Err(said) => self.flash = Some(said),
                 }
             }
+            ":reroll" => self.reroll_command(arg),
+            ":adopt" => match arg.trim().parse::<usize>() {
+                Ok(n) => self.adopt(n),
+                Err(_) => {
+                    self.flash = Some("Usage: :adopt <n> (a variant of the latest reroll)".into())
+                }
+            },
             ":tick" if self.busy() => {
                 self.flash = Some("The world is still answering; wait for it.".into());
             }
@@ -950,7 +1213,11 @@ impl App {
                 return;
             }
             KeyCode::Char('r') if ctrl => {
-                self.flash = Some("Rerolls aren't built yet.".into());
+                self.command(":reroll");
+                return;
+            }
+            _ if self.reroll_open && !self.help_open => {
+                self.reroll_key(key);
                 return;
             }
             KeyCode::PageUp => {
@@ -1373,6 +1640,17 @@ impl App {
             }
             return;
         }
+        // So does the reroll view: the wheel scrolls it.
+        if self.reroll_open
+            && let Some(r) = self.reroll.as_mut()
+        {
+            match m.kind {
+                MouseEventKind::ScrollUp => r.scroll = r.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => r.scroll += 3,
+                _ => {}
+            }
+            return;
+        }
         let at = Position::new(m.column, m.row);
         let over = |r: Option<Rect>| r.is_some_and(|r| r.contains(at));
         let pane = if over(self.areas.panel) {
@@ -1413,8 +1691,22 @@ impl App {
                     .into(),
             };
         }
+        if self.reroll_open
+            && let Some(r) = &self.reroll
+        {
+            let adopt = if r.running { "" } else { " · a adopt" };
+            return match r.mode {
+                RerollMode::Columns => format!(
+                    "←→ variant · Enter narration · d diff · c context{adopt} · Esc close · ? help"
+                ),
+                _ => format!(
+                    "←→ variant · j/k scroll · Enter narration · d diff · c context{adopt} · \
+                     Esc back"
+                ),
+            };
+        }
         if self.focus == Focus::Panel && self.xray_on_top() {
-            return "↑↓ select call · Enter/c context · [ ] turn · r reroll (coming) · \
+            return "↑↓ select call · Enter/c context · [ ] turn · r reroll · \
                     s surgery (coming) · Esc back · Tab focus"
                 .into();
         }
@@ -1471,7 +1763,8 @@ fn text_width(width: usize) -> usize {
 pub fn help_text() -> String {
     format!(
         "{}\n\nTUI: Ctrl-X (or :xray) toggles the X-ray panel; in it ↑↓ select a call, \
-         Enter opens its context and [ ] step turns. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
+         Enter opens its context, [ ] step turns and r rerolls the turn. Ctrl-R (or :reroll) \
+         rerolls the last turn into a full-screen view of variants. :panel toggles this panel (Ctrl-P), :mouse [on|off] switches mouse \
          capture (off restores native text selection; Shift-drag selects while it's on). \
          Press ? outside the input line for the keys.",
         commands::HELP
@@ -1508,7 +1801,14 @@ Story and panel
 
 X-ray panel (Ctrl-X)
   ↑ ↓ / Enter c     select a call / open its context
-  [ ]   r s         previous, next turn   reroll, surgery (coming)
+  [ ]   r s         previous, next turn   reroll this turn, surgery (coming)
+
+Reroll view (Ctrl-R, :reroll)
+  ← → h l  1-8      pick a variant
+  Enter   d         its whole narration, its full diff
+  c                 its director call in the context viewer
+  a                 adopt it: a new branch, switched to
+  j k  Esc          scroll   back to the columns, then close
 
 Context viewer
   Enter Space  / n N    fold, unfold   search, next, previous
@@ -1520,7 +1820,7 @@ Anywhere
   Ctrl-L            event log
   Ctrl-X            X-ray panel
   Ctrl-B            branches
-  Ctrl-R            reroll (coming)
+  Ctrl-R            reroll the last turn
   Ctrl-C Ctrl-D     quit
 
 Mouse: wheel scrolls, click focuses. :mouse off (or LOAM_MOUSE=0)
@@ -1703,8 +2003,6 @@ pub(crate) mod tests {
         let mut app = app();
         app.on_key(ctrl('l'));
         assert_eq!(app.panel.last().unwrap().cmd, ":log");
-        app.on_key(ctrl('r'));
-        assert!(app.flash.as_deref().unwrap().contains("Rerolls"));
         // Not a file save: the tree says there are no branches.
         app.on_key(ctrl('b'));
         assert!(app.panel.last().unwrap().text.contains("no branches"));
@@ -1967,6 +2265,168 @@ pub(crate) mod tests {
         (App::new(game.into_world(), true), first, second)
     }
 
+    /// A reroll's head and a finished variant `n`, as the worker sends them.
+    pub(crate) fn reroll_events(n: usize) -> (Head, Vec<VariantView>) {
+        use crate::reroll::{Fact, Played};
+        let head = Head {
+            id: 1,
+            turn_seq: 9,
+            input: "light the candle".into(),
+            n,
+            knobs: serde_json::json!({}),
+            dice: "same".into(),
+        };
+        let variants = (1..=n)
+            .map(|k| VariantView {
+                n: k,
+                result: Ok(Played {
+                    narration: format!("Narration of variant {k}."),
+                    route: "director".into(),
+                    facts: if k == 1 {
+                        vec![Fact {
+                            key: "candle.lit: false → true".into(),
+                            text: "candle.lit: false → true".into(),
+                            engine: false,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                }),
+                calls: 1,
+                cost_usd: 0.001,
+            })
+            .collect();
+        (head, variants)
+    }
+
+    #[test]
+    fn ctrl_r_starts_a_reroll_whose_view_fills_in_and_adopts() {
+        let mut app = app();
+        app.on_key(ctrl('r'));
+        assert_eq!(app.outbox, [Command::Reroll(reroll::Spec::default())]);
+        assert!(app.reroll_open);
+        // A second one waits for the first.
+        app.on_key(ctrl('r'));
+        assert_eq!(app.outbox.len(), 1);
+        let (head, variants) = reroll_events(3);
+        app.on_event(Event::RerollStarted(head));
+        app.on_event(Event::RerollProgress(variants[0].clone()));
+        // Adopting waits for the whole reroll.
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.flash.as_deref().unwrap().contains("still running"));
+        for v in &variants[1..] {
+            app.on_event(Event::RerollProgress(v.clone()));
+        }
+        app.on_event(Event::RerollDone(Ok(())));
+        app.on_event(Event::Ready);
+        let r = app.reroll.as_ref().unwrap();
+        assert_eq!((r.variants.len(), r.running), (3, false));
+        app.flash = None;
+        assert!(app.hints().contains("a adopt"));
+
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.reroll.as_ref().unwrap().selected, 3);
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.reroll.as_ref().unwrap().mode, RerollMode::Narration);
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.reroll.as_ref().unwrap().mode, RerollMode::Diff);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.reroll.as_ref().unwrap().mode, RerollMode::Columns);
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.outbox.last(), Some(&Command::Adopt(2)));
+        app.on_event(Event::Adopted {
+            variant: 2,
+            outcome: Err("This game isn't saved in a file.".into()),
+        });
+        app.on_event(Event::Ready);
+        assert!(app.flash.as_deref().unwrap().contains("isn't saved"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.reroll_open);
+
+        // `:reroll show` reopens it on a variant; `:adopt` adopts by number.
+        typed(&mut app, ":reroll show 3");
+        app.on_key(key(KeyCode::Enter));
+        let r = app.reroll.as_ref().unwrap();
+        assert!(app.reroll_open);
+        assert_eq!((r.selected, r.mode), (3, RerollMode::Narration));
+        app.reroll_open = false;
+        typed(&mut app, ":adopt 1");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.outbox.last(), Some(&Command::Adopt(1)));
+    }
+
+    #[test]
+    fn a_reroll_that_cannot_start_says_why() {
+        let mut app = app();
+        typed(&mut app, ":reroll 12");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.flash.as_deref().unwrap().contains("1 to 8"));
+        assert!(app.outbox.is_empty());
+        typed(&mut app, ":reroll director=haiku 2");
+        app.on_key(key(KeyCode::Enter));
+        app.on_event(Event::RerollDone(Err("No turn to reroll yet.".into())));
+        assert!(!app.reroll_open);
+        assert_eq!(app.flash.as_deref(), Some("No turn to reroll yet."));
+    }
+
+    #[test]
+    fn r_in_the_xray_rerolls_the_turn_shown() {
+        let (mut app, first, _) = xray_app();
+        app.on_key(ctrl('x'));
+        app.focus = Focus::Panel;
+        app.on_key(key(KeyCode::Char('[')));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            app.outbox.last(),
+            Some(&Command::Reroll(reroll::Spec {
+                turn: Some(first),
+                ..reroll::Spec::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn c_in_the_reroll_view_opens_a_variants_director_call() {
+        use crate::llm::{Response, ScriptedClient};
+        let (game, _) = crate::xray::tests::played();
+        let scripts = [ScriptedClient::new([Response::canned_text("Again.")])];
+        let mut started = None;
+        let mut done = Vec::new();
+        reroll::run(
+            game.world(),
+            &reroll::Spec {
+                n: 1,
+                ..reroll::Spec::default()
+            },
+            game.brains(),
+            &|n| &scripts[n - 1] as &(dyn crate::llm::LlmClient + Sync),
+            &mut |p| match p {
+                reroll::Progress::Started(h) => started = Some(h.clone()),
+                reroll::Progress::Variant(v) => done.push(v.clone()),
+            },
+        )
+        .unwrap();
+        let mut app = App::new(game.into_world(), true);
+        app.on_key(ctrl('r'));
+        app.on_event(Event::RerollStarted(started.unwrap()));
+        app.on_event(Event::RerollProgress(done.remove(0)));
+        app.on_event(Event::RerollDone(Ok(())));
+        app.on_key(key(KeyCode::Char('c')));
+        let cv = app.context.as_ref().expect("context viewer");
+        assert!(
+            cv.title.starts_with("Reroll r1 variant 1 call"),
+            "{}",
+            cv.title
+        );
+        assert!(cv.title.contains("director"), "{}", cv.title);
+        // Esc closes the viewer back onto the reroll view.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.context.is_none() && app.reroll_open);
+    }
+
     fn xray_turn(app: &App) -> Option<i64> {
         app.panel
             .last()
@@ -2040,10 +2500,8 @@ pub(crate) mod tests {
         assert!(app.context.is_none());
         app.on_key(key(KeyCode::Char('c')));
         assert!(app.context.is_some());
-        // Rerolls and surgery are announced, not yet wired.
+        // Surgery is announced, not yet wired.
         app.context = None;
-        app.on_key(key(KeyCode::Char('r')));
-        assert!(app.flash.as_deref().unwrap().contains("coming"));
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.flash.as_deref().unwrap().contains("Surgery"));
         assert!(app.outbox.is_empty());

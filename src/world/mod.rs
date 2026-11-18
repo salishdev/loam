@@ -11,7 +11,7 @@ mod replay;
 #[cfg(test)]
 mod tests;
 
-pub use calls::StoredCall;
+pub use calls::{StoredCall, StoredReroll};
 pub use component::Component;
 pub(crate) use component::{get_in, prop, remove_op, set_op};
 pub use log::{Event, EventKind};
@@ -244,6 +244,10 @@ enum Authority {
 /// The world store.
 pub struct World {
     conn: Connection,
+    /// Mixed into every dice roll's seed for this session only (a reroll
+    /// with fresh dice); never saved. Rolls are logged, so replay doesn't
+    /// need it.
+    dice_salt: Option<u64>,
 }
 
 impl World {
@@ -281,7 +285,10 @@ impl World {
                 "a read-only view needs a schema {SCHEMA_VERSION} save, found {stored:?}"
             )));
         }
-        Ok(World { conn })
+        Ok(World {
+            conn,
+            dice_salt: None,
+        })
     }
 
     /// A throwaway world held in memory.
@@ -296,7 +303,10 @@ impl World {
         tx.execute_batch(SCHEMA)?;
         check_schema_version(&tx)?;
         tx.commit()?;
-        Ok(World { conn })
+        Ok(World {
+            conn,
+            dice_salt: None,
+        })
     }
 
     /// A `meta` value, if set.
@@ -325,6 +335,18 @@ impl World {
             .path()
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from)
+    }
+
+    /// Mix `salt` into every dice roll from now on, for this connection
+    /// only (a reroll's `dice=fresh`). Nothing is saved: the rolls
+    /// themselves are logged.
+    pub fn set_dice_salt(&mut self, salt: u64) {
+        self.dice_salt = Some(salt);
+    }
+
+    /// The session's dice salt, if one is set.
+    pub fn dice_salt(&self) -> Option<u64> {
+        self.dice_salt
     }
 
     /// The branch's free-text label (meta `label`), if it has one.

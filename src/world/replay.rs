@@ -84,6 +84,19 @@ impl World {
         self.rebuild_into(at, Some(at), true, target)
     }
 
+    /// Write this whole world (log, state and main-line call records) into a
+    /// new branch file at `path`, recorded as forked at event `forked_at`
+    /// of its parent. For a world held in memory that was forked from a
+    /// file save (a reroll's variant), the parent stays that save.
+    pub fn save_branch(
+        &self,
+        path: impl AsRef<Path>,
+        forked_at: i64,
+    ) -> Result<World, ReplayError> {
+        let target = World::open(path)?;
+        self.rebuild_into(self.last_seq()?, Some(forked_at), true, target)
+    }
+
     /// The event this world was forked at, if it is a branch.
     pub fn forked_at(&self) -> Result<Option<i64>, StoreError> {
         let value: Option<String> = self

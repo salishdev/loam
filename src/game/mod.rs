@@ -178,6 +178,11 @@ impl Game {
         self.brains = brains;
     }
 
+    /// The brains this session plays with.
+    pub fn brains(&self) -> &Brains {
+        &self.brains
+    }
+
     /// Turn recording of model calls on or off (on by default; `LOAM_RECORD=0`
     /// turns it off in the REPL).
     pub fn set_recording(&mut self, on: bool) {

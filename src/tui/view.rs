@@ -7,7 +7,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{App, Areas, ContextView, Focus, KEYS, Kind, PROMPT};
+use super::app::{App, Areas, ContextView, Focus, KEYS, Kind, PROMPT, RerollMode, RerollScreen};
+use crate::reroll;
 use crate::xray::tree::token_label;
 
 /// Width of the side panel beside the story.
@@ -59,6 +60,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(app.hints()).style(Style::new().fg(Color::DarkGray)),
         hints,
     );
+    if app.reroll_open && app.reroll.is_some() {
+        draw_reroll(frame, app, frame.area());
+    }
     if app.context.is_some() {
         draw_context(frame, app, frame.area());
     }
@@ -191,6 +195,200 @@ fn draw_context(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(app.hints()).style(Style::new().fg(Color::DarkGray)),
         hints,
+    );
+}
+
+/// Narrowest a reroll column may be; narrower, the variants become tabs.
+pub const MIN_COLUMN: u16 = 30;
+
+/// Whether `n` variants fit side by side in `width` columns.
+pub fn reroll_columns(width: u16, n: usize) -> bool {
+    n > 0 && usize::from(width) >= n * usize::from(MIN_COLUMN)
+}
+
+/// Lines of narration a column shows before its diff.
+const EXCERPT_LINES: usize = 8;
+
+/// `text` wrapped to `width` as lines.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    crate::wrap::wrap(text, width.max(10))
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The full-screen reroll view: overview on top, then the variants in
+/// columns (or tabs), or one variant's narration or diff.
+fn draw_reroll(frame: &mut Frame, app: &mut App, area: Rect) {
+    frame.render_widget(Clear, area);
+    let hint_text = app.hints();
+    let Some(r) = app.reroll.as_mut() else {
+        return;
+    };
+    let width = area.width as usize;
+    let top: Vec<Line> = match &r.head {
+        None => vec![Line::from("Reroll starting…")],
+        Some(head) => {
+            let mut lines = reroll::overview(head, &r.variants);
+            if let Some(e) = &r.error {
+                lines.push(format!("failed: {e}"));
+            }
+            let mut out = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                for part in wrapped(line, width.saturating_sub(2)) {
+                    let mut l = Line::from(format!(" {part}"));
+                    if i == 0 {
+                        l = l.patch_style(Style::new().add_modifier(Modifier::BOLD));
+                    }
+                    out.push(l);
+                }
+            }
+            out
+        }
+    };
+    let top_height = (top.len() as u16).min(area.height / 3).max(1);
+    let [title, overview, body, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(top_height),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let state = if r.running { "running" } else { "done" };
+    frame.render_widget(
+        Paragraph::new(format!(" reroll · {state} — Esc closes"))
+            .style(Style::new().bg(Color::DarkGray).fg(Color::White)),
+        title,
+    );
+    frame.render_widget(Paragraph::new(top), overview);
+    frame.render_widget(
+        Paragraph::new(hint_text).style(Style::new().fg(Color::DarkGray)),
+        hints,
+    );
+    let n = r.n();
+    if n == 0 {
+        return;
+    }
+    match r.mode {
+        RerollMode::Columns if reroll_columns(body.width, n) => {
+            let columns = Layout::horizontal(vec![Constraint::Ratio(1, n as u32); n]).split(body);
+            for (i, col) in columns.iter().enumerate() {
+                draw_variant_column(frame, r, i + 1, *col);
+            }
+        }
+        RerollMode::Columns => {
+            let [tabs, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
+            let spans: Vec<Span> = (1..=n)
+                .map(|k| {
+                    let mark = if r.variant(k).is_some() { "" } else { "…" };
+                    let label = format!(" {k}{mark} ");
+                    if k == r.selected {
+                        Span::styled(label, Style::new().add_modifier(Modifier::REVERSED))
+                    } else {
+                        Span::raw(label)
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(Line::from(spans)), tabs);
+            let selected = r.selected;
+            draw_variant_column(frame, r, selected, rest);
+        }
+        RerollMode::Narration | RerollMode::Diff => {
+            let selected = r.selected;
+            let lines: Vec<String> = match r.variant(selected) {
+                None => vec!["running…".into()],
+                Some(v) => {
+                    let text = match (r.mode, &v.result) {
+                        (RerollMode::Narration, Ok(p)) => p.narration.clone(),
+                        (RerollMode::Narration, Err(e)) => format!("failed: {e}"),
+                        _ => reroll::diff_lines(v, true).join("\n"),
+                    };
+                    text.lines()
+                        .flat_map(|l| {
+                            let w = wrapped(l, usize::from(body.width).saturating_sub(4));
+                            if w.is_empty() { vec![String::new()] } else { w }
+                        })
+                        .collect()
+                }
+            };
+            let height = usize::from(body.height.saturating_sub(2)).max(1);
+            r.scroll = r.scroll.min(lines.len().saturating_sub(height));
+            let what = if r.mode == RerollMode::Diff {
+                "diff"
+            } else {
+                "narration"
+            };
+            let heading = r
+                .variant(selected)
+                .map_or_else(|| format!("Variant {selected}"), reroll::variant_heading);
+            frame.render_widget(
+                Paragraph::new(
+                    lines
+                        .into_iter()
+                        .skip(r.scroll)
+                        .take(height)
+                        .map(|l| Line::from(format!(" {l}")))
+                        .collect::<Vec<_>>(),
+                )
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(Color::Cyan))
+                        .title(format!(" {heading} · {what} ")),
+                ),
+                body,
+            );
+        }
+    }
+}
+
+/// One variant in a column (or as the open tab): heading, narration
+/// excerpt, then its compact diff.
+fn draw_variant_column(frame: &mut Frame, r: &RerollScreen, k: usize, area: Rect) {
+    let selected = k == r.selected;
+    let inner = usize::from(area.width.saturating_sub(4));
+    let (title, lines): (String, Vec<Line>) = match r.variant(k) {
+        None => (format!(" Variant {k} "), vec![Line::from(" running…")]),
+        Some(v) => {
+            let mut lines = Vec::new();
+            if let Ok(p) = &v.result {
+                let mut excerpt = wrapped(&p.narration, inner);
+                if excerpt.len() > EXCERPT_LINES {
+                    excerpt.truncate(EXCERPT_LINES);
+                    excerpt.push("…".into());
+                }
+                lines.extend(excerpt.into_iter().map(|l| Line::from(format!(" {l}"))));
+            }
+            lines.push(Line::from(""));
+            for fact in reroll::diff_lines(v, false) {
+                for (i, part) in wrapped(&fact, inner.saturating_sub(2))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let lead = if i == 0 { " • " } else { "   " };
+                    lines.push(Line::styled(
+                        format!("{lead}{part}"),
+                        Style::new().fg(Color::Yellow),
+                    ));
+                }
+            }
+            (format!(" {} ", reroll::variant_heading(v)), lines)
+        }
+    };
+    let border = if selected {
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(border)
+                .title(title),
+        ),
+        area,
     );
 }
 
@@ -623,9 +821,9 @@ mod tests {
         );
         let other = row_of(&rows, "1 director · sonnet");
         assert!(!buf[(x, other as u16)].modifier.contains(Modifier::REVERSED));
-        // The hint bar names the coming actions.
+        // The hint bar names the panel's actions.
         assert!(
-            rows[39].contains("r reroll (coming)") && rows[39].contains("s surgery"),
+            rows[39].contains("r reroll") && rows[39].contains("s surgery"),
             "{}",
             rows[39]
         );
@@ -693,5 +891,50 @@ mod tests {
             "{}",
             rows[1]
         );
+    }
+
+    #[test]
+    fn reroll_variants_sit_in_columns_when_they_fit_and_tabs_when_not() {
+        use crate::tui::app::tests::reroll_events;
+        use crate::worker::Event;
+        assert!(reroll_columns(90, 3));
+        assert!(!reroll_columns(89, 3));
+        let mut app = app();
+        app.on_key(ctrl('r'));
+        let (head, variants) = reroll_events(3);
+        app.on_event(Event::RerollStarted(head));
+        app.on_event(Event::RerollProgress(variants[0].clone()));
+        app.on_event(Event::RerollProgress(variants[2].clone()));
+
+        let wide = screen(&render(&mut app, 120, 30));
+        let row = row_of(&render(&mut app, 120, 30), "Variant 1 ·");
+        let line = wide.lines().nth(row).unwrap();
+        assert!(
+            line.contains("Variant 1 ·") && line.contains("Variant 3 ·"),
+            "{wide}"
+        );
+        assert!(line.contains("Variant 2"), "{wide}");
+        assert!(wide.contains("running…"), "variant 2 still runs: {wide}");
+        assert!(wide.contains("Reroll r1 of turn #9"), "{wide}");
+        assert!(wide.contains("2/3 done"), "{wide}");
+        assert!(wide.contains("candle.lit: false → true"), "{wide}");
+        assert!(wide.contains("Narration of variant 3."), "{wide}");
+
+        let narrow = screen(&render(&mut app, 60, 30));
+        assert!(narrow.contains(" 1  2…  3 "), "tabs: {narrow}");
+        assert!(narrow.contains("Variant 1 ·"), "{narrow}");
+        assert!(
+            !narrow.contains("Variant 3 ·"),
+            "only the selected tab: {narrow}"
+        );
+
+        app.on_key(key(KeyCode::Char('3')));
+        app.on_key(key(KeyCode::Char('d')));
+        let diff = screen(&render(&mut app, 60, 30));
+        assert!(
+            diff.contains("Variant 3 · director") && diff.contains("diff"),
+            "{diff}"
+        );
+        assert!(diff.contains("(nothing changed)"), "{diff}");
     }
 }

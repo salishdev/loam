@@ -41,6 +41,28 @@ impl World {
         turn_seq: Option<i64>,
         calls: &[CallRecord],
     ) -> Result<(), StoreError> {
+        self.insert_calls(turn_seq, None, calls)
+    }
+
+    /// Store calls made by variant `variant` of reroll `reroll` of the turn
+    /// whose input is event `turn_seq`. They stay out of the turn's own
+    /// calls ([`World::turn_calls`]) and out of forks.
+    pub fn record_variant_calls(
+        &self,
+        turn_seq: i64,
+        reroll: i64,
+        variant: i64,
+        calls: &[CallRecord],
+    ) -> Result<(), StoreError> {
+        self.insert_calls(Some(turn_seq), Some((reroll, variant)), calls)
+    }
+
+    fn insert_calls(
+        &self,
+        turn_seq: Option<i64>,
+        variant: Option<(i64, i64)>,
+        calls: &[CallRecord],
+    ) -> Result<(), StoreError> {
         if calls.is_empty() {
             return Ok(());
         }
@@ -60,8 +82,10 @@ impl World {
             tx.execute(
                 "INSERT INTO llm_calls (turn_seq, log_seq, role, model, effort, system_hash,
                     tools_hash, request, response, input_tokens, output_tokens,
-                    cache_creation_tokens, cache_read_tokens, latency_ms, cost_usd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    cache_creation_tokens, cache_read_tokens, latency_ms, cost_usd,
+                    reroll_id, variant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                    ?16, ?17)",
                 params![
                     turn_seq,
                     log_seq,
@@ -78,6 +102,8 @@ impl World {
                     call.usage.cache_read_input_tokens as i64,
                     call.latency_ms as i64,
                     call.cost_usd,
+                    variant.map(|v| v.0),
+                    variant.map(|v| v.1),
                 ],
             )?;
         }
@@ -94,6 +120,11 @@ impl World {
     /// order (rerolls' variant calls left out).
     pub fn turn_calls(&self, turn_seq: i64) -> Result<Vec<StoredCall>, StoreError> {
         self.query_calls("turn_seq = ?1 AND reroll_id IS NULL", [turn_seq])
+    }
+
+    /// The calls variant `variant` of reroll `reroll` made, in order.
+    pub fn variant_calls(&self, reroll: i64, variant: i64) -> Result<Vec<StoredCall>, StoreError> {
+        self.query_calls("reroll_id = ?1 AND variant = ?2", [reroll, variant])
     }
 
     /// One recorded call by id.
@@ -136,8 +167,8 @@ impl World {
             .unwrap();
     }
 
-    /// Mark call `id` as variant `variant` of reroll `reroll`, for tests
-    /// until rerolls record their own calls.
+    /// Mark call `id` as variant `variant` of reroll `reroll`, so a test can
+    /// make a variant call out of a recorded one.
     #[cfg(test)]
     pub(crate) fn mark_variant(&self, id: i64, reroll: i64, variant: i64) {
         self.conn
@@ -203,6 +234,93 @@ impl World {
             .query_map(params, RawCall::from_row)?
             .collect::<Result<_, _>>()?;
         rows.into_iter().map(|raw| raw.resolve(self)).collect()
+    }
+}
+
+/// A stored `rerolls` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReroll {
+    pub id: i64,
+    /// The rerolled turn's input event.
+    pub turn_seq: i64,
+    pub n: i64,
+    /// The knobs it ran with (`director`, `effort`), as JSON.
+    pub knobs: Value,
+    /// `same` or `fresh`.
+    pub dice: String,
+    /// The engine's summary, once the reroll finished.
+    pub summary: Option<String>,
+    pub created_at: String,
+    /// What its variants' calls cost, in US dollars.
+    pub cost_usd: f64,
+}
+
+impl World {
+    /// Start a `rerolls` row; returns its id.
+    pub fn insert_reroll(
+        &self,
+        turn_seq: i64,
+        n: usize,
+        knobs: &Value,
+        dice: &str,
+    ) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO rerolls (turn_seq, n, knobs, dice) VALUES (?1, ?2, ?3, ?4)",
+            params![turn_seq, n as i64, knobs.to_string(), dice],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Store a finished reroll's summary.
+    pub fn set_reroll_summary(&self, id: i64, summary: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE rerolls SET summary = ?2 WHERE id = ?1",
+            params![id, summary],
+        )?;
+        Ok(())
+    }
+
+    /// Every reroll run on this save, oldest first, with its cost.
+    pub fn rerolls(&self) -> Result<Vec<StoredReroll>, StoreError> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT r.id, r.turn_seq, r.n, r.knobs, r.dice, r.summary, r.created_at,
+                    (SELECT COALESCE(SUM(cost_usd), 0.0) FROM llm_calls c
+                       WHERE c.reroll_id = r.id)
+                 FROM rerolls r ORDER BY r.id",
+            )?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, f64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(id, turn_seq, n, knobs, dice, summary, created_at, cost_usd)| {
+                    Ok(StoredReroll {
+                        id,
+                        turn_seq,
+                        n,
+                        knobs: serde_json::from_str(&knobs).map_err(|e| {
+                            StoreError::Corrupt(format!("reroll {id}: bad knobs: {e}"))
+                        })?,
+                        dice,
+                        summary,
+                        created_at,
+                        cost_usd,
+                    })
+                },
+            )
+            .collect()
     }
 }
 

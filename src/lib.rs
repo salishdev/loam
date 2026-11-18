@@ -9,6 +9,7 @@ pub mod inventory;
 pub mod llm;
 pub mod pressure;
 pub mod quest;
+pub mod reroll;
 pub mod rules;
 pub mod stats;
 pub mod time;

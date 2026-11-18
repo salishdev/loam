@@ -314,6 +314,11 @@ pub fn check(
         Some(p) => world.get::<Dice>(p)?.map_or(0, |Dice(d)| d),
         None => 0,
     };
+    // Fresh dice (a reroll's `dice=fresh`) reseed the stream.
+    let base = match world.dice_salt() {
+        Some(salt) => mix(base ^ mix(salt)),
+        None => base,
+    };
     let n = world.count_events(EventKind::Roll)? as u64;
     let seed = roll_seed(base, n);
     let die = die(seed);

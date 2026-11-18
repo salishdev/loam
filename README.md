@@ -50,6 +50,14 @@ ticks and the bible. `:brain director=opus effort=high` or
 cycles the selected role's model and `e` its effort. `:brain reset` restores
 the defaults, which are also what a new session starts with.
 
+Ctrl-R (or `:reroll`) plays the last turn again three times, without
+touching your save, and shows the variants side by side with a summary of
+where they agreed and where they split. `:reroll #12 5 director=haiku
+effort=low dice=fresh` reruns turn 12 five times with another director and
+fresh dice. Press `a` on a variant (or `:adopt <n>`) to keep it: it becomes a
+new branch save beside this one and play switches to it. `:rerolls` lists
+past rerolls.
+
 `loam --plain` (or `LOAM_PLAIN=1`, or piping stdout) plays the same game as
 a plain line-by-line prompt.
 

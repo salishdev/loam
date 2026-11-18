@@ -298,3 +298,55 @@ fn haiku_tool_loop_reads_cache() {
 fn sonnet_tool_loop_reads_cache() {
     cache_hits_in_tool_loop(Model::Sonnet);
 }
+
+/// A small live reroll: a short game, one turn, then that turn rerolled
+/// twice with the director on Haiku. Prints the report; checks the save
+/// was left alone and the variants' calls were recorded.
+#[test]
+#[ignore = "calls the live Claude API; needs ANTHROPIC_API_KEY"]
+fn a_small_reroll_runs_two_variants() {
+    use loam::game::Game;
+    use loam::llm::LlmClient;
+    use loam::reroll::{self, Progress, Spec};
+    use loam::world::World;
+
+    let client = AnthropicClient::from_env().expect("set ANTHROPIC_API_KEY to run live tests");
+    let mut game = Game::new(World::open_in_memory().unwrap());
+    game.create_bible(
+        &client,
+        "A lighthouse on a foggy rock; the lamp has gone out. Quiet, eerie, small-scale.",
+    )
+    .unwrap();
+    game.begin(&client, &mut |_| {}).unwrap();
+    game.turn(&client, "try to relight the lamp", &mut |_| {})
+        .unwrap();
+    let state = game.world().state().unwrap();
+    let last = game.world().last_seq().unwrap();
+
+    let spec = Spec::parse("2 director=haiku").unwrap();
+    let r = reroll::run(
+        game.world(),
+        &spec,
+        game.brains(),
+        &|_| &client as &(dyn LlmClient + Sync),
+        &mut |p| {
+            if let Progress::Variant(v) = p {
+                println!("[{}]", reroll::variant_heading(v));
+            }
+        },
+    )
+    .unwrap();
+    println!("\n{}", reroll::report_text(&r.head, &r.variants));
+    assert_eq!(r.variants.len(), 2);
+    assert!(
+        r.variants.iter().all(|v| v.result.is_ok()),
+        "{:?}",
+        r.variants
+    );
+    assert_eq!(game.world().state().unwrap(), state);
+    assert_eq!(game.world().last_seq().unwrap(), last);
+    for n in 1..=2 {
+        let calls = game.world().variant_calls(r.head.id, n).unwrap();
+        assert!(calls.iter().any(|c| c.call.model == Model::Haiku.id()));
+    }
+}
