@@ -93,8 +93,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 ## Build & Test
 
 ```bash
-cargo test                      # unit tests; LLM code runs against llm::ScriptedClient
-cargo clippy --all-targets -- -D warnings
+just check                      # fmt, clippy, tests: what CI runs; LLM code runs against llm::ScriptedClient
 # Live Claude API tests (cost money, need ANTHROPIC_API_KEY):
 cargo test --test live_api -- --ignored --nocapture
 ```

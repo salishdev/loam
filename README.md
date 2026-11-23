@@ -84,8 +84,7 @@ from loam 0.2 are upgraded in place when opened.
 ## Develop
 
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
+just check   # fmt, clippy and tests, as CI runs them
 # Live Claude API tests (cost money, need ANTHROPIC_API_KEY):
 cargo test --test live_api -- --ignored --nocapture
 ```
