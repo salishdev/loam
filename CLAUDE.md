@@ -2,6 +2,36 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Delivery authority
+
+This section overrides the Conservative profile in the Beads block below for
+factory Delivery sessions only: a beads-pickup session working a greenlit
+ticket in its own worktree and branch. Interactive sessions keep the
+Conservative default.
+
+A Delivery session may, without asking:
+
+- commit on its ticket's branch;
+- push that branch to `origin` (with `--force-with-lease` only on the branch
+  its ticket created, after a rebase);
+- open a pull request for it with `gh pr create` once the ticket has
+  `review-passed`;
+- squash-merge that pull request with `gh pr merge --squash --delete-branch`
+  once all of these hold: the ticket has `review-passed`, every CI check on the
+  head commit succeeded, no review thread is unresolved, and no review requests
+  changes;
+- while loam still lands by merge rather than by pull request: rebase onto
+  local `main`, fast-forward `main` to its branch, and push `main` with a plain
+  `git push origin main`.
+
+Reserved: these stay with the user. A Delivery session raises a `hands`
+Exception instead of doing them:
+
+- pushing a release tag (`vX.Y.Z`, or any tag): it runs the Release workflow
+  and publishes binaries;
+- force-pushing or rewriting `main`'s history;
+- pushing or force-pushing any branch other than its own ticket branch.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
 
@@ -28,7 +58,7 @@ bd close <id>         # Complete work
 
 The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
+- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. Factory Delivery sessions instead follow "Delivery authority" above. At handoff, report changed files, validation, and suggested next commands.
 - **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
 - **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
 
