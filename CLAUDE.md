@@ -18,8 +18,9 @@ A Delivery session may, without asking:
   `review-passed`;
 - squash-merge that pull request with `gh pr merge --squash --delete-branch`
   once all of these hold: the ticket has `review-passed`, every CI check on the
-  head commit succeeded, no review thread is unresolved, and no review requests
-  changes;
+  head commit succeeded (skipped or neutral checks count as passing), no review
+  thread is unresolved, and no review requests changes. This is for
+  `approve:auto`; under `approve:user` it asks the user before merging;
 - while loam still lands by merge rather than by pull request: rebase onto
   local `main`, fast-forward `main` to its branch, and push `main` with a plain
   `git push origin main`.
@@ -30,7 +31,8 @@ Exception instead of doing them:
 - pushing a release tag (`vX.Y.Z`, or any tag): it runs the Release workflow
   and publishes binaries;
 - force-pushing or rewriting `main`'s history;
-- pushing or force-pushing any branch other than its own ticket branch.
+- pushing or force-pushing any branch other than its own ticket branch
+  (the plain push of `main` above excepted).
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
