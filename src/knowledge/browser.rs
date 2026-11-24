@@ -14,6 +14,8 @@ pub struct Link {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Page {
+    /// Exact identity after resolving an entry, stable across renames.
+    pub key: Option<String>,
     pub text: String,
     pub links: Vec<Link>,
 }
@@ -147,6 +149,7 @@ pub fn query(world: &World, mode: Mode, arg: &str) -> Result<Page, StoreError> {
 
 fn player_detail(world: &World, e: &Entry) -> Result<Page, StoreError> {
     let mut page = Page {
+        key: Some(format!("#{}", e.id)),
         text: report::detail(world, e)?,
         ..Page::default()
     };
@@ -175,6 +178,7 @@ fn player_detail(world: &World, e: &Entry) -> Result<Page, StoreError> {
 
 fn world_detail(world: &World, e: &super::WorldEntry) -> Result<Page, StoreError> {
     let mut page = Page {
+        key: Some(e.key.clone()),
         text: truth::world_detail(e),
         ..Page::default()
     };

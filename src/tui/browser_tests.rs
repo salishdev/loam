@@ -186,3 +186,100 @@ fn switching_saves_discards_player_history_and_in_progress_search_too() {
     drop(app);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn mode_switch_then_back_cannot_restore_rows_from_the_other_projection() {
+    let mut app = app();
+    command(&mut app, ":time");
+    command(&mut app, ":compendium places");
+    app.on_key(key(KeyCode::Char('m')));
+    assert_eq!(app.mode, Mode::World);
+    assert!(
+        app.panel
+            .iter()
+            .all(|v| v.browser.is_none() || v.mode == Mode::World)
+    );
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.panel.last().unwrap().cmd, ":time");
+    command(&mut app, ":compendium");
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    let target = selected(&app).unwrap();
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.panel.last().unwrap().arg, target);
+    assert!(app.panel.last().unwrap().text.contains("World mode"));
+    app.on_key(key(KeyCode::Char('m')));
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.panel.last().unwrap().cmd, ":time");
+    assert!(app.panel.iter().all(|v| v.browser.is_none()));
+}
+
+#[test]
+fn refresh_keeps_exact_entry_after_rename_ambiguity_and_removal() {
+    use crate::world::{Op, Patch};
+    let mut app = app();
+    command(&mut app, ":compendium world Drowned Chapel");
+    let target = app.panel.last().unwrap().arg.clone();
+    let id: i64 = target.trim_start_matches('#').parse().unwrap();
+    app.view
+        .apply_engine_patch(&Patch::new(vec![
+            Op::Rename {
+                entity: id.into(),
+                name: "Restored Chapel".into(),
+            },
+            Op::Create {
+                handle: None,
+                name: "Drowned Chapel".into(),
+                kind: "room".into(),
+                location: None,
+                props: Default::default(),
+            },
+            Op::Create {
+                handle: None,
+                name: "Restored Chapel".into(),
+                kind: "room".into(),
+                location: None,
+                props: Default::default(),
+            },
+        ]))
+        .unwrap();
+    app.on_event(Event::TickDone {
+        forced: false,
+        outcome: Ok(crate::game::TickOutcome {
+            summary: String::new(),
+            changes: vec![],
+            calls: 0,
+        }),
+    });
+    assert_eq!(app.panel.last().unwrap().arg, target);
+    assert!(
+        app.panel
+            .last()
+            .unwrap()
+            .text
+            .starts_with("Restored Chapel")
+    );
+    assert!(!app.panel.last().unwrap().text.contains("No entries found"));
+    // Removing a learned subject preserves its known account; removing a
+    // World entity drops its detail without resolving an old name again.
+    command(&mut app, ":compendium world tallow candle");
+    let target = app.panel.last().unwrap().arg.clone();
+    let id: i64 = target.trim_start_matches('#').parse().unwrap();
+    app.view
+        .apply_engine_patch(&Patch::new(vec![Op::Destroy { entity: id.into() }]))
+        .unwrap();
+    app.view
+        .apply_engine_patch(&Patch::new(vec![Op::Create {
+            handle: None,
+            name: "tallow candle".into(),
+            kind: "item".into(),
+            location: None,
+            props: Default::default(),
+        }]))
+        .unwrap();
+    for _ in 0..2 {
+        app.refresh_panel();
+    }
+    assert_eq!(app.panel.last().unwrap().arg, target);
+    assert!(app.panel.last().unwrap().text.contains("No entries found"));
+}

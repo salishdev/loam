@@ -613,7 +613,10 @@ impl App {
         };
         let view = PanelView {
             cmd: cmd.to_string(),
-            arg: arg.to_string(),
+            arg: browser
+                .as_ref()
+                .and_then(|p| p.key.clone())
+                .unwrap_or_else(|| arg.to_string()),
             text: browser.as_ref().map_or(text, |p| p.text.clone()),
             scroll: 0,
             selected: browser
@@ -1210,9 +1213,7 @@ impl App {
         // Another save starts over in Player mode.
         self.mode = Mode::Player;
         // Even Player entries can mean something different in another save.
-        self.panel.retain(|v| !commands::is_moded(&v.cmd));
-        self.clear_panel_search();
-        self.drop_world_views();
+        self.clear_compendium_views();
         self.refresh_panel();
         self.send(Command::Switch(path));
     }
@@ -1264,27 +1265,19 @@ impl App {
         }
     }
 
-    /// Change the compendium's mode. Leaving World drops every World-mode
-    /// view from the back stack (and the panel's last search), so nothing
-    /// only World mode shows survives in a title, the history or a
-    /// highlight. With `reopen`, a mode-aware view on top is replaced by
-    /// the compendium's overview in the new mode: an argument typed in
-    /// World mode may itself name something hidden.
+    /// Change the shared mode. Entry ids mean different things in the two
+    /// projections, so reset browser history before any row can be activated.
+    /// Unrelated workbench views keep their place in the back stack.
     fn set_mode(&mut self, mode: Mode, reopen: bool) {
         let moded_on_top = self.panel_open
             && self
                 .panel
                 .last()
                 .is_some_and(|v| commands::is_moded(&v.cmd));
-        let leaving_world = self.mode == Mode::World && mode == Mode::Player;
+        if self.mode != mode {
+            self.clear_compendium_views();
+        }
         self.mode = mode;
-        if mode == Mode::Player {
-            self.drop_world_views();
-        }
-        if leaving_world {
-            // A panel search typed in World mode may name something hidden.
-            self.clear_panel_search();
-        }
         if reopen && moded_on_top {
             if let Some(Ok(text)) = commands::report_in(&self.view, mode, ":compendium", "") {
                 self.open_view(":compendium", "", text);
@@ -1294,15 +1287,9 @@ impl App {
         self.refresh_panel();
     }
 
-    /// Drop the World-mode views of mode-aware reports, and the panel's
-    /// last search, closing the panel if nothing is left.
-    fn drop_world_views(&mut self) {
-        let before = self.panel.len();
-        self.panel
-            .retain(|v| !(commands::is_moded(&v.cmd) && v.mode == Mode::World));
-        if self.panel.len() != before {
-            self.clear_panel_search();
-        }
+    fn clear_compendium_views(&mut self) {
+        self.panel.retain(|v| !commands::is_moded(&v.cmd));
+        self.clear_panel_search();
         if self.panel.is_empty() {
             self.panel_open = false;
             if self.focus == Focus::Panel {
@@ -2521,17 +2508,14 @@ pub(crate) mod tests {
         }
         // Back through the history: only Player views and the clock.
         let titles: Vec<String> = app.panel.iter().map(PanelView::title).collect();
-        assert_eq!(
-            titles,
-            [":compendium · Player", ":time", ":compendium · Player"]
-        );
+        assert_eq!(titles, [":time", ":compendium · Player"]);
 
         // Naming Player explicitly drops World views the same way.
         typed(&mut app, ":compendium world brother ash");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(
             app.panel.last().unwrap().title(),
-            ":compendium brother ash · World"
+            ":compendium bible.npcs.1 · World"
         );
         typed(&mut app, ":compendium player");
         app.on_key(key(KeyCode::Enter));
