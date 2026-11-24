@@ -302,7 +302,13 @@ fn engine_counts(world: &World) -> Result<String, StoreError> {
     }
     writeln!(out, "Quests: {}{}", quests.len(), tally_list(&by_status)).unwrap();
 
-    let entities = world.state()?.entities;
+    // Compendium entries are what the player knows, not world entities.
+    let entities: Vec<Entity> = world
+        .state()?
+        .entities
+        .into_iter()
+        .filter(|e| !crate::world::is_entry(e))
+        .collect();
     let mut by_ekind: BTreeMap<&str, usize> = BTreeMap::new();
     for e in &entities {
         *by_ekind.entry(e.kind.as_str()).or_default() += 1;
@@ -487,7 +493,7 @@ fn find(world: &World, query: &str) -> Result<Found, StoreError> {
         .state()?
         .entities
         .into_iter()
-        .filter(|e| e.kind != crate::world::KNOWLEDGE_KIND)
+        .filter(|e| !crate::world::is_entry(e))
         .collect();
     let pick = |matches: Vec<&Entity>| match matches.len() {
         0 => None,

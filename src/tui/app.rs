@@ -2207,7 +2207,10 @@ pub(crate) mod tests {
         typed(&mut app, ":compendium drowned");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.panel.last().unwrap().text, chapel);
-        assert!(app.outbox.is_empty(), "reading it sends nothing to the game");
+        assert!(
+            app.outbox.is_empty(),
+            "reading it sends nothing to the game"
+        );
     }
 
     #[test]

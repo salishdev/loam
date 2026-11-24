@@ -588,7 +588,8 @@ fn played(
 }
 
 /// Kinds whose entities speak through their own events (rule changes) or
-/// aren't story (the bible, the glossary).
+/// aren't story (the bible, the glossary). Compendium entries aren't story
+/// either (see [`crate::world::is_entry`]).
 const QUIET_KINDS: [&str; 3] = ["rule", "glossary", "bible"];
 
 /// What changed in `world` since event `start`, when its state was
@@ -604,7 +605,7 @@ pub fn facts(world: &World, start: i64, before: &WorldState) -> Result<Vec<Fact>
             .map_or_else(|| format!("#{id}"), |e| e.name.clone())
     };
     let place = |at: Option<EntityId>| at.map_or_else(|| "nowhere".to_string(), name);
-    let quiet = |e: &Entity| QUIET_KINDS.contains(&e.kind.as_str());
+    let quiet = |e: &Entity| QUIET_KINDS.contains(&e.kind.as_str()) || crate::world::is_entry(e);
     let mut out = Vec::new();
 
     for e in after.entities.iter().filter(|e| !quiet(e)) {

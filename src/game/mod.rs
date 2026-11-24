@@ -520,7 +520,6 @@ impl Game {
         let narrated = self
             .world
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
-        self.remember_encounters(&turn, narrated, &narration)?;
         // Every turn spends world time; the opening scene doesn't.
         if turn.input.is_some() {
             let calls = self.tool_calls_since(turn.start)?;
@@ -532,6 +531,9 @@ impl Game {
         }
         let judgments =
             quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
+        // Last, so the turn's time, verdicts and rule changes follow its
+        // narration directly (the X-ray reads them there).
+        self.remember_encounters(&turn, narrated, &narration)?;
         Ok(TurnOutcome {
             narration,
             stop_reason: response

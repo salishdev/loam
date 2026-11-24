@@ -17,7 +17,7 @@ pub fn compendium(world: &World, arg: &str) -> Result<String, StoreError> {
     if arg.is_empty() {
         return overview(world);
     }
-    if word == "search" {
+    if word.eq_ignore_ascii_case("search") {
         return find_text(world, rest.trim());
     }
     if rest.is_empty()

@@ -338,6 +338,11 @@ fn query_entity(world: &World, input: QueryEntityInput) -> Result<ToolOutput, St
         BIBLE_KIND => return refuse("the bible is read with read_bible"),
         RULE_KIND => return refuse("rules are read with list_rules"),
         GLOSSARY_KIND => return refuse("the glossary is read with lookup_terms"),
+        _ if crate::world::is_entry(&e) => {
+            return refuse(
+                "that is a compendium entry (what the player knows), not a world entity",
+            );
+        }
         _ => {}
     }
     let location = match e.location {

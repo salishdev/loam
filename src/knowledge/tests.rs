@@ -303,7 +303,6 @@ fn director_patches_cannot_touch_knowledge() {
         json!({"op": "relate", "subject": room, "rel": "near", "object": entry}),
         json!({"op": "relate", "subject": entry, "rel": "near", "object": room}),
         json!({"op": "create", "name": "note", "kind": "note", "location": entry}),
-        json!({"op": "create", "name": "fake", "kind": "knowledge"}),
     ];
     for op in attempts {
         let patch: Patch = serde_json::from_value(json!({ "ops": [op] })).unwrap();
@@ -314,6 +313,27 @@ fn director_patches_cannot_touch_knowledge() {
         );
     }
     assert_eq!(game.world().state().unwrap(), state);
+
+    // The seal is the engine's `_entry` prop, not the kind: a thing the
+    // director calls "knowledge" (as an older save might hold) stays an
+    // ordinary entity, and no entry.
+    let made = game
+        .world_mut()
+        .apply_patch(
+            &serde_json::from_value(json!({"ops": [
+                {"op": "create", "handle": "k", "name": "scroll", "kind": "knowledge", "location": room}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap()
+        .created[0];
+    game.world_mut()
+        .apply_patch(&Patch::new(vec![Op::Rename {
+            entity: made.into(),
+            name: "old scroll".into(),
+        }]))
+        .unwrap();
+    assert_eq!(names(game.world()), ["Drowned Chapel", "Bell Tower"]);
 }
 
 #[test]
@@ -493,4 +513,94 @@ fn why_and_relations_do_not_match_compendium_entries() {
         .unwrap()
         .unwrap();
     assert!(!why.contains("several"), "{why}");
+}
+
+#[test]
+fn a_turn_through_several_rooms_claims_no_false_neighbour() {
+    // Chapel → Bell Tower → Loft in one turn: the narration ends in the
+    // loft, and the chapel has no exit to it.
+    let (mut game, client) = begun();
+    client.push(tower_room());
+    client.push(Response::canned_tool_use(
+        "r3",
+        "create_room",
+        json!({"via_exit": "up", "back_exit": "down", "name": "Loft", "region": "Saltmarsh",
+               "description": "Dusty.", "exits": {}, "contents": []}),
+    ));
+    client.push(Response::canned_text(
+        "You climb through the tower to the loft.",
+    ));
+    game.turn(&client, "climb to the top", &mut |_| {}).unwrap();
+    let world = game.world();
+    assert_eq!(names(world), ["Drowned Chapel", "Loft"]);
+    assert!(place(world, "Loft").facts.is_empty());
+}
+
+#[test]
+fn a_turn_logs_its_time_right_after_its_narration_then_remembers() {
+    // The X-ray reads a turn's time, verdicts and rule changes straight
+    // after its narration; the encounter is recorded after them.
+    let (game, _) = in_tower();
+    let events = game.world().events().unwrap();
+    let narration = events
+        .iter()
+        .rposition(|e| e.kind == EventKind::Narration)
+        .unwrap();
+    let after: Vec<EventKind> = events[narration + 1..].iter().map(|e| e.kind).collect();
+    assert_eq!(after.first(), Some(&EventKind::Patch), "the clock's patch");
+    assert!(after.contains(&EventKind::Time), "{after:?}");
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, EventKind::Patch);
+    assert_eq!(last.payload["by"], json!("engine"));
+    assert_eq!(
+        place(game.world(), "Bell Tower").first_seen,
+        events[narration].seq
+    );
+}
+
+#[test]
+fn compendium_entries_stay_out_of_stats_rerolls_and_director_lookups() {
+    let (game, _) = in_tower();
+    let world = game.world();
+    let stats = commands::report(world, ":stats", "").unwrap().unwrap();
+    assert!(!stats.contains("knowledge"), "{stats}");
+    let before = world.fork_in_memory(1).unwrap().state().unwrap();
+    let facts = crate::reroll::facts(world, 1, &before).unwrap();
+    assert!(
+        facts.iter().any(|f| f.text.contains("Bell Tower (room)")),
+        "{facts:?}"
+    );
+    assert!(
+        !facts.iter().any(|f| f.text.contains("(knowledge)")),
+        "{facts:?}"
+    );
+
+    // The director can't read an entry as if it were a world entity.
+    let (mut game, client) = in_tower();
+    let entry = place(game.world(), "Bell Tower").id;
+    client.push(Response::canned_tool_use(
+        "q",
+        "query_entity",
+        json!({ "id": entry }),
+    ));
+    client.push(Response::canned_text("You look about."));
+    game.turn(&client, "look", &mut |_| {}).unwrap();
+    let reply = client
+        .requests()
+        .last()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .content[0]
+        .clone();
+    match reply {
+        crate::llm::ContentBlock::ToolResult {
+            content, is_error, ..
+        } => assert!(
+            is_error && content.contains("compendium entry"),
+            "{content}"
+        ),
+        other => panic!("expected a tool result, got {other:?}"),
+    }
 }

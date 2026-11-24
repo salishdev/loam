@@ -182,7 +182,7 @@ pub const PLAYER_KIND: &str = "player";
 /// Kinds the engine gives meaning to. The director can't create entities of
 /// these kinds (rooms come only from `create_room`); every other kind is a
 /// free descriptive label.
-pub const RESERVED_KINDS: [&str; 8] = [
+pub const RESERVED_KINDS: [&str; 7] = [
     ROOM_KIND,
     PLAYER_KIND,
     "bible",
@@ -190,13 +190,22 @@ pub const RESERVED_KINDS: [&str; 8] = [
     "quest",
     "glossary",
     "pressure",
-    KNOWLEDGE_KIND,
 ];
 
-/// Kind of compendium entries: what the player has learned
-/// ([`crate::knowledge`]). Sealed: the director can't create, change,
-/// relate, move into or destroy one; only engine patches touch them.
+/// Kind the engine gives compendium entries ([`crate::knowledge`]). Only a
+/// label: an entry is whatever carries [`ENTRY_PROP`], so a director-made
+/// entity of this kind in an older save stays an ordinary entity.
 pub const KNOWLEDGE_KIND: &str = "knowledge";
+
+/// The engine-owned prop holding a compendium entry. An entity carrying
+/// it is sealed: director ops can't change, relate, move into or destroy
+/// it. The director could never write a `_` prop, so no older log has one.
+pub const ENTRY_PROP: &str = "_entry";
+
+/// Whether `e` is a compendium entry (see [`ENTRY_PROP`]).
+pub fn is_entry(e: &Entity) -> bool {
+    e.props.contains_key(ENTRY_PROP)
+}
 
 /// Marker prop: `acts: true` moves, speaks or acts on its own. NPCs are
 /// the entities carrying it, and it may hold things.
@@ -1133,12 +1142,17 @@ fn bad_rel_name(rel: &str, guarded: bool) -> Option<String> {
     }
 }
 
-/// Whether `id` is engine-sealed: director ops can't touch it at all.
+/// Whether `id` is engine-sealed (a compendium entry): director ops can't
+/// touch it at all.
 fn is_sealed(tx: &Transaction, id: EntityId) -> rusqlite::Result<bool> {
-    let kind: String = tx.query_row("SELECT kind FROM entities WHERE id = ?1", [id], |r| {
-        r.get(0)
-    })?;
-    Ok(kind == KNOWLEDGE_KIND)
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM props WHERE entity_id = ?1 AND key = ?2",
+            params![id, ENTRY_PROP],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn sealed_reason(r: &EntityRef) -> String {

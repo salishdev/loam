@@ -6,9 +6,9 @@
 //! stable entry identity independent of the world entity it describes.
 //! Its state is the engine-owned `_entry` component, changed only through
 //! engine patches, so the event log (and so replay, forks and adopted
-//! rerolls) carries it like any other state. The world store seals the
-//! kind: director patches can't create, rename, move, relate or destroy an
-//! entry.
+//! rerolls) carries it like any other state. The world store seals any
+//! entity carrying `_entry`: director patches can't change, rename, move,
+//! relate or destroy an entry.
 //!
 //! An entry stores what was learned when it was learned: readers never look
 //! at the world entity it was about, so later changes off-screen, or its
@@ -29,8 +29,8 @@ pub use report::compendium;
 use serde::{Deserialize, Serialize};
 
 use crate::world::{
-    self, ApplyError, Component, EntityId, EventKind, KNOWLEDGE_KIND, Op, Patch, ROOM_KIND,
-    StoreError, World,
+    self, ApplyError, Component, EXIT_REL, EntityId, EventKind, KNOWLEDGE_KIND, Op, Patch,
+    ROOM_KIND, StoreError, World,
 };
 
 /// The compendium's sections.
@@ -127,7 +127,7 @@ struct Record {
 }
 
 impl Component for Record {
-    const KEY: &'static str = "_entry";
+    const KEY: &'static str = world::ENTRY_PROP;
 }
 
 /// A compendium entry as the player knows it.
@@ -284,7 +284,8 @@ fn check_source(world: &World, seq: i64) -> Result<Result<(), String>, StoreErro
 /// (a narration event), coming from room `from` when they came from one.
 ///
 /// Records only what the encounter justifies: the room's name, the
-/// description they found there, and the known place they reached it from.
+/// description they found there, and the known place they reached it from
+/// (when an exit joins the two directly).
 /// No other prop, exit or content is copied. Re-entering updates the same
 /// entry, so a place keeps one identity. Returns the entry's id, or `Err`
 /// with why nothing was written (an invalid source, or `room` is not a
@@ -308,8 +309,18 @@ pub(crate) fn record_place(
         .unwrap_or_default()
         .trim()
         .to_owned();
-    // Named as the player knows the place they came from, not as it is now.
-    let came_from = match from.filter(|&f| f != room) {
+    // Named as the player knows the place they came from, not as it is now;
+    // only when an exit leads straight here, so a turn that passed through
+    // other rooms on the way claims no false neighbour.
+    let adjacent = match from.filter(|&f| f != room) {
+        Some(f) => world
+            .relations_from(f, Some(EXIT_REL))?
+            .iter()
+            .any(|r| r.object == room)
+            .then_some(f),
+        None => None,
+    };
+    let came_from = match adjacent {
         Some(f) => match about(world, Category::Place, f)? {
             Some((id, _)) => entry(world, id)?.map(|e| e.name),
             None => None,
