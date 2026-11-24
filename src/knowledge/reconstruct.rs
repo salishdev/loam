@@ -1,6 +1,7 @@
 //! One-off historical reconstruction, deliberately separate from live play.
 //! Only narration crosses the extraction boundary; writes use the live writer.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -9,7 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Discovery, entries, learn};
+use super::{Discovery, Fact, FactKind, NewFact, Source, entries};
 use crate::llm::{LlmClient, Message, Model, Request, StopReason};
 use crate::world::{EventKind, SCHEMA_VERSION, World};
 
@@ -26,7 +27,7 @@ Discovery is {"entry":existing_entry_id} OR {"name":"name","category":
 [{"text":"supported fact","excerpt":"verbatim 3-400 word/character passage (3+ words,
 400 characters maximum)","source":narration_event_id,"claimed_by":"named speaker for
 claims only","supersedes":[earlier fact numbers corrected]}]. Omit optional fields.
-Use entry IDs from prior_entries to continue an established subject. Never merge
+Group each subject's facts chronologically in one discovery. Use entry IDs from prior_entries to continue an established subject. Never merge
 same-named subjects without explicit identity evidence; flag ambiguity instead.
 Use distinct:true only when narration explicitly establishes a different subject.
 Preserve rumors as claims attributed to their narrated speaker, never observations.
@@ -167,7 +168,7 @@ pub fn reconstruct(
             EventKind::ToolCall,
             &json!({"reconstruction": MARKER, "status":"started"}),
         )?;
-        let imported_from = world.state()?.next_entity_id;
+        let mut imported = Vec::new();
         let mut chunk = Vec::new();
         let mut size = 0;
         for event in events
@@ -178,7 +179,7 @@ pub fn reconstruct(
             let chars: Vec<char> = text.chars().collect();
             for part in chars.chunks(options.chunk_chars) {
                 if size + part.len() > options.chunk_chars {
-                    extract(&mut world, &chunk, imported_from, client, &mut evidence)?;
+                    extract(&mut world, &chunk, &mut imported, client, &mut evidence)?;
                     chunk.clear();
                     size = 0;
                 }
@@ -190,7 +191,7 @@ pub fn reconstruct(
             }
         }
         if !chunk.is_empty() {
-            extract(&mut world, &chunk, imported_from, client, &mut evidence)?;
+            extract(&mut world, &chunk, &mut imported, client, &mut evidence)?;
         }
         if world.replay_in_memory()?.state()? != world.state()? {
             return Err("reconstructed save does not replay to its stored state".into());
@@ -222,7 +223,7 @@ pub fn reconstruct(
 fn extract(
     world: &mut World,
     chunk: &[Passage],
-    imported_from: crate::world::EntityId,
+    imported: &mut Vec<(crate::world::EntityId, NewFact)>,
     client: &dyn LlmClient,
     report: &mut File,
 ) -> Result<()> {
@@ -244,54 +245,107 @@ fn extract(
         .map(|e| e.seq - 1)
         .unwrap_or(world.last_seq()?);
     let historical = entries(&world.fork_in_memory(cutoff)?)?;
-    let mut prior = entries(world)?;
-    prior.retain_mut(|e| {
-        if e.id < imported_from {
-            let Some(then) = historical.iter().find(|old| old.id == e.id) else {
-                return false;
-            };
-            // A later encounter can rename an existing entry. Do not send
-            // that future learned name when reconstructing earlier narration.
-            e.name.clone_from(&then.name);
+    let mut prior = Vec::new();
+    for e in entries(world)? {
+        let then = historical.iter().find(|old| old.id == e.id);
+        let additions: Vec<_> = imported.iter().filter(|(id, _)| *id == e.id).collect();
+        if then.is_none() && additions.is_empty() {
+            continue;
         }
-        e.last_seen = e
-            .facts
-            .iter()
+        let name = then.map_or(e.name.as_str(), |old| old.name.as_str());
+        // Original facts come from their historical snapshot, not their
+        // final metadata. New imports overlay it at the writer's stable
+        // fact numbers, even when future original facts leave numbering gaps.
+        let mut facts: BTreeMap<usize, Fact> = then
+            .into_iter()
+            .flat_map(|old| old.facts.iter().enumerate())
+            .filter(|(_, f)| f.sources.iter().all(|s| s.event <= last))
+            .map(|(i, f)| (i + 1, f.clone()))
+            .collect();
+        for (_, f) in additions {
+            let n = e
+                .facts
+                .iter()
+                .position(|known| {
+                    known.text == f.text.trim()
+                        && known.claimed_by.as_deref() == f.claimed_by.as_deref().map(str::trim)
+                })
+                .ok_or("imported fact disappeared")?
+                + 1;
+            let known = facts.entry(n).or_insert_with(|| Fact {
+                text: f.text.trim().to_owned(),
+                kind: if f.claimed_by.is_some() {
+                    FactKind::Claimed
+                } else {
+                    FactKind::Observed
+                },
+                claimed_by: f.claimed_by.as_deref().map(str::trim).map(str::to_owned),
+                claimant: None,
+                sources: Vec::new(),
+                supersedes: Vec::new(),
+                rule_version: None,
+            });
+            let source = Source {
+                event: f.source.ok_or("imported fact lacks source")?,
+                excerpt: Some(f.excerpt.clone()),
+            };
+            if !known.sources.contains(&source) {
+                known.sources.push(source);
+            }
+            for &corrected in &f.supersedes {
+                if corrected != n && !known.supersedes.contains(&corrected) {
+                    known.supersedes.push(corrected);
+                }
+            }
+        }
+        let encountered = then.is_some_and(|old| old.encounters > 0 && old.first_seen <= last);
+        if facts.is_empty() && !encountered {
+            continue;
+        }
+        let latest = facts
+            .values()
             .flat_map(|f| &f.sources)
-            .filter(|s| s.event <= last)
             .map(|s| s.event)
             .max()
-            .unwrap_or(0);
-        e.facts
-            .iter()
-            .any(|f| f.sources.iter().any(|s| s.event <= last))
-    });
-    prior.sort_by_key(|e| (narration.contains(&e.name.to_lowercase()), e.last_seen));
-    let mut context = Vec::new();
-    let mut allowed = Vec::new();
-    let mut size = 0;
-    let mut omitted = 0;
-    for e in prior.iter().rev() {
-        // Keep original fact numbers even when filtering future facts.
-        let facts: Vec<_> = e
-            .facts
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.sources.iter().any(|s| s.event <= last))
-            .map(|(i, f)| {
-                let sources: Vec<_> = f.sources.iter().filter(|s| s.event <= last).collect();
-                json!({"number":i+1,"text":f.text,"claimed_by":f.claimed_by,
-                    "sources":sources,"supersedes":f.supersedes})
+            .unwrap_or_else(|| then.map_or(0, |old| old.last_seen));
+        let facts: Vec<_> = facts
+            .into_iter()
+            .map(|(n, f)| {
+                json!({"number":n,"text":f.text,
+            "claimed_by":f.claimed_by,"sources":f.sources,"supersedes":f.supersedes})
             })
             .collect();
-        let value = json!({"entry": e.id, "name": e.name, "category":e.category,"facts":facts});
+        let value = json!({"entry":e.id,"name":name,"category":e.category,"facts":facts});
+        prior.push((
+            narration.contains(&name.to_lowercase()),
+            latest,
+            e.id,
+            value,
+        ));
+    }
+    prior.sort_by_key(|(relevant, latest, _, _)| (*relevant, *latest));
+    let mut context = Vec::new();
+    let mut allowed = Vec::new();
+    let mut known_numbers = BTreeMap::new();
+    let mut size = 0;
+    let mut omitted = 0;
+    for (_, _, id, value) in prior.into_iter().rev() {
         let len = value.to_string().chars().count();
         if size + len > CONTEXT_CHARS {
             omitted += 1;
             continue;
         }
         size += len;
-        allowed.push(e.id);
+        allowed.push(id);
+        known_numbers.insert(
+            id,
+            value["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["number"].as_u64().unwrap() as usize)
+                .collect::<Vec<_>>(),
+        );
         context.push(value);
     }
     let request = Request::new(
@@ -354,13 +408,66 @@ fn extract(
                     .into(),
             );
         }
-        let id = learn(world, &d, None)?.map_err(|why| format!("discovery refused: {why}"))?;
-        writeln!(
-            report,
-            "Imported entry #{id}: {}",
-            serde_json::to_string(&d)?
-        )?;
-        report.flush()?;
+        if !d.distinct
+            && d.entry.is_none()
+            && entries(world)?.iter().any(|e| {
+                d.category == Some(e.category)
+                    && d.name
+                        .as_deref()
+                        .is_some_and(|name| name.trim().eq_ignore_ascii_case(&e.name))
+                    && !allowed.contains(&e.id)
+            })
+        {
+            writeln!(
+                report,
+                "FLAG (not imported): same-named stored entry unavailable in chronological context; identity ambiguous: {}",
+                serde_json::to_string(&d)?
+            )?;
+            continue;
+        }
+        if d.facts
+            .windows(2)
+            .any(|pair| pair[0].source > pair[1].source)
+        {
+            return Err("a subject's facts must be in narration order".into());
+        }
+        let mut target = d.clone();
+        // Write facts in narrated order, so a correction inside the same
+        // chunk can supersede a fact just learned about a new subject.
+        for f in &d.facts {
+            let numbers = target.entry.and_then(|id| known_numbers.get(&id));
+            if f.supersedes
+                .iter()
+                .any(|n| !numbers.is_some_and(|known| known.contains(n)))
+            {
+                return Err("correction refers to a fact outside chronological context".into());
+            }
+            target.facts = vec![f.clone()];
+            let id = super::learn_historical(world, &target)?
+                .map_err(|why| format!("discovery refused: {why}"))?;
+            let e = super::entry(world, id)?.ok_or("imported entry disappeared")?;
+            let n = e
+                .facts
+                .iter()
+                .position(|known| {
+                    known.text == f.text.trim()
+                        && known.claimed_by.as_deref() == f.claimed_by.as_deref().map(str::trim)
+                })
+                .ok_or("imported fact disappeared")?
+                + 1;
+            known_numbers.entry(id).or_default().push(n);
+            imported.push((id, f.clone()));
+            writeln!(
+                report,
+                "Imported entry #{id}: {}",
+                serde_json::to_string(&target)?
+            )?;
+            report.flush()?;
+            target = Discovery {
+                entry: Some(id),
+                ..Default::default()
+            };
+        }
     }
     Ok(())
 }
@@ -368,7 +475,7 @@ fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{Category, NewFact};
+    use crate::knowledge::{Category, NewFact, learn};
     use crate::llm::{Response, ScriptedClient};
     use crate::world::{Op, Patch};
 
@@ -421,14 +528,7 @@ mod tests {
                 name: "FutureSecret".into(),
             }]))
             .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "loam-context-{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mut report = File::create(&path).unwrap();
+        let (path, mut report) = report_file();
         let client =
             ScriptedClient::new([Response::canned_text(r#"{"discoveries":[],"flags":[]}"#)]);
         extract(
@@ -437,7 +537,7 @@ mod tests {
                 event: first,
                 text: "The stranger wears a hood.".into(),
             }],
-            id + 1,
+            &mut Vec::new(),
             &client,
             &mut report,
         )
@@ -445,6 +545,435 @@ mod tests {
         let request = format!("{:?}", client.requests()[0].messages);
         assert!(request.contains("Stranger"));
         assert!(!request.contains("FutureSecret"));
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+    fn report_file() -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!(
+            "loam-context-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = File::create(&path).unwrap();
+        (path, file)
+    }
+
+    fn fact(source: i64, text: &str) -> NewFact {
+        NewFact {
+            text: text.into(),
+            excerpt: text.into(),
+            source: Some(source),
+            ..Default::default()
+        }
+    }
+
+    fn extraction(d: Discovery) -> Response {
+        Response::canned_text(
+            serde_json::to_string(&Extraction {
+                discoveries: vec![Candidate {
+                    support: Support::Explicit,
+                    discovery: d,
+                }],
+                flags: vec![],
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn encountered_entry_keeps_its_identity_and_imported_corrections_across_chunks() {
+        let mut w = World::open_in_memory().unwrap();
+        let room = w
+            .apply_engine_patch(&Patch::new(vec![Op::Create {
+                handle: None,
+                name: "Hall".into(),
+                kind: "room".into(),
+                location: None,
+                props: serde_json::Map::new(),
+            }]))
+            .unwrap()
+            .created[0];
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"The hall has iron doors."}),
+            )
+            .unwrap();
+        let id = super::super::record_place(&mut w, room, None, a)
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::super::entry(&w, id)
+                .unwrap()
+                .unwrap()
+                .facts
+                .is_empty()
+        );
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"The hall has wooden doors."}),
+            )
+            .unwrap();
+        let client = ScriptedClient::new([
+            extraction(Discovery {
+                entry: Some(id),
+                facts: vec![fact(a, "The hall has iron doors.")],
+                ..Default::default()
+            }),
+            extraction(Discovery {
+                entry: Some(id),
+                facts: vec![NewFact {
+                    supersedes: vec![1],
+                    ..fact(b, "The hall has wooden doors.")
+                }],
+                ..Default::default()
+            }),
+        ]);
+        let (path, mut report) = report_file();
+        let mut imported = Vec::new();
+        extract(
+            &mut w,
+            &[Passage {
+                event: a,
+                text: "The hall has iron doors.".into(),
+            }],
+            &mut imported,
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        extract(
+            &mut w,
+            &[Passage {
+                event: b,
+                text: "The hall has wooden doors.".into(),
+            }],
+            &mut imported,
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        let learned = entries(&w).unwrap();
+        assert_eq!(learned.len(), 1);
+        assert_eq!(learned[0].id, id);
+        assert_eq!(learned[0].facts[1].supersedes, vec![1]);
+        assert!(format!("{:?}", client.requests()[1].messages).contains("iron doors"));
+        assert_eq!(
+            w.replay_in_memory().unwrap().state().unwrap(),
+            w.state().unwrap()
+        );
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_later_stored_namesake_is_flagged_without_guessing_identity_or_failing() {
+        let mut w = World::open_in_memory().unwrap();
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a red cloak."}),
+            )
+            .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a blue cloak."}),
+            )
+            .unwrap();
+        learn(
+            &mut w,
+            &Discovery {
+                name: Some("Mara".into()),
+                category: Some(Category::Person),
+                facts: vec![fact(b, "Mara wears a blue cloak.")],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let client = ScriptedClient::new([extraction(Discovery {
+            name: Some("Mara".into()),
+            category: Some(Category::Person),
+            facts: vec![fact(a, "Mara wears a red cloak.")],
+            ..Default::default()
+        })]);
+        let (path, mut report) = report_file();
+        extract(
+            &mut w,
+            &[Passage {
+                event: a,
+                text: "Mara wears a red cloak.".into(),
+            }],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(entries(&w).unwrap()[0].facts.len(), 1);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("identity ambiguous")
+        );
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_future_repeated_fact_cannot_leak_its_new_correction_metadata_backwards() {
+        let mut w = World::open_in_memory().unwrap();
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a red cloak."}),
+            )
+            .unwrap();
+        let id = learn(
+            &mut w,
+            &Discovery {
+                name: Some("Mara".into()),
+                category: Some(Category::Person),
+                facts: vec![fact(a, "Mara wears a red cloak.")],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a blue cloak."}),
+            )
+            .unwrap();
+        learn(
+            &mut w,
+            &Discovery {
+                entry: Some(id),
+                facts: vec![NewFact {
+                    supersedes: vec![1],
+                    ..fact(b, "Mara wears a blue cloak.")
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let c = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a red cloak."}),
+            )
+            .unwrap();
+        learn(
+            &mut w,
+            &Discovery {
+                entry: Some(id),
+                facts: vec![NewFact {
+                    supersedes: vec![2],
+                    ..fact(c, "Mara wears a red cloak.")
+                }],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(entries(&w).unwrap()[0].facts[0].supersedes, vec![2]);
+        let client =
+            ScriptedClient::new([Response::canned_text(r#"{"discoveries":[],"flags":[]}"#)]);
+        let (path, mut report) = report_file();
+        extract(
+            &mut w,
+            &[Passage {
+                event: a,
+                text: "Mara wears a red cloak.".into(),
+            }],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        let message = serde_json::to_value(&client.requests()[0].messages).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(message[0]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            payload["prior_entries"][0]["facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            payload["prior_entries"][0]["facts"][0]["supersedes"],
+            json!([])
+        );
+        assert_eq!(
+            payload["prior_entries"][0]["facts"][0]["sources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let unsupported = ScriptedClient::new([extraction(Discovery {
+            entry: Some(id),
+            facts: vec![NewFact {
+                supersedes: vec![2],
+                ..fact(a, "Mara wears a red cloak.")
+            }],
+            ..Default::default()
+        })]);
+        assert!(
+            extract(
+                &mut w,
+                &[Passage {
+                    event: a,
+                    text: "Mara wears a red cloak.".into()
+                }],
+                &mut Vec::new(),
+                &unsupported,
+                &mut report
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("outside chronological context")
+        );
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn a_new_subject_can_have_a_claim_and_correction_in_the_same_chunk() {
+        let mut w = World::open_in_memory().unwrap();
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara says the bridge is safe."}),
+            )
+            .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara admits the bridge is unsafe."}),
+            )
+            .unwrap();
+        let client = ScriptedClient::new([extraction(Discovery {
+            name: Some("Bridge".into()),
+            category: Some(Category::Place),
+            facts: vec![
+                NewFact {
+                    claimed_by: Some("Mara".into()),
+                    ..fact(a, "Mara says the bridge is safe.")
+                },
+                NewFact {
+                    claimed_by: Some("Mara".into()),
+                    supersedes: vec![1],
+                    ..fact(b, "Mara admits the bridge is unsafe.")
+                },
+            ],
+            ..Default::default()
+        })]);
+        let (path, mut report) = report_file();
+        extract(
+            &mut w,
+            &[
+                Passage {
+                    event: a,
+                    text: "Mara says the bridge is safe.".into(),
+                },
+                Passage {
+                    event: b,
+                    text: "Mara admits the bridge is unsafe.".into(),
+                },
+            ],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        let learned = entries(&w).unwrap();
+        assert_eq!(learned.len(), 1);
+        assert_eq!(learned[0].facts[1].supersedes, vec![1]);
+        assert_eq!(
+            w.replay_in_memory().unwrap().state().unwrap(),
+            w.state().unwrap()
+        );
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn an_existing_linked_mechanic_uses_its_source_rule_version() {
+        let mut w = World::open_in_memory().unwrap();
+        let def=serde_json::from_value(json!({"name":"Lever", "trigger":"pull lever", "roles":{}, "conditions":[], "effects":[], "outcome":"The gate opens."})).unwrap();
+        let rule = crate::rules::mint(&mut w, def, "fixture")
+            .unwrap()
+            .unwrap()
+            .0
+            .id;
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Pulling the lever opens the gate."}),
+            )
+            .unwrap();
+        let id = learn(
+            &mut w,
+            &Discovery {
+                name: Some("Lever".into()),
+                category: Some(Category::Mechanic),
+                rule: Some(rule),
+                facts: vec![fact(a, "Pulling the lever opens the gate.")],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"The lever also rings the bell."}),
+            )
+            .unwrap();
+        crate::rules::amend(
+            &mut w,
+            rule,
+            crate::rules::Amendment {
+                outcome: Some("The gate now closes.".into()),
+                ..Default::default()
+            },
+            "fixture",
+        )
+        .unwrap()
+        .unwrap();
+        let client = ScriptedClient::new([extraction(Discovery {
+            entry: Some(id),
+            facts: vec![fact(b, "The lever also rings the bell.")],
+            ..Default::default()
+        })]);
+        let (path, mut report) = report_file();
+        extract(
+            &mut w,
+            &[Passage {
+                event: b,
+                text: "The lever also rings the bell.".into(),
+            }],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(entries(&w).unwrap()[0].facts[1].rule_version, Some(1));
+        assert_eq!(crate::rules::get(&w, rule).unwrap().unwrap().version, 2);
+        assert_eq!(
+            w.replay_in_memory().unwrap().state().unwrap(),
+            w.state().unwrap()
+        );
         drop(report);
         std::fs::remove_file(path).unwrap();
     }

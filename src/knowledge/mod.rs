@@ -1222,6 +1222,24 @@ pub(crate) fn learn(
     d: &Discovery,
     current: Option<i64>,
 ) -> Result<Result<EntityId, String>, StoreError> {
+    write_discovery(world, d, current, false)
+}
+
+/// Reconstruction shares the writer, but a fact about an already linked
+/// mechanic must remember the rule at its cited event, not today's version.
+fn learn_historical(
+    world: &mut World,
+    d: &Discovery,
+) -> Result<Result<EntityId, String>, StoreError> {
+    write_discovery(world, d, None, true)
+}
+
+fn write_discovery(
+    world: &mut World,
+    d: &Discovery,
+    current: Option<i64>,
+    historical: bool,
+) -> Result<Result<EntityId, String>, StoreError> {
     if current.is_none() && d.facts.iter().any(|f| f.source.is_none()) {
         return Ok(Err("a fact cites no narration".into()));
     }
@@ -1237,22 +1255,43 @@ pub(crate) fn learn(
         Some(Link::Rule(id)) => rules::get(world, *id)?.map(|r| r.version),
         _ => None,
     };
-    let facts = d.facts.iter().map(|f| Fact {
-        text: f.text.trim().to_owned(),
-        kind: if f.claimed_by.is_some() {
-            FactKind::Claimed
-        } else {
-            FactKind::Observed
-        },
-        claimed_by: f.claimed_by.as_ref().map(|c| c.trim().to_owned()),
-        claimant: f.claimant,
-        sources: vec![Source {
-            event: f.source.or(current).expect("checked above"),
-            excerpt: Some(f.excerpt.trim().to_owned()),
-        }],
-        supersedes: f.supersedes.clone(),
-        rule_version,
-    });
+    let facts = d
+        .facts
+        .iter()
+        .map(|f| {
+            let version = if historical {
+                match &link {
+                    Some(Link::Rule(id)) => {
+                        let past = world
+                            .fork_in_memory(f.source.expect("checked above"))
+                            .map_err(|e| {
+                                StoreError::Corrupt(format!("historical mechanic: {e}"))
+                            })?;
+                        rules::get(&past, *id)?.map(|r| r.version)
+                    }
+                    _ => None,
+                }
+            } else {
+                rule_version
+            };
+            Ok(Fact {
+                text: f.text.trim().to_owned(),
+                kind: if f.claimed_by.is_some() {
+                    FactKind::Claimed
+                } else {
+                    FactKind::Observed
+                },
+                claimed_by: f.claimed_by.as_ref().map(|c| c.trim().to_owned()),
+                claimant: f.claimant,
+                sources: vec![Source {
+                    event: f.source.or(current).expect("checked above"),
+                    excerpt: Some(f.excerpt.trim().to_owned()),
+                }],
+                supersedes: f.supersedes.clone(),
+                rule_version: version,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
     let (op, existing) = match target {
         Target::Existing(id, mut r) => {
             for f in facts {
