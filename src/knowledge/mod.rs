@@ -36,6 +36,7 @@
 //! supersedes it.
 
 pub mod browser;
+pub mod reconstruct;
 mod report;
 pub(crate) mod tools;
 mod truth;

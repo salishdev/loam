@@ -81,6 +81,10 @@ The save records every model call: what was sent, what came back, tokens,
 cache hits, latency and cost. Set `LOAM_RECORD=0` to turn that off. Saves
 from loam 0.2 are upgraded in place when opened.
 
+To recover learned knowledge from an older game's narration into a new save,
+see [historical reconstruction](docs/reconstruction.md). The standalone example
+includes an offline fixture and an evidence report; it leaves the source unchanged.
+
 ## Develop
 
 ```bash
