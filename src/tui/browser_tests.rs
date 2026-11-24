@@ -283,3 +283,40 @@ fn refresh_keeps_exact_entry_after_rename_ambiguity_and_removal() {
     assert_eq!(app.panel.last().unwrap().arg, target);
     assert!(app.panel.last().unwrap().text.contains("No entries found"));
 }
+
+#[test]
+fn switching_saves_clears_world_search_without_any_world_view_to_drop() {
+    use crate::branches::tests::{saved_game, temp_dir};
+    let dir = temp_dir("browser-world-search-switch");
+    let main = saved_game(&dir, "mill.db");
+    let world = World::open(&main).unwrap();
+    let other = dir.join("other.db");
+    drop(world.fork(world.last_seq().unwrap(), &other).unwrap());
+    drop(world);
+    let mut app = App::new(World::open_read_only(&main).unwrap(), true);
+    command(&mut app, ":compendium world people");
+    app.on_key(key(KeyCode::Esc));
+    command(&mut app, ":time");
+    assert_eq!(app.mode, Mode::World);
+    assert!(app.panel.iter().all(|v| !commands::is_moded(&v.cmd)));
+
+    // Search a mode-independent panel while the session remains in World.
+    app.on_key(key(KeyCode::Char('/')));
+    typed(&mut app, "Brother Ash");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.last_search, Some((Focus::Panel, "Brother Ash".into())));
+    app.on_key(key(KeyCode::Char('/')));
+    typed(&mut app, "The hidden bell");
+    assert_eq!(app.search.as_ref().unwrap().query, "The hidden bell");
+
+    app.switch_to(other.clone());
+    assert_eq!(app.mode, Mode::Player);
+    assert!(app.search.is_none() && app.last_search.is_none());
+    assert_eq!(app.panel.last().unwrap().cmd, ":time");
+    for text in [app.hints(), format!("{:?}", app.panel)] {
+        assert!(!text.contains("Brother Ash") && !text.contains("The hidden bell"));
+    }
+    assert_eq!(app.outbox, [Command::Switch(other)]);
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
