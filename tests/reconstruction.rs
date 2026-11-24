@@ -78,6 +78,208 @@ fn mutate(response: &Response, change: impl FnOnce(&mut Value)) -> Response {
     change(&mut value);
     Response::canned_text(value.to_string())
 }
+fn tool_response(response: &Response) -> Response {
+    Response::canned_tool_use(
+        "extraction",
+        "record_discoveries",
+        serde_json::from_str(&response.text()).unwrap(),
+    )
+}
+
+#[test]
+fn typed_result_tool_imports_the_fixture_and_declares_nested_evidence_schema() {
+    let c = Case::new();
+    let original = bytes(&c.source);
+    let client = ScriptedClient::new(c.responses.iter().map(|response| {
+        let mut result = tool_response(response);
+        result.content.push(ContentBlock::text(
+            "Accompanying prose is not the result JSON.",
+        ));
+        result
+    }));
+    c.run(&client).unwrap();
+    assert_eq!(bytes(&c.source), original);
+    let world = World::open(&c.output).unwrap();
+    assert_eq!(knowledge::entries(&world).unwrap().len(), 6);
+    assert_eq!(
+        world.state().unwrap(),
+        world.replay_in_memory().unwrap().state().unwrap()
+    );
+    assert!(
+        knowledge::compendium(&world, "player Bridge")
+            .unwrap()
+            .contains("corrects 1")
+    );
+    assert!(c.text().starts_with("Status: COMPLETE"));
+    for request in client.requests() {
+        assert_eq!(request.tools.len(), 1);
+        let tool = &request.tools[0];
+        assert_eq!(tool.name, "record_discoveries");
+        let schema = &tool.input_schema;
+        assert_eq!(schema["required"], json!(["discoveries", "flags"]));
+        assert_eq!(schema["additionalProperties"], false);
+        let candidate = &schema["properties"]["discoveries"]["items"];
+        assert_eq!(candidate["required"], json!(["support", "discovery"]));
+        assert_eq!(
+            candidate["properties"]["support"]["enum"],
+            json!(["explicit", "ambiguous", "inferred"])
+        );
+        let discovery = &candidate["properties"]["discovery"];
+        assert_eq!(discovery["required"], json!(["facts"]));
+        let props = &discovery["properties"];
+        assert_eq!(props["entry"]["type"], "integer");
+        for forbidden in ["subject", "rule", "term"] {
+            assert!(props.get(forbidden).is_none());
+        }
+        let fact = &props["facts"]["items"];
+        assert_eq!(fact["required"], json!(["text", "excerpt", "source"]));
+        assert_eq!(fact["properties"]["source"]["type"], "integer");
+        assert_eq!(fact["additionalProperties"], false);
+        let instructions = request.system.unwrap();
+        assert!(instructions.contains("ONE discovery"));
+        assert!(instructions.contains("numeric existing IDs listed in prior_entries"));
+    }
+}
+
+fn malformed(response: &Response, shape: &str) -> Response {
+    mutate(response, |v| match shape {
+        "entry_name" => v["discoveries"][1]["discovery"]["entry"] = json!("Dry oak peg"),
+        "flat" => v["discoveries"][1] = v["discoveries"][1]["discovery"].clone(),
+        "support" => {
+            v["discoveries"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("support");
+        }
+        "discovery" => {
+            v["discoveries"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("discovery");
+        }
+        "flags" => {
+            v.as_object_mut().unwrap().remove("flags");
+        }
+        "unknown" => v["discoveries"][1]["discovery"]["facts"][0]["extra"] = json!(true),
+        _ => unreachable!(),
+    })
+}
+
+#[test]
+fn malformed_response_gets_one_fresh_repair_without_importing_any_of_its_candidates() {
+    for shape in [
+        "entry_name",
+        "flat",
+        "support",
+        "discovery",
+        "flags",
+        "unknown",
+    ] {
+        for tool in [false, true] {
+            let c = Case::new();
+            let original = bytes(&c.source);
+            let bad = malformed(&c.responses[0], shape);
+            let bad = if tool { tool_response(&bad) } else { bad };
+            let client = ScriptedClient::new(
+                [bad]
+                    .into_iter()
+                    .chain(c.responses.iter().map(tool_response)),
+            );
+            c.run(&client).unwrap();
+            assert_eq!(bytes(&c.source), original);
+            let requests = client.requests();
+            assert_eq!(requests.len(), 4, "{shape}");
+            assert_eq!(requests[0].tools, requests[1].tools);
+            assert_eq!(requests[0].messages[0], requests[1].messages[0]);
+            assert_eq!(requests[1].messages.len(), 2);
+            assert!(message_text(&requests[1].messages[1]).contains("structure was invalid"));
+            let world = World::open(&c.output).unwrap();
+            assert_eq!(knowledge::entries(&world).unwrap().len(), 6);
+            assert_eq!(c.text().matches("Imported entry #").count(), 7);
+        }
+    }
+}
+
+#[test]
+fn repeated_malformed_results_stop_after_two_calls_with_no_discoveries_written() {
+    for shape in [
+        "entry_name",
+        "flat",
+        "support",
+        "discovery",
+        "flags",
+        "unknown",
+    ] {
+        let c = Case::new();
+        let original = bytes(&c.source);
+        let bad = tool_response(&malformed(&c.responses[0], shape));
+        let client = ScriptedClient::new([bad.clone(), bad, tool_response(&c.responses[0])]);
+        assert!(c.run(&client).is_err(), "{shape}");
+        assert_eq!(client.requests().len(), 2);
+        assert_eq!(client.remaining(), 1);
+        assert_eq!(bytes(&c.source), original);
+        assert!(
+            knowledge::entries(&World::open(&c.output).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(c.text().contains("FAILED / INCOMPLETE"));
+        assert!(!c.text().contains("Imported entry #"));
+        assert!(!c.text().contains("COMPLETE: replay matches"));
+    }
+}
+
+#[test]
+fn only_one_declared_result_tool_with_a_matching_stop_reason_is_accepted() {
+    for failure in [
+        "unknown",
+        "multiple",
+        "mixed",
+        "end_turn",
+        "truncated",
+        "missing_stop",
+        "no_call",
+    ] {
+        let c = Case::new();
+        let original = bytes(&c.source);
+        let mut response = tool_response(&c.responses[0]);
+        match failure {
+            "unknown" => {
+                if let ContentBlock::ToolUse(call) = &mut response.content[0] {
+                    call.name = "learn".into();
+                }
+            }
+            "multiple" => response.content.push(response.content[0].clone()),
+            "mixed" => response
+                .content
+                .push(ContentBlock::ToolUse(loam::llm::ToolUse {
+                    id: "other".into(),
+                    name: "learn".into(),
+                    input: json!({}),
+                })),
+            "end_turn" => response.stop_reason = Some(StopReason::EndTurn),
+            "truncated" => response.stop_reason = Some(StopReason::MaxTokens),
+            "missing_stop" => response.stop_reason = None,
+            "no_call" => {
+                response.content.clear();
+            }
+            _ => unreachable!(),
+        }
+        // Even valid accompanying text cannot rescue an invalid tool protocol.
+        response
+            .content
+            .push(ContentBlock::text(c.responses[0].text()));
+        let client = ScriptedClient::new([response, tool_response(&c.responses[0])]);
+        assert!(c.run(&client).is_err(), "{failure}");
+        assert_eq!(client.requests().len(), 1, "{failure}");
+        assert_eq!(bytes(&c.source), original);
+        assert!(
+            knowledge::entries(&World::open(&c.output).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
 
 #[test]
 fn chronological_extraction_uses_live_records_reports_and_replay_without_touching_source() {
@@ -166,6 +368,8 @@ fn evidence_and_identity_errors_fail_with_incomplete_artifacts_and_unchanged_sou
     for bad in [
         "missing",
         "wrong_excerpt",
+        "short_excerpt",
+        "empty_excerpt",
         "wrong_event",
         "future",
         "subject",
@@ -180,6 +384,8 @@ fn evidence_and_identity_errors_fail_with_incomplete_artifacts_and_unchanged_sou
             match bad {
                 "missing" => d["facts"][0]["source"] = json!(9999),
                 "wrong_excerpt" => d["facts"][0]["excerpt"] = json!("She has a blue cloak"),
+                "short_excerpt" => d["facts"][0]["excerpt"] = json!("Mara wears"),
+                "empty_excerpt" => d["facts"][0]["excerpt"] = json!(""),
                 "wrong_event" => d["facts"][0]["source"] = json!(5), // player input, not narration
                 "future" => d["facts"][0]["source"] = json!(8),
                 "subject" => d["subject"] = json!(1),
@@ -195,8 +401,13 @@ fn evidence_and_identity_errors_fail_with_incomplete_artifacts_and_unchanged_sou
                 _ => unreachable!(),
             }
         });
-        let client = ScriptedClient::new([response]);
+        let client = ScriptedClient::new([tool_response(&response)]);
         assert!(c.run(&client).is_err(), "{bad}");
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "evidence failures are not retried"
+        );
         assert_eq!(bytes(&c.source), original);
         assert!(c.output.exists());
         assert!(c.text().contains("FAILED / INCOMPLETE"));
@@ -219,8 +430,12 @@ fn inferred_and_ambiguous_candidates_are_reported_without_becoming_knowledge() {
         v["discoveries"][1]["support"] = json!("ambiguous");
     });
     let empty = Response::canned_text(r#"{"discoveries":[],"flags":[]}"#);
-    c.run(&ScriptedClient::new([first, empty.clone(), empty]))
-        .unwrap();
+    c.run(&ScriptedClient::new([
+        tool_response(&first),
+        empty.clone(),
+        empty,
+    ]))
+    .unwrap();
     assert!(
         knowledge::entries(&World::open(&c.output).unwrap())
             .unwrap()

@@ -37,7 +37,18 @@ against narration before trusting reconstructed memories.
 
 Narration is processed chronologically in bounded chunks. Oversized events are
 split with their original ID; an excerpt must fit within one passage. The
-request includes a bounded 32000-character prior-entry context, prioritizing
+extractor requests one `record_discoveries` tool result with a typed schema:
+`discoveries` contains `support`/`discovery` wrappers, and `flags` lists omissions.
+New-subject facts belong together under `name`/`category`; `entry` is only a numeric
+ID from `prior_entries`, never a name or a guessed new ID. Only that single result
+tool with a `tool_use` stop reason is accepted. Strict JSON text with `end_turn`
+remains supported for offline fixture compatibility and uses the same evidence checks.
+A malformed JSON structure gets at most one fresh extraction attempt for that
+chunk, before any discoveries from the malformed response are written. Protocol,
+citation and identity failures are not retried; failed repair leaves the output
+INCOMPLETE. No malformed fields are coerced into evidence or IDs.
+
+The request includes a bounded 32000-character prior-entry context, prioritizing
 names mentioned in the chunk, then recent entries. If older context is omitted,
 the model must flag uncertain identity; duplicate names cannot silently merge. A
 name collision with an unavailable older or later live entry is flagged and
