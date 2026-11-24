@@ -38,7 +38,7 @@ an intention or attempt is never evidence of success. Do not infer hidden motive
 locations, identities, mechanics or outcomes. Later explicit corrections cite earlier
 fact numbers, preserving the original claim. Facts need explicit source IDs from the
 current chunk. Prior entries provide identity/correction context, not new evidence.
-Never give subject, rule, term or claimant IDs: narration does not establish internal
+Never give subject, rule, term, claimant or related IDs: narration does not establish internal
 engine identity. Learned mechanics describe only the narrated discovery; do not guess
 current rules, versions or hidden conditions. Report any unresolved links in flags.
 Do not manufacture entries for flags. Empty discoveries is valid. Citation validation
@@ -282,6 +282,7 @@ fn extract(
                 },
                 claimed_by: f.claimed_by.as_deref().map(str::trim).map(str::to_owned),
                 claimant: None,
+                related: Vec::new(),
                 sources: Vec::new(),
                 supersedes: Vec::new(),
                 rule_version: None,
@@ -396,7 +397,9 @@ fn extract(
         if d.subject.is_some()
             || d.rule.is_some()
             || d.term.is_some()
-            || d.facts.iter().any(|f| f.claimant.is_some())
+            || d.facts
+                .iter()
+                .any(|f| f.claimant.is_some() || !f.related.is_empty())
         {
             return Err("internal entity/rule/term links are not narration evidence; flag unresolved identities instead".into());
         }
@@ -589,6 +592,66 @@ mod tests {
         drop(report);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn reconstruction_cannot_guess_related_ids_from_future_live_knowledge() {
+        let mut w = World::open_in_memory().unwrap();
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text": "Mara wears a red cloak."}),
+            )
+            .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text": "The secret council meets underground."}),
+            )
+            .unwrap();
+        let secret = learn(
+            &mut w,
+            &Discovery {
+                name: Some("Secret council".into()),
+                category: Some(Category::Faction),
+                facts: vec![fact(b, "The secret council meets underground.")],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let before = w.state().unwrap();
+        let client = ScriptedClient::new([extraction(Discovery {
+            name: Some("Mara".into()),
+            category: Some(Category::Person),
+            facts: vec![NewFact {
+                related: vec![secret],
+                ..fact(a, "Mara wears a red cloak.")
+            }],
+            ..Default::default()
+        })]);
+        let (path, mut report) = report_file();
+        let error = extract(
+            &mut w,
+            &[Passage {
+                event: a,
+                text: "Mara wears a red cloak.".into(),
+            }],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("links are not narration evidence"),
+            "{error}"
+        );
+        assert_eq!(w.state().unwrap(), before);
+        assert!(!format!("{:?}", client.requests()[0].messages).contains("Secret council"));
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn report_file() -> (std::path::PathBuf, File) {
         let path = std::env::temp_dir().join(format!(
             "loam-context-{}.txt",
