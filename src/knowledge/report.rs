@@ -1,10 +1,11 @@
 //! `:compendium`: the Player-mode compendium as a text report, shared by
-//! plain mode and the TUI's report panel. Reads entries only: no model
-//! call, no write.
+//! plain mode and the TUI's report panel, with `:rules` and `:glossary` as
+//! shortcuts into its Mechanics section. Reads entries only (never a rule
+//! or glossary term an entry is linked to): no model call, no write.
 
 use std::fmt::Write;
 
-use super::{Category, Entry, FactKind, Found, entries, entry, find, search};
+use super::{Category, Entry, FactKind, Found, entries, entry, find, mechanics, search};
 use crate::world::{StoreError, World};
 
 const USAGE: &str = "Usage: :compendium [people | places | factions | items | lore | mechanics | <name|#entry> | search <text>]";
@@ -23,6 +24,9 @@ pub fn compendium(world: &World, arg: &str) -> Result<String, StoreError> {
     if rest.is_empty()
         && let Some(category) = Category::parse(word)
     {
+        if category == Category::Mechanic {
+            return mechanics_section(world);
+        }
         return section(world, category);
     }
     Ok(match find(world, arg)? {
@@ -84,6 +88,68 @@ fn section(world: &World, category: Category) -> Result<String, StoreError> {
         writeln!(out, "  {}", line(e)).unwrap();
     }
     write!(out, "\n{HINT}").unwrap();
+    Ok(out)
+}
+
+/// The Mechanics section: interactions, then terms.
+fn mechanics_section(world: &World) -> Result<String, StoreError> {
+    let m = mechanics(world)?;
+    if m.interactions.is_empty() && m.terms.is_empty() {
+        return Ok(NO_MECHANICS.into());
+    }
+    let mut out = String::from("Mechanics\n");
+    for (heading, known) in [("Interactions", &m.interactions), ("Terms", &m.terms)] {
+        if known.is_empty() {
+            continue;
+        }
+        writeln!(out, "  {heading}").unwrap();
+        for e in known {
+            writeln!(out, "    {}", line(e)).unwrap();
+        }
+    }
+    write!(out, "\n{HINT}").unwrap();
+    Ok(out)
+}
+
+const NO_MECHANICS: &str = "No mechanics known yet: how things work is remembered as you \
+                            learn it in play.";
+
+/// `:rules`: the interactions the player has learned, each in full. Never
+/// the engine's rules themselves.
+pub fn learned_rules(world: &World) -> Result<String, StoreError> {
+    learned(
+        world,
+        mechanics(world)?.interactions,
+        "Mechanics: interactions you have learned",
+        "No interactions known yet: how things work is remembered as you learn it in play.",
+    )
+}
+
+/// `:glossary`: the terminology the player has learned, each in full.
+/// Never the engine's glossary itself.
+pub fn learned_terms(world: &World) -> Result<String, StoreError> {
+    learned(
+        world,
+        mechanics(world)?.terms,
+        "Mechanics: terms you have learned",
+        "No terms known yet: terminology is remembered as you learn it in play.",
+    )
+}
+
+fn learned(
+    world: &World,
+    known: Vec<Entry>,
+    heading: &str,
+    none: &str,
+) -> Result<String, StoreError> {
+    if known.is_empty() {
+        return Ok(none.into());
+    }
+    let mut out = format!("{heading}\n");
+    for e in &known {
+        writeln!(out, "\n{}", detail(world, e)?).unwrap();
+    }
+    write!(out, "\n:compendium mechanics lists every mechanic.").unwrap();
     Ok(out)
 }
 
@@ -176,6 +242,14 @@ fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
             };
             writeln!(out, "{n}. {text}{notes} [{}]", sources.join("; ")).unwrap();
         }
+    }
+    if let Some(u) = e.usage {
+        let times = if u.count == 1 {
+            "once".to_owned()
+        } else {
+            format!("{} times", u.count)
+        };
+        writeln!(out, "Used {times}: first #{}, last #{}.", u.first, u.last).unwrap();
     }
     if e.encounters == 0 {
         write!(

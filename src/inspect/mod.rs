@@ -1,5 +1,7 @@
-//! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:inventory`, `:stats`, `:time`, `:pressures`, `:log`.
+//! The REPL inspector: `:why`, `:relations`, `:quests`, `:inventory`,
+//! `:stats`, `:time`, `:pressures`, `:log`, and the raw [`rules`] and
+//! [`glossary`] listings (`:rules` and `:glossary` show the learned
+//! mechanics in [`crate::knowledge`]).
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.

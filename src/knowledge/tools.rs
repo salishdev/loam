@@ -43,7 +43,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
          may then be empty; a new entry always needs a fact); never link by a shared name alone. A fact that corrects earlier ones \
          lists their numbers (from recall) in supersedes: the earlier facts stay, attributed, as \
          superseded. People and notable items the narration names around the player are \
-         remembered as seen without this.",
+         remembered as seen without this. For a mechanic, give rule (the rule that governs it) \
+         or term (a glossary term) when one does, and state only what the narration shows, \
+         never the rule's hidden conditions or effects; when a known mechanic turns out to \
+         work differently, supersede the old fact (amend_rule and retire_rule list what the \
+         player learned about a rule).",
             json!({
                 "type": "object",
                 "properties": {
@@ -52,6 +56,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "category": category,
                     "distinct": {"type": "boolean", "description": "A new entry even though one of this name and category is known."},
                     "subject": {"type": "integer", "description": "The world entity this is about, when it exists."},
+                    "rule": {"type": "integer", "description": "For a mechanic: the rule it is about."},
+                    "term": {"type": "string", "description": "For a mechanic: the glossary term it is about."},
                     "facts": {
                         "type": "array",
                             "items": {

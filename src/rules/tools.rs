@@ -302,10 +302,14 @@ struct AmendInput {
 
 fn amend(world: &mut World, input: AmendInput) -> Result<ToolOutput, StoreError> {
     match super::amend(world, input.id, input.changes, &input.reason)? {
-        Ok((rule, new_terms)) => ok(glossary::tools::with_new_terms(
-            json!({"rule": rule.id, "version": rule.version}),
-            &new_terms,
-        )),
+        Ok((rule, new_terms)) => {
+            let result = with_learned(
+                world,
+                rule.id,
+                json!({"rule": rule.id, "version": rule.version}),
+            )?;
+            ok(glossary::tools::with_new_terms(result, &new_terms))
+        }
         Err(r) => refuse(r),
     }
 }
@@ -318,7 +322,24 @@ struct RetireInput {
 
 fn retire(world: &mut World, input: RetireInput) -> Result<ToolOutput, StoreError> {
     match super::retire(world, input.id, &input.reason)? {
-        Ok(rule) => ok(json!({"rule": rule.id, "version": rule.version, "status": rule.status})),
+        Ok(rule) => ok(with_learned(
+            world,
+            rule.id,
+            json!({"rule": rule.id, "version": rule.version, "status": rule.status}),
+        )?),
         Err(r) => refuse(r),
     }
+}
+
+/// A rule change's result, with what the player learned about the rule:
+/// their compendium keeps it as learned, until narration shows the change.
+fn with_learned(world: &World, id: RuleId, mut result: Value) -> Result<Value, StoreError> {
+    if let Some(learned) = crate::knowledge::learned_about_rule(world, id)? {
+        result["player_learned"] = learned;
+        result["note"] = json!(
+            "the player's compendium keeps what they learned about this rule; if your narration \
+             shows the change, learn the new behaviour on that entry with supersedes"
+        );
+    }
+    Ok(result)
 }

@@ -2192,6 +2192,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rules_and_glossary_open_learned_mechanics_in_the_panel_as_plain_mode_prints_them() {
+        let mut app = app();
+        for cmd in [":rules", ":glossary"] {
+            let plain = crate::commands::report(&app.view, cmd, "")
+                .unwrap()
+                .unwrap();
+            assert!(plain.contains("known yet"), "{plain}");
+            typed(&mut app, cmd);
+            app.on_key(key(KeyCode::Enter));
+            assert_eq!(app.panel.last().unwrap().text, plain);
+        }
+        assert!(
+            app.outbox.is_empty(),
+            "reading them sends nothing to the game"
+        );
+    }
+
+    #[test]
     fn the_compendium_opens_in_the_panel_as_plain_mode_prints_it() {
         let mut app = app();
         let plain = |arg: &str| {

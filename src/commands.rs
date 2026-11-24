@@ -46,7 +46,7 @@ pub const COMMANDS: &[&str] = &[
 
 /// The command list `:help` prints.
 pub const HELP: &str = "Commands: :compendium [<category> | <name|#entry> | search <text>] \
-(what you have learned), :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
+(what you have learned), :rules and :glossary (the mechanics you have learned), :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs (:compendium people), :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
 :log #<event>, :tick, :quit
 
@@ -86,8 +86,10 @@ pub fn split(input: &str) -> (&str, &str) {
 pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, String>> {
     let result = match cmd {
         ":compendium" => crate::knowledge::compendium(world, arg),
-        ":rules" => inspect::rules(world),
-        ":glossary" => inspect::glossary(world),
+        // Shortcuts into the compendium's learned Mechanics, never the
+        // engine's rules or glossary.
+        ":rules" => crate::knowledge::learned_rules(world),
+        ":glossary" => crate::knowledge::learned_terms(world),
         ":why" => inspect::why(world, arg),
         ":quests" => inspect::quests(world),
         // A shortcut into the compendium's People section.

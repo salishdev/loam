@@ -63,6 +63,7 @@ fn place(world: &World, name: &str) -> Entry {
 
 mod encounters;
 mod learned;
+mod mechanics;
 
 #[test]
 fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sources() {
@@ -92,6 +93,7 @@ fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sourc
             claimant: None,
             sources: vec![Source::event(tower.first_seen)],
             supersedes: Vec::new(),
+            rule_version: None,
         }]
     );
     // Every cited source is narration the player saw.

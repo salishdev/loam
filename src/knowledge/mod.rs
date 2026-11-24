@@ -27,6 +27,13 @@
 //! a discovery the excerpt it quotes), checked before anything is written.
 //! The queries read entries only, so nothing the player hasn't learned can
 //! show up in a list, a name match or a search.
+//!
+//! A mechanic may be linked to the rule or glossary term behind it
+//! ([`Link`]). Its facts record the rule's version when learned, and
+//! [`record_use`] counts fast-path uses of a learned rule, but nothing ever
+//! reads the rule or term to show an entry: amending or retiring the rule
+//! leaves what was learned as it was, until a later narrated fact
+//! supersedes it.
 
 mod report;
 pub(crate) mod tools;
@@ -34,10 +41,12 @@ pub(crate) mod tools;
 #[cfg(test)]
 mod tests;
 
-pub use report::compendium;
+pub use report::{compendium, learned_rules, learned_terms};
 
 use serde::{Deserialize, Serialize};
 
+use crate::glossary;
+use crate::rules::{self, RuleId};
 use crate::world::{
     self, ApplyError, Component, EXIT_REL, EntityId, EventKind, KNOWLEDGE_KIND, Op, Patch,
     ROOM_KIND, StoreError, World,
@@ -127,6 +136,32 @@ pub struct Fact {
     /// and attribution, but no longer shape the summary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<usize>,
+    /// The version of the entry's linked rule when this was learned: what
+    /// was learned stays tied to the rule as it was then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_version: Option<u32>,
+}
+
+/// What a mechanic entry is about in the engine: a rule, or a glossary
+/// term. Player views never read the rule or term itself, so a link reveals
+/// none of its conditions, effects, roles or meanings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Link {
+    Rule(RuleId),
+    Term(String),
+}
+
+/// How often the player has used a learned mechanic (a rule applied to
+/// their action on the fast path), and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub count: u32,
+    /// The narration of the first and latest uses.
+    pub first: i64,
+    pub last: i64,
+    /// The linked rule's version at the latest use.
+    pub version: u32,
 }
 
 /// A narration event cited as evidence, and the words in it that support
@@ -210,6 +245,11 @@ struct Record {
     seen_at: Option<EntityId>,
     #[serde(default)]
     facts: Vec<Fact>,
+    /// The rule or glossary term a mechanic is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<Link>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 impl Component for Record {
@@ -236,6 +276,10 @@ pub struct Entry {
     /// exposed: readers show only what was learned.
     pub linked: bool,
     pub facts: Vec<Fact>,
+    /// What a mechanic is about in the engine, when established. Readers
+    /// never follow it.
+    pub link: Option<Link>,
+    pub usage: Option<Usage>,
 }
 
 impl Entry {
@@ -252,7 +296,15 @@ impl Entry {
             seen_at: r.seen_at,
             linked: r.subject.is_some(),
             facts: r.facts,
+            link: r.link,
+            usage: r.usage,
         }
+    }
+
+    /// Whether this is learned terminology (a mechanic about a glossary
+    /// term) rather than an interaction.
+    pub fn is_term(&self) -> bool {
+        matches!(self.link, Some(Link::Term(_)))
     }
 
     /// Fact numbers (1-based) that a later fact corrects.
@@ -307,6 +359,35 @@ pub fn search(world: &World, text: &str) -> Result<Vec<Entry>, StoreError> {
         .into_iter()
         .filter(|e| e.mentions(&needle))
         .collect())
+}
+
+/// The Mechanics section as the player knows it: interactions (how things
+/// work, including those learned from a rule) and terminology.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Mechanics {
+    pub interactions: Vec<Entry>,
+    pub terms: Vec<Entry>,
+}
+
+/// Every learned mechanic, split into interactions and terms, in the order
+/// first learned.
+pub fn mechanics(world: &World) -> Result<Mechanics, StoreError> {
+    let (terms, interactions) = entries(world)?
+        .into_iter()
+        .filter(|e| e.category == Category::Mechanic)
+        .partition(Entry::is_term);
+    Ok(Mechanics {
+        interactions,
+        terms,
+    })
+}
+
+/// The entry linked to `link`, if any.
+fn linked(world: &World, link: &Link) -> Result<Option<(EntityId, Record)>, StoreError> {
+    Ok(world
+        .query::<Record>()?
+        .into_iter()
+        .find(|(_, r)| r.link.as_ref() == Some(link)))
 }
 
 /// What a name or `#id` finds among known entries.
@@ -465,6 +546,8 @@ pub(crate) fn record_place(
                 encounters: 1,
                 seen_at: None,
                 facts,
+                link: None,
+                usage: None,
             };
             let op = Op::Create {
                 handle: None,
@@ -586,6 +669,8 @@ pub(crate) fn record_encounters(
                     encounters: 0,
                     seen_at: None,
                     facts: Vec::new(),
+                    link: None,
+                    usage: None,
                 },
             ));
         }
@@ -646,6 +731,7 @@ fn add_fact(facts: &mut Vec<Fact>, text: String, source: i64) {
             claimant: None,
             sources: vec![Source::event(source)],
             supersedes: Vec::new(),
+            rule_version: None,
         },
     );
 }
@@ -703,10 +789,27 @@ pub struct Discovery {
     /// entity it turned out to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<EntityId>,
+    /// For a mechanic: the rule it is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<RuleId>,
+    /// For a mechanic: the glossary term it is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
     /// May be empty with `entry` and `subject` (a known person or item):
     /// a link and nothing more.
     #[serde(default)]
     pub facts: Vec<NewFact>,
+}
+
+impl Discovery {
+    /// The engine link the discovery names, if any.
+    fn link(&self) -> Option<Link> {
+        match (&self.rule, &self.term) {
+            (Some(r), _) => Some(Link::Rule(*r)),
+            (None, Some(t)) => Some(Link::Term(t.trim().to_owned())),
+            (None, None) => None,
+        }
+    }
 }
 
 /// `distinct` as given, with `null` read as not given.
@@ -934,6 +1037,10 @@ fn resolve(
         }
     }
 
+    if let Err(why) = check_link(world, d, &target, pending)? {
+        return Ok(Err(why));
+    }
+
     if d.facts.is_empty() {
         // A link and nothing more: only for a known person or item, so
         // nothing new (not even a name) is written without a citation.
@@ -1000,6 +1107,80 @@ fn resolve(
     Ok(Ok(target))
 }
 
+/// Check a discovery's `rule` or `term` link: only for a mechanic, naming
+/// something that exists, and not already the link of another entry (or of
+/// another discovery staged this turn). `Err` says why not.
+fn check_link(
+    world: &World,
+    d: &Discovery,
+    target: &Target,
+    pending: &[Discovery],
+) -> Result<Result<(), String>, StoreError> {
+    macro_rules! refuse {
+        ($($t:tt)*) => { return Ok(Err(format!($($t)*))) };
+    }
+    if d.rule.is_some() && d.term.is_some() {
+        refuse!("a mechanic is about a rule or a glossary term, not both");
+    }
+    let Some(link) = d.link() else {
+        return Ok(Ok(()));
+    };
+    let (own, category, current) = match target {
+        Target::Existing(id, r) => (Some(*id), r.category, r.link.as_ref()),
+        Target::New { category, .. } => (None, *category, None),
+    };
+    if category != Category::Mechanic {
+        refuse!(
+            "rule and term go with a mechanic, not a {}",
+            category.label()
+        );
+    }
+    match &link {
+        Link::Rule(id) => {
+            if rules::get(world, *id)?.is_none() {
+                refuse!("there is no rule #{id}");
+            }
+        }
+        Link::Term(name) => {
+            if !glossary::terms(world)?.contains_key(name) {
+                refuse!("{name:?} is not a glossary term");
+            }
+        }
+    }
+    if let (Some(id), Some(other)) = (own, current)
+        && *other != link
+    {
+        refuse!("entry #{id} is already about another rule or term");
+    }
+    let what = match &link {
+        Link::Rule(id) => format!("rule #{id}"),
+        Link::Term(name) => format!("the term {name:?}"),
+    };
+    if let Some((other, _)) = linked(world, &link)?
+        && Some(other) != own
+    {
+        refuse!("entry #{other} is already about {what}: add to it with entry");
+    }
+    for p in pending.iter().filter(|p| p.link().as_ref() == Some(&link)) {
+        if own.is_none() || p.entry != own {
+            refuse!(
+                "another learn call this turn already records {what}; give all its facts in \
+                 that one call"
+            );
+        }
+    }
+    // Another call this turn links the same entry elsewhere: only the first
+    // could be kept, and the other's facts would be lost.
+    if let Some(id) = own
+        && pending
+            .iter()
+            .any(|p| p.entry == Some(id) && p.link().is_some_and(|l| l != link))
+    {
+        refuse!("another learn call this turn links entry #{id} to another rule or term");
+    }
+    Ok(Ok(()))
+}
+
 /// `d` with only the facts whose excerpts their narration contains
 /// (citing `current` where they give no source), or `None` when no fact
 /// is left.
@@ -1042,6 +1223,14 @@ pub(crate) fn learn(
         Ok(t) => t,
         Err(why) => return Ok(Err(why)),
     };
+    let link = match &target {
+        Target::Existing(_, r) => r.link.clone().or_else(|| d.link()),
+        Target::New { .. } => d.link(),
+    };
+    let rule_version = match &link {
+        Some(Link::Rule(id)) => rules::get(world, *id)?.map(|r| r.version),
+        _ => None,
+    };
     let facts = d.facts.iter().map(|f| Fact {
         text: f.text.trim().to_owned(),
         kind: if f.claimed_by.is_some() {
@@ -1056,6 +1245,7 @@ pub(crate) fn learn(
             excerpt: Some(f.excerpt.trim().to_owned()),
         }],
         supersedes: f.supersedes.clone(),
+        rule_version,
     });
     let (op, existing) = match target {
         Target::Existing(id, mut r) => {
@@ -1064,6 +1254,9 @@ pub(crate) fn learn(
             }
             if r.subject.is_none() {
                 r.subject = d.subject;
+            }
+            if r.link.is_none() {
+                r.link = link;
             }
             refresh(&mut r);
             (world::set_op(id, &r), Some(id))
@@ -1079,6 +1272,8 @@ pub(crate) fn learn(
                 encounters: 0,
                 seen_at: None,
                 facts: Vec::new(),
+                link,
+                usage: None,
             };
             for f in facts {
                 merge_fact(&mut r.facts, f);
@@ -1143,4 +1338,71 @@ fn refresh(r: &mut Record) {
         .collect::<Vec<_>>()
         .join(" ");
     r.summary_source = cited(&observed).into_iter().max().unwrap_or(r.first_seen);
+}
+
+/// Remember that the player used the mechanic learned about rule `rule`
+/// (at version `version`), as narrated by `source`: its usage is counted
+/// and cited. Nothing else is copied from the rule, so its conditions and
+/// effects stay unknown. Returns the entry, or `None` when no entry is
+/// about the rule (a rule the player never learned stays unlearned) or the
+/// source isn't narration.
+pub(crate) fn record_use(
+    world: &mut World,
+    rule: RuleId,
+    version: u32,
+    source: i64,
+) -> Result<Option<EntityId>, StoreError> {
+    let Some((id, mut r)) = linked(world, &Link::Rule(rule))? else {
+        return Ok(None);
+    };
+    if check_source(world, source)?.is_err() {
+        return Ok(None);
+    }
+    r.usage = Some(match r.usage {
+        Some(u) => Usage {
+            count: u.count + 1,
+            last: source,
+            version,
+            ..u
+        },
+        None => Usage {
+            count: 1,
+            first: source,
+            last: source,
+            version,
+        },
+    });
+    match world.apply_engine_patch(&Patch::new(vec![world::set_op(id, &r)])) {
+        Ok(_) => Ok(Some(id)),
+        Err(ApplyError::Rejected(_)) => Ok(None),
+        Err(ApplyError::Storage(e)) => Err(StoreError::Sqlite(e)),
+    }
+}
+
+/// The entry learned about rule `rule` and its current facts, numbered as
+/// `supersedes` names them, for the director when it changes the rule: the
+/// compendium keeps what the player learned until a narrated fact
+/// supersedes it.
+pub(crate) fn learned_about_rule(
+    world: &World,
+    rule: RuleId,
+) -> Result<Option<serde_json::Value>, StoreError> {
+    let Some((id, r)) = linked(world, &Link::Rule(rule))? else {
+        return Ok(None);
+    };
+    let gone = superseded(&r.facts);
+    let facts: Vec<serde_json::Value> = r
+        .facts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !gone.contains(&(i + 1)))
+        .map(|(i, f)| {
+            let mut v = serde_json::json!({"fact": i + 1, "text": f.text});
+            if let Some(n) = f.rule_version {
+                v["learned_at_rule_version"] = serde_json::json!(n);
+            }
+            v
+        })
+        .collect();
+    Ok(Some(serde_json::json!({"entry": id, "facts": facts})))
 }

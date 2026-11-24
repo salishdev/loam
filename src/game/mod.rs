@@ -74,7 +74,9 @@ notable item, lore or a mechanic (seen, or told by someone), record it with lear
 words your narration will repeat exactly; a rumour is a claim with claimed_by, and a subject \
 only mentioned needs no entity. When someone known only by mention turns up, link their \
 entry to the entity with learn (entry + subject); a later revelation that corrects an earlier \
-fact names it in supersedes (recall lists an entry's facts). If a tool \
+fact names it in supersedes (recall lists an entry's facts). When a ruling shows the player \
+how something works, learn it as a mechanic with rule (only what the narration shows, never \
+hidden conditions). If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
@@ -143,6 +145,8 @@ struct Turn<'a> {
     estimate: Option<Bucket>,
     /// The minutes of the rule the fast path applied.
     rule_minutes: Option<u32>,
+    /// The rule (and its version) the fast path applied.
+    rule_applied: Option<(RuleId, u32)>,
     /// Where the player was when the turn began (nowhere before the
     /// opening).
     start_room: Option<EntityId>,
@@ -326,6 +330,7 @@ impl Game {
             input: None,
             estimate: None,
             rule_minutes: None,
+            rule_applied: None,
             start_room: player_room(&self.world)?,
         };
         self.director_turn(client, &slice, OPENING, turn, on_text)
@@ -372,6 +377,7 @@ impl Game {
             input: Some(input),
             estimate: None,
             rule_minutes: None,
+            rule_applied: None,
             start_room: player_room(&self.world)?,
         };
 
@@ -392,6 +398,7 @@ impl Game {
                     )? {
                         Ok(app) => {
                             turn.rule_minutes = rule.def.minutes;
+                            turn.rule_applied = Some((rule.id, rule.version));
                             let response = fast_path::narrate(
                                 &self.world,
                                 client,
@@ -469,6 +476,7 @@ impl Game {
                 input: Some(input),
                 estimate: None,
                 rule_minutes: None,
+                rule_applied: None,
                 start_room: player_room(&game.world)?,
             };
             game.run_director(client, &prompt.system, &prompt.message, turn, on_text)
@@ -546,6 +554,11 @@ impl Game {
         let ended = response.stop_reason == Some(StopReason::EndTurn);
         if ended && !narration.is_empty() {
             knowledge::tools::commit_turn(&mut self.world, turn.start, narrated)?;
+            // Using a mechanic the player has learned is remembered, without
+            // learning anything more about the rule behind it.
+            if let Some((rule, version)) = turn.rule_applied {
+                knowledge::record_use(&mut self.world, rule, version, narrated)?;
+            }
         }
         self.remember_encounters(&turn, narrated, &narration)?;
         Ok(TurnOutcome {
