@@ -566,7 +566,7 @@ fn normalize(s: &str) -> String {
 /// ellipses.
 fn normalize_excerpt(s: &str) -> String {
     normalize(s)
-        .trim_matches(|c: char| c == '"' || c == '.' || c.is_whitespace())
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c.is_whitespace())
         .to_owned()
 }
 
@@ -652,7 +652,7 @@ fn resolve(
             }
             let same: Vec<String> = all
                 .iter()
-                .filter(|e| e.category == category && e.name.eq_ignore_ascii_case(name))
+                .filter(|e| e.category == category && e.name.to_lowercase() == name.to_lowercase())
                 .map(|e| {
                     let gist = e
                         .facts
@@ -666,17 +666,22 @@ fn resolve(
                     && p.category == Some(category)
                     && p.name
                         .as_deref()
-                        .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+                        .is_some_and(|n| n.trim().to_lowercase() == name.to_lowercase())
             });
-            if !d.distinct && (!same.is_empty() || staged) {
-                let known = if same.is_empty() {
-                    "already being recorded this turn".to_owned()
-                } else {
-                    format!("already known as {}", same.join(", "))
-                };
+            if !d.distinct && !same.is_empty() {
                 refuse!(
-                    "a {} called {name:?} is {known}: add to it with entry, or pass \
-                     distinct: true if this is a different one that shares the name",
+                    "a {} called {name:?} is already known as {}: add to it with entry, or \
+                     pass distinct: true if this is a different one that shares the name",
+                    category.label(),
+                    same.join(", ")
+                );
+            }
+            if !d.distinct && staged {
+                // It has no id yet, so it can't be named with entry.
+                refuse!(
+                    "a {} called {name:?} is already being recorded this turn: give all its \
+                     facts in that one call, or pass distinct: true if this is a different \
+                     one that shares the name",
                     category.label()
                 );
             }

@@ -151,8 +151,8 @@ fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
     if e.encounters == 0 {
         write!(
             out,
-            "\nKnown by mention: first #{}, latest #{}; not encountered. [#n] is the narration \
-             it comes from: :log #n shows it.",
+            "\nLearned from narration #{} to #{}. [#n] is the narration it comes from: :log #n \
+             shows it.",
             e.first_seen, e.last_seen
         )
         .unwrap();

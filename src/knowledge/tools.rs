@@ -31,7 +31,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
          say. Each fact quotes an excerpt: words your final narration will include word for \
          word (or, with source, words of an earlier narration event). A fact whose excerpt \
          isn't narrated is dropped. Places the player enters are remembered without this; to add \
-         to one, give its room as subject. A \
+         to one, use entry (a refusal for its name gives the id). A \
          subject merely mentioned needs no world entity: don't create one to learn about it. \
          Name and category start an entry; if one of that name is already known, the tool \
          refuses and lists it with its id: then add to it with entry, or pass distinct: true \

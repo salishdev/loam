@@ -124,7 +124,7 @@ fn narrated_observations_and_named_claims_become_readable_entries() {
         )),
         "{detail}"
     );
-    assert!(detail.contains("not encountered"), "{detail}");
+    assert!(detail.contains("Learned from narration"), "{detail}");
     let detail = compendium(world, "Brother Ash");
     assert!(detail.starts_with(&format!("Brother Ash · person · entry #{}", ash.id)));
     assert!(detail.contains(&format!(
@@ -731,4 +731,30 @@ fn an_ellipsis_matches_either_way_it_is_written() {
         "facts": [{"text": "Open.", "excerpt": "...whispers... the gate is open.", "source": seq}]}))
     .unwrap();
     assert!(learn(world, &d, None).unwrap().is_ok());
+}
+
+#[test]
+fn a_second_call_for_a_name_staged_this_turn_is_told_to_use_one_call() {
+    let (mut game, client) = begun();
+    let calls = client.requests().len();
+    let mara = |fact: &str| {
+        json!({"name": "Mara", "category": "person", "facts": [
+            {"text": fact, "excerpt": "Mara rows the ferry"}]})
+    };
+    learning_turn(
+        &mut game,
+        &client,
+        &[mara("Rows the ferry."), mara("Is a ferrywoman.")],
+        "Mara rows the ferry.",
+    );
+    let results = tool_results(&client, client.requests().len() - calls);
+    assert!(
+        results[1].1 && results[1].0.contains("give all its facts in that one call"),
+        "{results:?}"
+    );
+    assert!(
+        !results[1].0.contains("add to it with entry"),
+        "{results:?}"
+    );
+    assert_eq!(names(game.world()), ["Drowned Chapel", "Mara"]);
 }
