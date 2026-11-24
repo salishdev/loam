@@ -677,3 +677,58 @@ fn search_finds_who_made_a_claim() {
     let hits = compendium(game.world(), "search ash");
     assert!(hits.contains("The drowned bell (lore)"), "{hits}");
 }
+
+#[test]
+fn a_retried_opening_does_not_count_the_failed_attempts_calls() {
+    let (mut game, client) = crate::game::tests::new_game();
+    let mara = json!({"name": "Mara", "category": "person", "facts": [
+        {"text": "Rows the ferry.", "excerpt": "Mara rows the ferry"}]});
+    client.push(learn_call(mara.clone()));
+    assert!(game.begin(&client, &mut |_| {}).is_err());
+    let calls = client.requests().len();
+    client.push(learn_call(mara));
+    client.push(crate::game::tests::opening_room());
+    client.push(Response::canned_text("You wake; Mara rows the ferry past."));
+    game.begin(&client, &mut |_| {}).unwrap();
+    let results = tool_results(&client, client.requests().len() - calls);
+    assert!(!results[0].1, "{results:?}");
+    assert_eq!(names(game.world()), ["Mara", "Drowned Chapel"]);
+}
+
+#[test]
+fn distinct_is_read_leniently_but_only_for_new_entries() {
+    let (mut game, client) = begun();
+    learning_turn(&mut game, &client, &ash_and_the_bell()[..1], ASH_NARRATION);
+    let ash = one(game.world(), "Brother Ash").id;
+    let narration = game
+        .world()
+        .last_event(EventKind::Narration)
+        .unwrap()
+        .unwrap()
+        .seq;
+    let world = game.world_mut();
+    let null: Discovery = serde_json::from_value(json!({"name": "Mara", "category": "person",
+        "distinct": null, "facts": [{"text": "A monk.", "excerpt": "A gaunt monk ties", "source": narration}]}))
+    .unwrap();
+    assert!(!null.distinct);
+    let both: Discovery = serde_json::from_value(json!({"entry": ash, "distinct": true,
+        "facts": [{"text": "A monk.", "excerpt": "A gaunt monk ties", "source": narration}]}))
+    .unwrap();
+    assert!(learn(world, &both, None).unwrap().is_err());
+}
+
+#[test]
+fn an_ellipsis_matches_either_way_it_is_written() {
+    let (mut game, _client) = begun();
+    let world = game.world_mut();
+    let seq = world
+        .log_event(
+            EventKind::Narration,
+            &json!({"text": "She whispers\u{2026} the gate is open."}),
+        )
+        .unwrap();
+    let d: Discovery = serde_json::from_value(json!({"name": "Gate", "category": "place",
+        "facts": [{"text": "Open.", "excerpt": "...whispers... the gate is open.", "source": seq}]}))
+    .unwrap();
+    assert!(learn(world, &d, None).unwrap().is_ok());
+}

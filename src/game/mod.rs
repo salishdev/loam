@@ -534,12 +534,13 @@ impl Game {
         }
         let judgments =
             quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
-        // Knowledge last, so the turn's time, verdicts and rule changes
-        // follow its narration directly (the X-ray reads them there).
-        // What the director staged with `learn`, now that the narration it
-        // cites exists. Only a turn that ended normally and narrated
-        // something commits any. Before the encounter, so a place learned
-        // about this turn is the entry the encounter then updates.
+        // Knowledge (learned, then encountered) comes last, so the turn's
+        // time, verdicts and rule changes follow its narration directly
+        // (the X-ray reads them there). What the director staged with
+        // `learn` commits now that the narration it cites exists, and only
+        // when the turn ended normally and narrated something; before the
+        // encounter, so a place learned about this turn is the entry the
+        // encounter then updates.
         let ended = response.stop_reason == Some(StopReason::EndTurn);
         if ended && !narration.is_empty() {
             knowledge::tools::commit_turn(&mut self.world, turn.start, narrated)?;
@@ -620,6 +621,9 @@ impl Game {
         let world = &mut self.world;
         let inventory = &self.inventory;
         let dice_seed = self.dice_seed.unwrap_or_else(entropy);
+        // This call's tool calls all come after this event: what a turn
+        // stages counts from here, not from an earlier attempt that failed.
+        let turn_start = world.last_seq()?;
         let mut fatal: Option<StoreError> = None;
         let outcome = run_tool_loop(client, request, max_calls, on_text, &mut |call| {
             if fatal.is_some() {
@@ -628,7 +632,8 @@ impl Game {
             if let Some(f) = observe.as_mut() {
                 f(world, call, None);
             }
-            let output = match tools::dispatch(world, inventory, dice_seed, phase, call) {
+            let output = match tools::dispatch(world, inventory, dice_seed, phase, turn_start, call)
+            {
                 Ok(o) => o,
                 Err(e) => {
                     fatal = Some(e);

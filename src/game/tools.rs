@@ -77,11 +77,14 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
 }
 
 /// Run one tool call. Unknown tools and bad input go back as tool errors.
+/// `turn_start` is the last event before this director call's turn began
+/// (its tool calls come after it).
 pub fn dispatch(
     world: &mut World,
     inventory: &Inventory,
     dice_seed: u64,
     phase: Phase,
+    turn_start: i64,
     call: &ToolUse,
 ) -> Result<ToolOutput, StoreError> {
     let allowed = definitions(phase).iter().any(|d| d.name == call.name);
@@ -116,7 +119,7 @@ pub fn dispatch(
     if let Some(output) = stats::tools::handle_tool(world, dice_seed, call) {
         return output;
     }
-    if let Some(output) = knowledge::tools::handle_tool(world, call) {
+    if let Some(output) = knowledge::tools::handle_tool(world, turn_start, call) {
         return output;
     }
     macro_rules! input {

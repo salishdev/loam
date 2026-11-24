@@ -507,12 +507,17 @@ pub struct Discovery {
     pub category: Option<Category>,
     /// Start a new entry even though one of the same name and category is
     /// known: a different subject that shares the name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_is_false")]
     pub distinct: bool,
     /// The world entity the entry is about, when it exists physically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<EntityId>,
     pub facts: Vec<NewFact>,
+}
+
+/// `distinct` as given, with `null` read as not given.
+fn null_is_false<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(d)?.unwrap_or(false))
 }
 
 /// One fact of a [`Discovery`].
@@ -552,7 +557,8 @@ fn normalize(s: &str) -> String {
             c => c,
         })
         .flat_map(char::to_lowercase)
-        .collect();
+        .collect::<String>()
+        .replace('…', "...");
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -560,10 +566,7 @@ fn normalize(s: &str) -> String {
 /// ellipses.
 fn normalize_excerpt(s: &str) -> String {
     normalize(s)
-        .trim_matches(|c: char| c == '"' || c == '…' || c.is_whitespace())
-        .trim_start_matches("...")
-        .trim_end_matches("...")
-        .trim()
+        .trim_matches(|c: char| c == '"' || c == '.' || c.is_whitespace())
         .to_owned()
 }
 
@@ -630,6 +633,9 @@ fn resolve(
     }
     let all = entries(world)?;
     let target = match (d.entry, &d.name, d.category) {
+        (Some(_), None, None) if d.distinct => {
+            refuse!("distinct goes with a new entry's name and category, not entry")
+        }
         (Some(id), None, None) => match world.get::<Record>(id)? {
             Some(r) => Target::Existing(id, r),
             None => refuse!("#{id} is not a compendium entry"),

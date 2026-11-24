@@ -65,20 +65,26 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     )]
 }
 
-/// Handle a `learn` call, or `None` for other tools.
-pub fn handle_tool(world: &World, call: &ToolUse) -> Option<Result<ToolOutput, StoreError>> {
+/// Handle a `learn` call made in the turn that began after event
+/// `turn_start`, or `None` for other tools.
+pub fn handle_tool(
+    world: &World,
+    turn_start: i64,
+    call: &ToolUse,
+) -> Option<Result<ToolOutput, StoreError>> {
     if call.name != LEARN {
         return None;
     }
-    Some(stage(world, &call.input))
+    Some(stage(world, turn_start, &call.input))
 }
 
-fn stage(world: &World, input: &Value) -> Result<ToolOutput, StoreError> {
+fn stage(world: &World, turn_start: i64, input: &Value) -> Result<ToolOutput, StoreError> {
     let d: Discovery = match serde_json::from_value(input.clone()) {
         Ok(d) => d,
         Err(e) => return Ok(ToolOutput::Err(format!("bad input for {LEARN}: {e}"))),
     };
-    let pending = staged_this_turn(world)?;
+    // Only this turn's calls: a failed earlier attempt's never commit.
+    let pending = staged_since(world, turn_start)?;
     if let Err(why) = check(world, &d, None, &pending)? {
         return Ok(ToolOutput::Err(why));
     }
@@ -105,15 +111,6 @@ fn staged_since(world: &World, after: i64) -> Result<Vec<Discovery>, StoreError>
         })
         .filter_map(|e| serde_json::from_value(e.payload["input"].clone()).ok())
         .collect())
-}
-
-/// The discoveries already staged this turn: since its input (or, for the
-/// opening scene, since the last narration), so a failed turn's calls
-/// don't count.
-fn staged_this_turn(world: &World) -> Result<Vec<Discovery>, StoreError> {
-    let input = world.last_event(EventKind::Input)?.map_or(0, |e| e.seq);
-    let narration = world.last_event(EventKind::Narration)?.map_or(0, |e| e.seq);
-    staged_since(world, input.max(narration))
 }
 
 /// Write the discoveries staged since event `after`, citing `narration`

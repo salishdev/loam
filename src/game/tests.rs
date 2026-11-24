@@ -2192,7 +2192,7 @@ fn the_bible_can_choose_the_opening_hour_and_hides_the_clock() {
             name: name.into(),
             input,
         };
-        tools::dispatch(world, &inventory, 7, phase, &call).unwrap()
+        tools::dispatch(world, &inventory, 7, phase, 0, &call).unwrap()
     };
     let bible = |start: &str| {
         json!({
