@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::explain::{self, Notes, Topic};
+use crate::knowledge::Mode;
 use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::reroll::{self, Head, VariantView, surgery};
 use crate::worker::{Command, Event};
@@ -59,6 +60,9 @@ pub struct PanelView {
     pub selected: Option<usize>,
     /// Set for the X-ray view, which shows this instead of `text`.
     pub xray: Option<XrayPanel>,
+    /// The compendium mode it was made in (what mode-aware reports, see
+    /// [`commands::is_moded`], are read in).
+    pub mode: Mode,
 }
 
 /// The X-ray panel's state.
@@ -168,10 +172,15 @@ pub enum TermAction {
 
 impl PanelView {
     pub fn title(&self) -> String {
-        if self.arg.is_empty() {
+        let title = if self.arg.is_empty() {
             self.cmd.clone()
         } else {
             format!("{} {}", self.cmd, self.arg)
+        };
+        if commands::is_moded(&self.cmd) {
+            format!("{title} · {}", self.mode.label())
+        } else {
+            title
         }
     }
 }
@@ -228,6 +237,9 @@ pub struct App {
     draft: String,
     pub panel: Vec<PanelView>,
     pub panel_open: bool,
+    /// The compendium's mode this session, shared by every mode-aware
+    /// view; Player at the start and after switching saves.
+    pub mode: Mode,
     pub help_open: bool,
     /// First line of the help overlay on screen.
     pub help_scroll: usize,
@@ -288,6 +300,7 @@ impl App {
             draft: String::new(),
             panel: Vec::new(),
             panel_open: false,
+            mode: Mode::Player,
             help_open: false,
             help_scroll: 0,
             search: None,
@@ -545,7 +558,7 @@ impl App {
             self.show_turn(seq);
             return;
         }
-        if let Some(Ok(text)) = commands::report(&self.view, &top.cmd, &top.arg)
+        if let Some(Ok(text)) = commands::report_in(&self.view, top.mode, &top.cmd, &top.arg)
             && let Some(top) = self.panel.last_mut()
         {
             top.text = text;
@@ -561,12 +574,13 @@ impl App {
             scroll: 0,
             selected: None,
             xray: None,
+            mode: self.mode,
         };
         // The same report again replaces itself rather than stacking.
         if self
             .panel
             .last()
-            .is_some_and(|v| v.cmd == view.cmd && v.arg == view.arg)
+            .is_some_and(|v| v.cmd == view.cmd && v.arg == view.arg && v.mode == view.mode)
         {
             self.panel.pop();
         }
@@ -1145,6 +1159,9 @@ impl App {
         self.cost_carried += self.view.cost_since(self.since_call).unwrap_or(0.0);
         self.since_call = view.last_call_id().unwrap_or(0);
         self.view = view;
+        // Another save starts over in Player mode.
+        self.mode = Mode::Player;
+        self.drop_world_views();
         self.send(Command::Switch(path));
     }
 
@@ -1192,6 +1209,66 @@ impl App {
             self.show_branches(None);
         } else {
             self.refresh_panel();
+        }
+    }
+
+    /// Change the compendium's mode. Leaving World drops every World-mode
+    /// view from the back stack (and the panel's last search), so nothing
+    /// only World mode shows survives in a title, the history or a
+    /// highlight. With `reopen`, a mode-aware view on top is replaced by
+    /// the compendium's overview in the new mode: an argument typed in
+    /// World mode may itself name something hidden.
+    fn set_mode(&mut self, mode: Mode, reopen: bool) {
+        let moded_on_top = self.panel_open
+            && self
+                .panel
+                .last()
+                .is_some_and(|v| commands::is_moded(&v.cmd));
+        let leaving_world = self.mode == Mode::World && mode == Mode::Player;
+        self.mode = mode;
+        if mode == Mode::Player {
+            self.drop_world_views();
+        }
+        if leaving_world {
+            // A panel search typed in World mode may name something hidden.
+            self.clear_panel_search();
+        }
+        if reopen && moded_on_top {
+            if let Some(Ok(text)) = commands::report_in(&self.view, mode, ":compendium", "") {
+                self.open_view(":compendium", "", text);
+            }
+            return;
+        }
+        self.refresh_panel();
+    }
+
+    /// Drop the World-mode views of mode-aware reports, and the panel's
+    /// last search, closing the panel if nothing is left.
+    fn drop_world_views(&mut self) {
+        let before = self.panel.len();
+        self.panel
+            .retain(|v| !(commands::is_moded(&v.cmd) && v.mode == Mode::World));
+        if self.panel.len() != before {
+            self.clear_panel_search();
+        }
+        if self.panel.is_empty() {
+            self.panel_open = false;
+            if self.focus == Focus::Panel {
+                self.focus = Focus::Input;
+            }
+        }
+    }
+
+    fn clear_panel_search(&mut self) {
+        if self
+            .last_search
+            .as_ref()
+            .is_some_and(|(f, _)| *f == Focus::Panel)
+        {
+            self.last_search = None;
+        }
+        if self.search.as_ref().is_some_and(|s| s.pane == Focus::Panel) {
+            self.search = None;
         }
     }
 
@@ -1277,9 +1354,33 @@ impl App {
                 }
                 return;
             }
+            ":mode" => {
+                match commands::mode_switch(arg, self.mode) {
+                    Ok(mode) => {
+                        self.set_mode(mode, true);
+                        self.flash = Some(commands::mode_line(mode));
+                    }
+                    Err(usage) => self.flash = Some(usage.into()),
+                }
+                return;
+            }
             _ => {}
         }
-        if let Some(report) = commands::report(&self.view, cmd, arg) {
+        // A mode named in a mode-aware command becomes the session's, so
+        // the panel never holds a World view in Player mode.
+        let (mode, arg) = match commands::resolve_mode(&self.view, self.mode, cmd, arg) {
+            Ok(resolved) => resolved,
+            Err(notice) => {
+                self.flash = Some(notice);
+                return;
+            }
+        };
+        let arg = arg.as_str();
+        if mode != self.mode {
+            self.set_mode(mode, false);
+            self.flash = Some(commands::mode_line(mode));
+        }
+        if let Some(report) = commands::report_in(&self.view, self.mode, cmd, arg) {
             match report {
                 Ok(text) => {
                     self.open_view(cmd, arg, text);
@@ -2189,6 +2290,175 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Char('h')));
         assert!(!app.panel_open);
         assert_eq!(app.focus, Focus::Input);
+    }
+
+    /// Every title and text the panel holds, back stack included.
+    fn panel_texts(app: &App) -> Vec<String> {
+        app.panel
+            .iter()
+            .flat_map(|v| [v.title(), v.text.clone()])
+            .collect()
+    }
+
+    /// What only World mode shows in the begun game.
+    const WORLD_ONLY: [&str; 5] = ["Brother Ash", "Eel-wives", "Saltmarsh", "altar", "bible"];
+
+    #[test]
+    fn the_panel_shows_the_session_mode_and_later_views_share_it() {
+        let mut app = app();
+        assert_eq!(app.mode, Mode::Player, "a session starts in Player mode");
+        typed(&mut app, ":compendium");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().title(), ":compendium · Player");
+
+        typed(&mut app, ":mode");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::World);
+        assert!(app.flash.as_deref().unwrap().contains("World"));
+        let top = app.panel.last().unwrap();
+        assert_eq!(top.title(), ":compendium · World");
+        let world = commands::report_in(&app.view, Mode::World, ":compendium", "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(top.text, world);
+
+        typed(&mut app, ":compendium people");
+        app.on_key(key(KeyCode::Enter));
+        let top = app.panel.last().unwrap();
+        assert_eq!(top.title(), ":compendium people · World");
+        assert!(
+            top.text.contains("Brother Ash (person · bible plan)"),
+            "{}",
+            top.text
+        );
+        // A refresh reads it again in its own mode.
+        app.refresh_panel();
+        assert!(app.panel.last().unwrap().text.contains("Brother Ash"));
+        // Other reports don't carry a mode.
+        typed(&mut app, ":time");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().title(), ":time");
+        assert!(
+            app.outbox.is_empty(),
+            "toggling and reading send nothing to the game"
+        );
+    }
+
+    #[test]
+    fn returning_to_player_mode_leaves_no_world_only_text_in_the_panel() {
+        let mut app = app();
+        for line in [
+            ":compendium",
+            ":time",
+            ":compendium world",
+            ":compendium brother ash",
+        ] {
+            typed(&mut app, line);
+            app.on_key(key(KeyCode::Enter));
+        }
+        assert_eq!(
+            app.mode,
+            Mode::World,
+            "a mode named in the command becomes the session's"
+        );
+        assert!(
+            app.panel
+                .last()
+                .unwrap()
+                .text
+                .contains("Last monk, lies kindly.")
+        );
+        app.last_search = Some((Focus::Panel, "Brother Ash".into()));
+
+        typed(&mut app, ":mode player");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Player);
+        assert_eq!(app.last_search, None);
+        assert!(
+            app.panel
+                .iter()
+                .all(|v| v.mode == Mode::Player || v.cmd == ":time")
+        );
+        for text in panel_texts(&app) {
+            for hidden in WORLD_ONLY {
+                assert!(
+                    !text.contains(hidden),
+                    "{hidden} left in the panel:\n{text}"
+                );
+            }
+        }
+        // Back through the history: only Player views and the clock.
+        let titles: Vec<String> = app.panel.iter().map(PanelView::title).collect();
+        assert_eq!(
+            titles,
+            [":compendium · Player", ":time", ":compendium · Player"]
+        );
+
+        // Naming Player explicitly drops World views the same way.
+        typed(&mut app, ":compendium world brother ash");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.panel.last().unwrap().title(),
+            ":compendium brother ash · World"
+        );
+        typed(&mut app, ":compendium player");
+        app.on_key(key(KeyCode::Enter));
+        for text in panel_texts(&app) {
+            assert!(!text.contains("Brother Ash"), "{text}");
+        }
+        // A mode word that isn't followed by a section, search or key is
+        // part of a name: it never stores a World report as a Player view.
+        typed(&mut app, ":compendium player world");
+        app.on_key(key(KeyCode::Enter));
+        let top = app.panel.last().unwrap();
+        assert_eq!(top.mode, Mode::Player);
+        assert!(
+            top.text.starts_with("You know of nothing called"),
+            "{}",
+            top.text
+        );
+        for text in panel_texts(&app) {
+            for hidden in WORLD_ONLY {
+                assert!(!text.contains(hidden), "{hidden} in the panel:\n{text}");
+            }
+        }
+        // With only World views, leaving World closes the panel.
+        let mut app = self::app();
+        typed(&mut app, ":compendium world");
+        app.on_key(key(KeyCode::Enter));
+        typed(&mut app, ":mode");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().title(), ":compendium · Player");
+        assert_eq!(app.panel.len(), 1);
+        assert!(app.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_switched_save_starts_in_player_mode() {
+        use crate::branches::tests::{saved_game, temp_dir};
+        let dir = temp_dir("tui-mode-switch");
+        let main = saved_game(&dir, "mill.db");
+        let other = dir.join("mill.b1.db");
+        let world = World::open(&main).unwrap();
+        drop(world.fork(world.last_seq().unwrap(), &other).unwrap());
+        drop(world);
+        let mut app = seen_notes(App::new(World::open_read_only(&main).unwrap(), true));
+        for line in [":compendium", ":compendium world brother ash"] {
+            typed(&mut app, line);
+            app.on_key(key(KeyCode::Enter));
+        }
+        assert_eq!(app.mode, Mode::World);
+        app.switch_to(other.clone());
+        app.on_event(Event::Switched {
+            path: other,
+            outcome: Ok("Drowned Chapel.".into()),
+        });
+        app.on_event(Event::Ready);
+        assert_eq!(app.mode, Mode::Player);
+        assert!(app.panel.iter().all(|v| v.mode == Mode::Player));
+        for text in panel_texts(&app) {
+            assert!(!text.contains("Brother Ash"), "{text}");
+        }
     }
 
     #[test]

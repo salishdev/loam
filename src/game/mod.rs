@@ -16,6 +16,7 @@ mod tools;
 pub(crate) mod tests;
 
 pub use context::{STALL_HINT, STALL_TURNS, local_slice, stall_hint};
+pub(crate) use exits::is_stub_entity;
 pub use npcs::{NpcSighting, bible_npc_names, npcs};
 pub use tick::{ROOM_CHANGE_MINUTES, TICK_MINUTES, TickChange, TickOutcome};
 pub use tools::Phase;

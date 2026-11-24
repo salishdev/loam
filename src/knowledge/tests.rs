@@ -64,6 +64,7 @@ fn place(world: &World, name: &str) -> Entry {
 mod encounters;
 mod learned;
 mod mechanics;
+mod modes;
 
 #[test]
 fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sources() {

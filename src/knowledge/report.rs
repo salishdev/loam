@@ -1,18 +1,69 @@
-//! `:compendium`: the Player-mode compendium as a text report, shared by
-//! plain mode and the TUI's report panel, with `:rules` and `:glossary` as
-//! shortcuts into its Mechanics section. Reads entries only (never a rule
-//! or glossary term an entry is linked to): no model call, no write.
+//! `:compendium`: the compendium as a text report, shared by plain mode
+//! and the TUI's report panel, with `:rules` and `:glossary` as shortcuts
+//! into its Mechanics section. Player mode reads learned entries only
+//! (never a rule or glossary term an entry is linked to); World mode
+//! ([`super::truth`]) reads stored world state and the bible. Neither calls
+//! a model or writes.
 
 use std::fmt::Write;
 
+use super::truth::{Mode, WorldFound, split_mode, world_find, world_report};
 use super::{Category, Entry, FactKind, Found, entries, entry, find, mechanics, search};
 use crate::world::{StoreError, World};
 
-const USAGE: &str = "Usage: :compendium [people | places | factions | items | lore | mechanics | <name|#entry> | search <text>]";
+pub(super) const USAGE: &str = "Usage: :compendium [player | world] [people | places | factions | items | lore | mechanics | <name|#entry> | search <text>]";
 const HINT: &str = ":compendium <name> shows an entry; :compendium search <text> searches.";
 
-/// `:compendium [<category> | <name|#entry> | search <text>]`.
+/// `:compendium [player | world] [<category> | <name|#entry> | search
+/// <text>]` in Player mode unless the argument names World.
 pub fn compendium(world: &World, arg: &str) -> Result<String, StoreError> {
+    let (mode, arg) = resolve_mode(world, Mode::Player, arg)?;
+    compendium_in(world, mode, arg)
+}
+
+/// The mode a `:compendium` argument asks for, read in `mode`, and the
+/// rest of it. A leading `player` or `world` names a mode before nothing,
+/// a section, `search …` or a key ([`split_mode`]); before anything else
+/// it does too, unless the whole argument names something in `mode` (a
+/// learned "World Tree"). Read once, as typed: what is left is never
+/// read for a mode again.
+pub fn resolve_mode<'a>(
+    world: &World,
+    mode: Mode,
+    arg: &'a str,
+) -> Result<(Mode, &'a str), StoreError> {
+    let arg = arg.trim();
+    if let (Some(named), rest) = split_mode(arg) {
+        return Ok((named, rest));
+    }
+    let Some((word, rest)) = arg.split_once(char::is_whitespace) else {
+        return Ok((mode, arg));
+    };
+    let Some(named) = Mode::parse(word) else {
+        return Ok((mode, arg));
+    };
+    let names_something = match mode {
+        Mode::Player => find(world, arg)? != Found::None,
+        Mode::World => world_find(world, arg)? != WorldFound::None,
+    };
+    Ok(if names_something {
+        (mode, arg)
+    } else {
+        (named, rest.trim())
+    })
+}
+
+/// `:compendium` in `mode`, with the argument taken as it is (no mode
+/// word: see [`resolve_mode`]).
+pub fn compendium_in(world: &World, mode: Mode, arg: &str) -> Result<String, StoreError> {
+    match mode {
+        Mode::Player => player(world, arg),
+        Mode::World => world_report(world, arg),
+    }
+}
+
+/// The Player-mode report: learned entries only.
+fn player(world: &World, arg: &str) -> Result<String, StoreError> {
     let arg = arg.trim();
     let (word, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
     if arg.is_empty() {
@@ -51,7 +102,7 @@ fn overview(world: &World) -> Result<String, StoreError> {
                 .into(),
         );
     }
-    let mut out = String::from("Compendium: what you have learned\n");
+    let mut out = String::from("Compendium · Player mode: what you have learned\n");
     for c in Category::ALL {
         let n = all.iter().filter(|e| e.category == c).count();
         if n > 0 {
@@ -83,7 +134,7 @@ fn section(world: &World, category: Category) -> Result<String, StoreError> {
             category.heading().to_lowercase()
         ));
     }
-    let mut out = format!("{}\n", category.heading());
+    let mut out = format!("{} · Player mode\n", category.heading());
     for e in &known {
         writeln!(out, "  {}", line(e)).unwrap();
     }

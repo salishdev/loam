@@ -7,6 +7,7 @@
 use crate::explain::Topic;
 use crate::game::{GameError, TickOutcome, TurnOutcome};
 use crate::inspect;
+use crate::knowledge::Mode;
 use crate::quest::Verdict;
 use crate::world::{EventKind, StoreError, StoredCall, World};
 use crate::xray;
@@ -25,6 +26,7 @@ pub const COMMANDS: &[&str] = &[
     ":i",
     ":inventory",
     ":log",
+    ":mode",
     ":mouse",
     ":npcs",
     ":panel",
@@ -45,9 +47,12 @@ pub const COMMANDS: &[&str] = &[
 ];
 
 /// The command list `:help` prints.
-pub const HELP: &str = "Commands: :compendium [<category> | <name|#entry> | search <text>] \
-(what you have learned), :rules and :glossary (the mechanics you have learned), :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs (:compendium people), :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
+pub const HELP: &str = "Commands: :compendium [player|world] [<category> | <name|#entry> | \
+search <text>] (Player mode: what you have learned; World mode: the world as it is and the \
+hidden bible), :mode [player|world] (the compendium's mode; no argument toggles), :rules and \
+:glossary (Mechanics: what you have learned, or in World mode the engine's), :why <#id|name>, \
+:relations <#id|name>, :quests, :npcs (:compendium people, in the compendium's mode), \
+:inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
 :log #<event>, :tick, :quit
 
 Workbench (see and steer the models): :xray [on|off] shows each turn's calls, cache use, \
@@ -82,18 +87,54 @@ pub fn split(input: &str) -> (&str, &str) {
 
 /// The text of a report command (an inspector, `:fork`), or `None` when
 /// `cmd` isn't one. `Err` holds an engine notice: the report failed and the
-/// save is still usable.
+/// save is still usable. Mode-aware reports read in Player mode.
 pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, String>> {
+    let (mode, arg) = match resolve_mode(world, Mode::Player, cmd, arg) {
+        Ok(resolved) => resolved,
+        Err(notice) => return Some(Err(notice)),
+    };
+    report_in(world, mode, cmd, &arg)
+}
+
+/// The mode a command typed in `mode` reads in, and its argument without
+/// the mode word: a mode-aware command's leading `player` or `world` (see
+/// [`crate::knowledge::resolve_mode`]). Read once, as typed.
+pub fn resolve_mode(
+    world: &World,
+    mode: Mode,
+    cmd: &str,
+    arg: &str,
+) -> Result<(Mode, String), String> {
+    if !is_moded(cmd) {
+        return Ok((mode, arg.to_owned()));
+    }
+    crate::knowledge::resolve_mode(world, mode, arg)
+        .map(|(m, rest)| (m, rest.to_owned()))
+        .map_err(|e| format!("[{cmd} unavailable: {e}]"))
+}
+
+/// [`report`], with mode-aware reports (see [`is_moded`]) in `mode` and
+/// `arg` taken as it is: resolve a typed argument with [`resolve_mode`]
+/// first.
+pub fn report_in(
+    world: &World,
+    mode: Mode,
+    cmd: &str,
+    arg: &str,
+) -> Option<Result<String, String>> {
     let result = match cmd {
-        ":compendium" => crate::knowledge::compendium(world, arg),
-        // Shortcuts into the compendium's learned Mechanics, never the
-        // engine's rules or glossary.
+        ":compendium" => crate::knowledge::compendium_in(world, mode, arg),
+        // Shortcuts into the compendium's Mechanics: in Player mode the
+        // learned ones, never the engine's rules or glossary.
+        ":rules" | ":glossary" if mode == Mode::World => {
+            crate::knowledge::compendium_in(world, mode, "mechanics")
+        }
         ":rules" => crate::knowledge::learned_rules(world),
         ":glossary" => crate::knowledge::learned_terms(world),
         ":why" => inspect::why(world, arg),
         ":quests" => inspect::quests(world),
         // A shortcut into the compendium's People section.
-        ":npcs" => crate::knowledge::compendium(world, "people"),
+        ":npcs" => crate::knowledge::compendium_in(world, mode, "people"),
         ":inventory" | ":i" => inspect::inventory(world),
         ":relations" => inspect::relations(world, arg),
         ":stats" => inspect::stats(world),
@@ -107,6 +148,28 @@ pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, Stri
         _ => return None,
     };
     Some(result.map_err(|e| format!("[{cmd} unavailable: {e}]")))
+}
+
+/// Whether `cmd`'s report follows the session's Player/World mode.
+pub fn is_moded(cmd: &str) -> bool {
+    matches!(cmd, ":compendium" | ":npcs" | ":rules" | ":glossary")
+}
+
+/// `:mode [player|world]`: the mode it asks for, from `current` (no
+/// argument toggles). Changing it only changes the view.
+pub fn mode_switch(arg: &str, current: Mode) -> Result<Mode, &'static str> {
+    if arg.trim().is_empty() {
+        return Ok(current.toggled());
+    }
+    Mode::parse(arg.trim()).ok_or("Usage: :mode [player|world]")
+}
+
+/// What `:mode` says once the mode is `mode`.
+pub fn mode_line(mode: Mode) -> String {
+    match mode {
+        Mode::Player => "Compendium mode: Player (what you know).".into(),
+        Mode::World => "Compendium mode: World (truth and the bible; teaches nothing).".into(),
+    }
 }
 
 /// The topics a workbench command's view involves, for first-time notes.

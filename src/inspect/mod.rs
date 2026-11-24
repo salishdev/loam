@@ -39,34 +39,38 @@ pub fn rules(world: &World) -> Result<String, StoreError> {
     if all.is_empty() {
         return Ok("No rules yet.".into());
     }
+    Ok(trim_end(all.iter().map(rule_text).collect()))
+}
+
+/// One rule in full: its heading, trigger, roles, conditions, effects and
+/// outcome, a line each.
+pub(crate) fn rule_text(r: &rules::Rule) -> String {
     let mut out = String::new();
-    for r in all {
-        let class = match r.class {
-            RuleClass::World => "world",
-            RuleClass::Stat => "stat",
-        };
-        let retired = if r.is_active() { "" } else { " RETIRED" };
-        writeln!(
-            out,
-            "#{} {} [{class} v{}]{retired}",
-            r.id, r.def.name, r.version
-        )
-        .unwrap();
-        writeln!(out, "  when: {}", r.def.trigger).unwrap();
-        for (role, what) in &r.def.roles {
-            writeln!(out, "  role {role}: {what}").unwrap();
-        }
-        for c in &r.def.conditions {
-            writeln!(out, "  if {}", condition(c)).unwrap();
-        }
-        for op in &r.def.effects {
-            writeln!(out, "  do {}", render_op(op, &[])).unwrap();
-        }
-        if !r.def.outcome.trim().is_empty() {
-            writeln!(out, "  => {}", r.def.outcome.trim()).unwrap();
-        }
+    let class = match r.class {
+        RuleClass::World => "world",
+        RuleClass::Stat => "stat",
+    };
+    let retired = if r.is_active() { "" } else { " RETIRED" };
+    writeln!(
+        out,
+        "#{} {} [{class} v{}]{retired}",
+        r.id, r.def.name, r.version
+    )
+    .unwrap();
+    writeln!(out, "  when: {}", r.def.trigger).unwrap();
+    for (role, what) in &r.def.roles {
+        writeln!(out, "  role {role}: {what}").unwrap();
     }
-    Ok(trim_end(out))
+    for c in &r.def.conditions {
+        writeln!(out, "  if {}", condition(c)).unwrap();
+    }
+    for op in &r.def.effects {
+        writeln!(out, "  do {}", render_op(op, &[])).unwrap();
+    }
+    if !r.def.outcome.trim().is_empty() {
+        writeln!(out, "  => {}", r.def.outcome.trim()).unwrap();
+    }
+    out
 }
 
 /// Every glossary term, sorted by name.
@@ -1011,11 +1015,11 @@ pub(crate) fn render_op(op: &Op, ids: &[EntityId]) -> String {
     }
 }
 
-fn clip_value(v: &Value) -> String {
+pub(crate) fn clip_value(v: &Value) -> String {
     clip(&v.to_string(), VALUE_CHARS)
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     let s = s.trim();
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),

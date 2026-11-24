@@ -178,6 +178,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut notes = loam::explain::Notes::load(&view);
     // The latest reroll's variants, for `:reroll show`.
     let mut last_reroll: Option<(loam::reroll::Head, Vec<loam::reroll::VariantView>)> = None;
+    // The compendium's mode, Player until `:mode` changes it; an explicit
+    // `:compendium world …` reads World for that command only.
+    let mut mode = loam::knowledge::Mode::Player;
     loop {
         println!();
         let Some(line) = editor.read_line(PROMPT)? else {
@@ -189,7 +192,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if input.starts_with(':') {
             let (cmd, arg) = commands::split(input);
-            if let Some(report) = commands::report(&view, cmd, arg) {
+            // A mode word reads that mode for this command only.
+            let (once, arg) = match commands::resolve_mode(&view, mode, cmd, arg) {
+                Ok(resolved) => resolved,
+                Err(notice) => {
+                    note(&notice);
+                    continue;
+                }
+            };
+            let arg = arg.as_str();
+            if let Some(report) = commands::report_in(&view, once, cmd, arg) {
                 match report {
                     Ok(text) => {
                         say(&text);
@@ -215,6 +227,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     say(&brains.table());
                 }
+                ":mode" => match commands::mode_switch(arg, mode) {
+                    Ok(m) => {
+                        mode = m;
+                        say(&commands::mode_line(mode));
+                    }
+                    Err(usage) => say(usage),
+                },
                 ":xray" => match commands::xray_switch(arg, xray_on) {
                     Ok(on) => {
                         xray_on = on;
@@ -331,8 +350,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => say(&format!("Unknown command {cmd}. {}", commands::HELP)),
             }
             if matches!(cmd, ":switch" | ":adopt") {
-                // Another save: its own notes.
+                // Another save: its own notes, and the compendium starts
+                // over in Player mode.
                 notes = loam::explain::Notes::load(&view);
+                mode = loam::knowledge::Mode::Player;
             }
             show_notes(&mut notes, &worker, commands::command_topics(cmd).to_vec());
             continue;

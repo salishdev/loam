@@ -37,11 +37,15 @@
 
 mod report;
 pub(crate) mod tools;
+mod truth;
 
 #[cfg(test)]
 mod tests;
 
-pub use report::{compendium, learned_rules, learned_terms};
+pub use report::{compendium, compendium_in, learned_rules, learned_terms, resolve_mode};
+pub use truth::{
+    Mode, Origin, WorldEntry, WorldFound, split_mode, world_entries, world_find, world_search,
+};
 
 use serde::{Deserialize, Serialize};
 
