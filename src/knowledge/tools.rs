@@ -40,7 +40,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
          refuses and lists it with its id: then add to it with entry, or pass distinct: true \
          for a different subject that shares the name. When someone or something known only by \
          mention turns up in person, link the entry to its world entity: entry plus subject (facts \
-         may then be empty); never link by a shared name alone. A fact that corrects earlier ones \
+         may then be empty; a new entry always needs a fact); never link by a shared name alone. A fact that corrects earlier ones \
          lists their numbers (from recall) in supersedes: the earlier facts stay, attributed, as \
          superseded. People and notable items the narration names around the player are \
          remembered as seen without this.",
@@ -54,8 +54,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "subject": {"type": "integer", "description": "The world entity this is about, when it exists."},
                     "facts": {
                         "type": "array",
-                        "minItems": 1,
-                        "items": {
+                            "items": {
                             "type": "object",
                             "properties": {
                                 "text": {"type": "string", "description": "What was learned, one sentence."},

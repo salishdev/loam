@@ -540,7 +540,9 @@ pub(crate) fn record_encounters(
         }
         let linked: Vec<&(EntityId, Record)> = records
             .iter()
-            .filter(|(_, r)| r.subject == Some(id))
+            .filter(|(_, r)| {
+                r.subject == Some(id) && matches!(r.category, Category::Person | Category::Item)
+            })
             .collect();
         if !linked.is_empty() {
             for (entry_id, r) in linked {
@@ -566,7 +568,11 @@ pub(crate) fn record_encounters(
                 waiting = true;
             }
         }
-        if !waiting && !met.iter().any(|m| m.eq_ignore_ascii_case(&e.name)) {
+        if !waiting
+            && !met
+                .iter()
+                .any(|m| m.to_lowercase() == e.name.to_lowercase())
+        {
             met.push(e.name.clone());
             seen.push((
                 None,
@@ -668,6 +674,10 @@ fn merge_fact(facts: &mut Vec<Fact>, fact: Fact) {
         }
         None => facts.push(fact),
     }
+    // A repeat of a fact can't correct itself.
+    for (i, f) in facts.iter_mut().enumerate() {
+        f.supersedes.retain(|&n| n != i + 1);
+    }
 }
 
 /// A discovery to remember: facts about one entry, each citing the
@@ -693,7 +703,8 @@ pub struct Discovery {
     /// entity it turned out to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<EntityId>,
-    /// May be empty when `subject` is given: a link and nothing more.
+    /// May be empty with `entry` and `subject` (a known person or item):
+    /// a link and nothing more.
     #[serde(default)]
     pub facts: Vec<NewFact>,
 }
@@ -924,12 +935,23 @@ fn resolve(
     }
 
     if d.facts.is_empty() {
+        // A link and nothing more: only for a known person or item, so
+        // nothing new (not even a name) is written without a citation.
         match (&target, d.subject) {
-            (_, None) => refuse!("a discovery needs at least one fact, or a subject to link"),
-            (Target::Existing(id, r), Some(s)) if r.subject == Some(s) => {
-                refuse!("entry #{id} is already linked to #{s}: nothing to learn")
+            (Target::Existing(id, r), Some(s)) => {
+                if r.subject == Some(s) {
+                    refuse!("entry #{id} is already linked to #{s}: nothing to learn");
+                }
+                if !matches!(r.category, Category::Person | Category::Item) {
+                    refuse!("only a person or item entry links to a world entity without facts");
+                }
             }
-            _ => {}
+            (Target::Existing(..), None) => {
+                refuse!("a discovery needs at least one fact, or a subject to link")
+            }
+            (Target::New { .. }, _) => {
+                refuse!("a new entry needs at least one fact; to link a known one, give entry")
+            }
         }
     }
     let known_facts = match &target {

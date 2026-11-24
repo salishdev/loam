@@ -411,7 +411,11 @@ fn only_observed_movement_updates_last_seen_and_destruction_keeps_the_entry() {
                 "props": {"container": true}},
                {"op": "move", "entity": hal, "to": "b"}]),
     );
-    // A tick off-screen changes nothing the player knows.
+    // Brother Ash is with the player and known; a tick names him and Hal,
+    // and changes nothing the player knows.
+    npc(&mut game, "Brother Ash", tower);
+    turn(&mut game, &client, &[], "Brother Ash waits in the tower.");
+    assert_eq!(place(game.world(), "Brother Ash").encounters, 1);
     let known = entries(game.world()).unwrap();
     client.push(Response::canned_tool_use(
         "k",
@@ -420,7 +424,9 @@ fn only_observed_movement_updates_last_seen_and_destruction_keeps_the_entry() {
             {"op": "set_prop", "entity": hal, "key": "mood", "value": "sulking"}
         ]}),
     ));
-    client.push(Response::canned_text("Hal sulks in the loft."));
+    client.push(Response::canned_text(
+        "Old Hal sulks in the chapel; Brother Ash prays in the tower.",
+    ));
     let before = client.requests().len();
     game.tick(&client).unwrap();
     assert!(
@@ -563,4 +569,38 @@ fn links_corrections_and_encounters_survive_reopen_replay_fork_and_an_adopted_re
     );
     assert_eq!(entries(game.world()).unwrap(), want);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_link_without_facts_needs_a_known_person_or_item() {
+    let (mut game, client, entry) = hal_mentioned();
+    let chapel = player_room(&game);
+    let mara = npc(&mut game, "Mara", chapel);
+    let before = entries(game.world()).unwrap();
+    let chapel_entry = place(game.world(), "Drowned Chapel").id;
+    turn(
+        &mut game,
+        &client,
+        &[
+            // A new entry with nothing narrated to cite: refused.
+            learn_call(json!({"name": "Mara", "category": "person", "subject": mara, "facts": []})),
+            // A place or lore entry can't be linked to a person this way.
+            learn_call(json!({"entry": chapel_entry, "subject": mara})),
+        ],
+        "A hooded figure watches from the font.",
+    );
+    let results: Vec<bool> = client
+        .requests()
+        .iter()
+        .rev()
+        .take(2)
+        .filter_map(|r| match r.messages.last()?.content.first()? {
+            ContentBlock::ToolResult { is_error, .. } => Some(*is_error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, [true, true]);
+    assert_eq!(entries(game.world()).unwrap().len(), before.len());
+    assert!(!compendium(game.world(), "").contains("Mara"));
+    let _ = entry;
 }
