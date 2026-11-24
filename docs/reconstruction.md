@@ -36,20 +36,23 @@ they cannot prove a model's semantic interpretation is right. Review the report
 against narration before trusting reconstructed memories.
 
 Narration is processed chronologically in bounded chunks. Oversized events are
-split with their original ID; an excerpt must fit within one passage. The request
-includes a bounded 32000-character prior-entry context, prioritizing names mentioned
-in the chunk, then recent entries. If older context is omitted, the model must flag
-uncertain identity; duplicate names cannot silently merge. A name collision with an unavailable older
-or later live entry is flagged and omitted, preserving that entry without guessing
-identity. Corrections use existing
-entry IDs and original fact numbers. Only learned facts available by that chunk
-are included, never future summaries or correction metadata. Encounter-only entries
-retain their stable IDs even before any fact rows exist. Internal entity/rule/glossary IDs are not
-established by ordinary prose, so reconstruction refuses those links instead of
-guessing from matching names. Mechanics remain readable learned accounts; current
-rule conditions are not backfilled. An already linked mechanic records the rule
-version at its cited event, preserving its historical meaning. Existing live entries
-use the same
+split with their original ID; an excerpt must fit within one passage. The
+request includes a bounded 32000-character prior-entry context, prioritizing
+names mentioned in the chunk, then recent entries. If older context is omitted,
+the model must flag uncertain identity; duplicate names cannot silently merge. A
+name collision with an unavailable older or later live entry is flagged and
+omitted, preserving that entry without guessing identity. Corrections use
+existing entry IDs and original fact numbers, and cannot supersede facts sourced
+later than the correction. When a response echoes name/category alongside an
+allowed existing ID, only matching chronological identity fields are
+canonicalized; contradictions are rejected. Only learned facts available by that
+chunk are included, never future summaries or correction metadata. Encounter-
+only entries retain their stable IDs even before any fact rows exist. Internal
+entity/rule/glossary IDs are not established by ordinary prose, so
+reconstruction refuses those links instead of guessing from matching names.
+Mechanics remain readable learned accounts; current rule conditions are not
+backfilled. An already linked mechanic records the rule version at its cited
+event, preserving its historical meaning. Existing live entries use the same
 writer's identity and fact deduplication checks.
 
 The report starts `Status: INCOMPLETE`, records each imported discovery with entry ID,

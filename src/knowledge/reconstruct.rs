@@ -27,6 +27,7 @@ Discovery is {"entry":existing_entry_id} OR {"name":"name","category":
 [{"text":"supported fact","excerpt":"verbatim 3-400 word/character passage (3+ words,
 400 characters maximum)","source":narration_event_id,"claimed_by":"named speaker for
 claims only","supersedes":[earlier fact numbers corrected]}]. Omit optional fields.
+When using entry, omit name/category; contradictory identity echoes are rejected.
 Group each subject's facts chronologically in one discovery. Use entry IDs from prior_entries to continue an established subject. Never merge
 same-named subjects without explicit identity evidence; flag ambiguity instead.
 Use distinct:true only when narration explicitly establishes a different subject.
@@ -343,8 +344,17 @@ fn extract(
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|f| f["number"].as_u64().unwrap() as usize)
-                .collect::<Vec<_>>(),
+                .map(|f| {
+                    let available = f["sources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|s| s.as_i64().or_else(|| s["event"].as_i64()))
+                        .min()
+                        .unwrap_or(i64::MAX);
+                    (f["number"].as_u64().unwrap() as usize, available)
+                })
+                .collect::<BTreeMap<_, _>>(),
         );
         context.push(value);
     }
@@ -371,7 +381,7 @@ fn extract(
         writeln!(report, "FLAG: {flag}")?;
     }
     for candidate in extraction.discoveries {
-        let d = candidate.discovery;
+        let mut d = candidate.discovery;
         if candidate.support != Support::Explicit {
             writeln!(
                 report,
@@ -395,6 +405,28 @@ fn extract(
                 "entry identity was not in the chronological context; flag ambiguity instead"
                     .into(),
             );
+        }
+        if let Some(id) = d.entry {
+            // Some real responses echo identity fields despite the schema's
+            // either/or shape. Canonicalize only a proven matching echo;
+            // never use these fields to redirect or rename an existing ID.
+            let identity = context
+                .iter()
+                .find(|e| e["entry"].as_i64() == Some(id))
+                .ok_or("entry identity missing from chronological context")?;
+            if d.name.as_deref().is_some_and(|name| {
+                name.trim().to_lowercase()
+                    != identity["name"].as_str().unwrap_or_default().to_lowercase()
+            }) {
+                return Err("entry name contradicts chronological context".into());
+            }
+            if let Some(category) = d.category
+                && serde_json::to_value(category)? != identity["category"]
+            {
+                return Err("entry category contradicts chronological context".into());
+            }
+            d.name = None;
+            d.category = None;
         }
         if d.facts.is_empty()
             || d.facts.iter().any(|f| {
@@ -436,10 +468,13 @@ fn extract(
         // chunk can supersede a fact just learned about a new subject.
         for f in &d.facts {
             let numbers = target.entry.and_then(|id| known_numbers.get(&id));
-            if f.supersedes
-                .iter()
-                .any(|n| !numbers.is_some_and(|known| known.contains(n)))
-            {
+            if f.supersedes.iter().any(|n| {
+                !numbers.is_some_and(|known| {
+                    known
+                        .get(n)
+                        .is_some_and(|available| Some(*available) <= f.source)
+                })
+            }) {
                 return Err("correction refers to a fact outside chronological context".into());
             }
             target.facts = vec![f.clone()];
@@ -455,7 +490,13 @@ fn extract(
                 })
                 .ok_or("imported fact disappeared")?
                 + 1;
-            known_numbers.entry(id).or_default().push(n);
+            let source = f.source.expect("validated explicit source");
+            known_numbers
+                .entry(id)
+                .or_default()
+                .entry(n)
+                .and_modify(|available| *available = (*available).min(source))
+                .or_insert(source);
             imported.push((id, f.clone()));
             writeln!(
                 report,
@@ -976,5 +1017,141 @@ mod tests {
         );
         drop(report);
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn earlier_narration_cannot_correct_a_later_original_fact_in_one_chunk() {
+        let mut w = World::open_in_memory().unwrap();
+        let a = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a red cloak."}),
+            )
+            .unwrap();
+        let b = w
+            .log_event(
+                EventKind::Narration,
+                &json!({"text":"Mara wears a blue cloak."}),
+            )
+            .unwrap();
+        let id = learn(
+            &mut w,
+            &Discovery {
+                name: Some("Mara".into()),
+                category: Some(Category::Person),
+                facts: vec![fact(b, "Mara wears a blue cloak.")],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let original = w.state().unwrap();
+        let client = ScriptedClient::new([extraction(Discovery {
+            entry: Some(id),
+            facts: vec![NewFact {
+                supersedes: vec![1],
+                ..fact(a, "Mara wears a red cloak.")
+            }],
+            ..Default::default()
+        })]);
+        let (path, mut report) = report_file();
+        let error = extract(
+            &mut w,
+            &[
+                Passage {
+                    event: a,
+                    text: "Mara wears a red cloak.".into(),
+                },
+                Passage {
+                    event: b,
+                    text: "Mara wears a blue cloak.".into(),
+                },
+            ],
+            &mut Vec::new(),
+            &client,
+            &mut report,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside chronological context"));
+        assert_eq!(w.state().unwrap(), original);
+        drop(report);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn echoed_existing_identity_is_canonicalized_only_when_context_matches() {
+        for (name, category, accepted) in [
+            (Some("Mara"), Some(Category::Person), true),
+            (Some(" mara "), None, true),
+            (None, Some(Category::Person), true),
+            (Some("Mora"), Some(Category::Person), false),
+            (Some("Mara"), Some(Category::Item), false),
+        ] {
+            let mut w = World::open_in_memory().unwrap();
+            let a = w
+                .log_event(
+                    EventKind::Narration,
+                    &json!({"text":"Mara wears a red cloak."}),
+                )
+                .unwrap();
+            let id = learn(
+                &mut w,
+                &Discovery {
+                    name: Some("Mara".into()),
+                    category: Some(Category::Person),
+                    facts: vec![fact(a, "Mara wears a red cloak.")],
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let b = w
+                .log_event(
+                    EventKind::Narration,
+                    &json!({"text":"Mara carries a silver bell."}),
+                )
+                .unwrap();
+            let original = w.state().unwrap();
+            let client = ScriptedClient::new([extraction(Discovery {
+                entry: Some(id),
+                name: name.map(str::to_owned),
+                category,
+                facts: vec![fact(b, "Mara carries a silver bell.")],
+                ..Default::default()
+            })]);
+            let (path, mut report) = report_file();
+            let result = extract(
+                &mut w,
+                &[Passage {
+                    event: b,
+                    text: "Mara carries a silver bell.".into(),
+                }],
+                &mut Vec::new(),
+                &client,
+                &mut report,
+            );
+            if accepted {
+                result.unwrap();
+                let learned = entries(&w).unwrap();
+                assert_eq!(learned.len(), 1);
+                assert_eq!(learned[0].id, id);
+                assert_eq!(learned[0].facts.len(), 2);
+                assert_eq!(
+                    w.replay_in_memory().unwrap().state().unwrap(),
+                    w.state().unwrap()
+                );
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("contradicts chronological context")
+                );
+                assert_eq!(w.state().unwrap(), original);
+            }
+            drop(report);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }
