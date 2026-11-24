@@ -14,12 +14,18 @@
 //! at the world entity it was about, so later changes off-screen, or its
 //! destruction, leave the remembered account as it was.
 //!
-//! [`record_place`] is the one writer so far; every write cites a
-//! player-visible source event (a non-empty `narration`), checked before
-//! anything is written. The queries read entries only, so nothing the
-//! player hasn't learned can show up in a list, a name match or a search.
+//! Two writers: [`record_place`] for rooms the player enters, and [`learn`]
+//! for discoveries (observations and attributed claims about any category,
+//! including subjects only mentioned, which need no world entity). The
+//! director submits discoveries with the `learn` tool; they are staged
+//! until the turn's narration exists, then committed ([`tools`]). Every
+//! write cites player-visible source events (non-empty `narration`, and for
+//! a discovery the excerpt it quotes), checked before anything is written.
+//! The queries read entries only, so nothing the player hasn't learned can
+//! show up in a list, a name match or a search.
 
 mod report;
+pub(crate) mod tools;
 
 #[cfg(test)]
 mod tests;
@@ -94,6 +100,9 @@ impl Category {
 pub enum FactKind {
     /// The player saw it for themselves.
     Observed,
+    /// Someone told the player (or it is said): attributed, never
+    /// established truth.
+    Claimed,
 }
 
 /// One thing learned about an entry, with the events that support it.
@@ -101,8 +110,71 @@ pub enum FactKind {
 pub struct Fact {
     pub text: String,
     pub kind: FactKind,
+    /// Who made a claim, as narrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    /// The entry for whoever made the claim, when one was named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<EntityId>,
     /// Player-visible events supporting it, oldest first.
-    pub sources: Vec<i64>,
+    pub sources: Vec<Source>,
+}
+
+/// A narration event cited as evidence, and the words in it that support
+/// the fact (none for an encounter, which the whole narration supports).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub event: i64,
+    pub excerpt: Option<String>,
+}
+
+impl Source {
+    /// A whole narration event as evidence.
+    pub fn event(event: i64) -> Source {
+        Source {
+            event,
+            excerpt: None,
+        }
+    }
+}
+
+// A bare event number (as places were first recorded) or
+// `{event, excerpt}`.
+impl Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Full<'a> {
+            event: i64,
+            excerpt: &'a str,
+        }
+        match &self.excerpt {
+            None => s.serialize_i64(self.event),
+            Some(excerpt) => Full {
+                event: self.event,
+                excerpt,
+            }
+            .serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Source, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Event(i64),
+            Full {
+                event: i64,
+                #[serde(default)]
+                excerpt: Option<String>,
+            },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Event(event) => Source::event(event),
+            Repr::Full { event, excerpt } => Source { event, excerpt },
+        })
+    }
 }
 
 /// An entry's state: the `_entry` component.
@@ -380,16 +452,391 @@ pub(crate) fn record_place(
 
 /// Add an observed fact, or cite `source` for it again if already known.
 fn add_fact(facts: &mut Vec<Fact>, text: String, source: i64) {
-    match facts.iter_mut().find(|f| f.text == text) {
-        Some(f) => {
-            if !f.sources.contains(&source) {
-                f.sources.push(source);
-            }
-        }
-        None => facts.push(Fact {
+    merge_fact(
+        facts,
+        Fact {
             text,
             kind: FactKind::Observed,
-            sources: vec![source],
-        }),
+            claimed_by: None,
+            claimant: None,
+            sources: vec![Source::event(source)],
+        },
+    );
+}
+
+/// Add `fact`, or cite its sources for the same fact (same words, kind and
+/// attribution) already known.
+fn merge_fact(facts: &mut Vec<Fact>, fact: Fact) {
+    let same = |f: &&mut Fact| {
+        f.text == fact.text && f.kind == fact.kind && f.claimed_by == fact.claimed_by
+    };
+    match facts.iter_mut().find(same) {
+        Some(f) => {
+            for s in fact.sources {
+                if !f.sources.iter().any(|k| k.event == s.event) {
+                    f.sources.push(s);
+                }
+            }
+            if f.claimant.is_none() {
+                f.claimant = fact.claimant;
+            }
+        }
+        None => facts.push(fact),
+    }
+}
+
+/// A discovery to remember: facts about one entry, each citing the
+/// narration that supports it. The `learn` tool's input, and what the
+/// one-off reconstruction script writes through [`learn`] too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Discovery {
+    /// An existing entry to add to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<EntityId>,
+    /// A new entry's name and category (instead of `entry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<Category>,
+    /// Start a new entry even though one of the same name and category is
+    /// known: a different subject that shares the name.
+    #[serde(default)]
+    pub distinct: bool,
+    /// The world entity the entry is about, when it exists physically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EntityId>,
+    pub facts: Vec<NewFact>,
+}
+
+/// One fact of a [`Discovery`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewFact {
+    pub text: String,
+    /// Words from the cited narration that support the fact.
+    pub excerpt: String,
+    /// The narration event cited; none for the narration still to come
+    /// (the current turn's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<i64>,
+    /// Who said it, for a claim; none for what the player observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    /// The entry for whoever said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<EntityId>,
+}
+
+/// Fewest words an excerpt may have, so it pins down a passage.
+const MIN_EXCERPT_WORDS: usize = 3;
+/// Most characters an excerpt may have.
+const MAX_EXCERPT_CHARS: usize = 400;
+
+/// Text compared for an excerpt: lowercase, straight quotes and dashes,
+/// single spaces.
+fn normalize(s: &str) -> String {
+    let s: String = s
+        .chars()
+        .map(|c| match c {
+            '‘' | '’' => '\'',
+            '“' | '”' => '"',
+            '–' | '—' => '-',
+            c => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect();
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// An excerpt as compared: normalised, without surrounding quotes or
+/// ellipses.
+fn normalize_excerpt(s: &str) -> String {
+    normalize(s)
+        .trim_matches(|c: char| c == '"' || c == '…' || c.is_whitespace())
+        .trim_start_matches("...")
+        .trim_end_matches("...")
+        .trim()
+        .to_owned()
+}
+
+/// Check that `excerpt` occurs in narration event `seq`. `Err` says why
+/// not.
+fn check_excerpt(world: &World, seq: i64, excerpt: &str) -> Result<Result<(), String>, StoreError> {
+    if let Err(why) = check_source(world, seq)? {
+        return Ok(Err(why));
+    }
+    let event = world.event(seq)?.expect("checked above");
+    let text = normalize(event.payload["text"].as_str().unwrap_or_default());
+    if text.contains(&normalize_excerpt(excerpt)) {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(format!(
+            "narration #{seq} does not say {excerpt:?}; quote it word for word"
+        )))
+    }
+}
+
+/// `s` cut to at most `n` characters, with an ellipsis when cut.
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_owned()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// What a discovery adds to.
+enum Target {
+    Existing(EntityId, Record),
+    New { name: String, category: Category },
+}
+
+/// Check a discovery against the store, citing `current` for facts with no
+/// source of their own. With `current` `None` (staging, before the turn's
+/// narration exists), those facts' excerpts are left unchecked. `pending`
+/// are new entries already staged this turn, as (category, name).
+pub(crate) fn check(
+    world: &World,
+    d: &Discovery,
+    current: Option<i64>,
+    pending: &[(Category, String)],
+) -> Result<Result<(), String>, StoreError> {
+    Ok(resolve(world, d, current, pending)?.map(|_| ()))
+}
+
+fn resolve(
+    world: &World,
+    d: &Discovery,
+    current: Option<i64>,
+    pending: &[(Category, String)],
+) -> Result<Result<Target, String>, StoreError> {
+    macro_rules! refuse {
+        ($($t:tt)*) => { return Ok(Err(format!($($t)*))) };
+    }
+    let all = entries(world)?;
+    let target = match (d.entry, &d.name, d.category) {
+        (Some(id), None, None) => match world.get::<Record>(id)? {
+            Some(r) => Target::Existing(id, r),
+            None => refuse!("#{id} is not a compendium entry"),
+        },
+        (Some(_), ..) => {
+            refuse!(
+                "give entry to add to a known entry, or name and category for a new one, not both"
+            )
+        }
+        (None, Some(name), Some(category)) => {
+            let name = name.trim();
+            if name.is_empty() {
+                refuse!("a new entry needs a name");
+            }
+            let same: Vec<String> = all
+                .iter()
+                .filter(|e| e.category == category && e.name.eq_ignore_ascii_case(name))
+                .map(|e| {
+                    let gist = e
+                        .facts
+                        .first()
+                        .map_or(e.summary.as_str(), |f| f.text.as_str());
+                    format!("#{} ({})", e.id, clip(gist, 80))
+                })
+                .collect();
+            let staged = pending
+                .iter()
+                .any(|(c, n)| *c == category && n.eq_ignore_ascii_case(name));
+            if !d.distinct && (!same.is_empty() || staged) {
+                let known = if same.is_empty() {
+                    "already being recorded this turn".to_owned()
+                } else {
+                    format!("already known as {}", same.join(", "))
+                };
+                refuse!(
+                    "a {} called {name:?} is {known}: add to it with entry, or pass \
+                     distinct: true if this is a different one that shares the name",
+                    category.label()
+                );
+            }
+            Target::New {
+                name: name.to_owned(),
+                category,
+            }
+        }
+        (None, ..) => {
+            refuse!("give entry (a known entry's id), or name and category for a new one")
+        }
+    };
+
+    if let Some(s) = d.subject {
+        match world.entity(s)? {
+            None => refuse!("subject #{s} does not exist"),
+            Some(e) if world::is_entry(&e) => {
+                refuse!("subject #{s} is a compendium entry, not a world entity")
+            }
+            Some(e) if e.kind != ROOM_KIND && world::RESERVED_KINDS.contains(&e.kind.as_str()) => {
+                refuse!("subject #{s} is engine state, not something to learn about")
+            }
+            Some(_) => {}
+        }
+        let (own, category) = match &target {
+            Target::Existing(id, r) => {
+                if r.subject.is_some_and(|t| t != s) {
+                    refuse!("entry #{id} is already about another entity");
+                }
+                (Some(*id), r.category)
+            }
+            Target::New { category, .. } => (None, *category),
+        };
+        if let Some((other, _)) = about(world, category, s)?
+            && Some(other) != own
+        {
+            refuse!("entry #{other} is already about #{s}: add to it with entry");
+        }
+    }
+
+    if d.facts.is_empty() {
+        refuse!("a discovery needs at least one fact");
+    }
+    for f in &d.facts {
+        if f.text.trim().is_empty() {
+            refuse!("a fact needs text");
+        }
+        let excerpt = normalize_excerpt(&f.excerpt);
+        if excerpt.split_whitespace().count() < MIN_EXCERPT_WORDS {
+            refuse!(
+                "excerpt {:?} is too short: quote at least {MIN_EXCERPT_WORDS} words of narration",
+                f.excerpt
+            );
+        }
+        if f.excerpt.chars().count() > MAX_EXCERPT_CHARS {
+            refuse!("an excerpt is at most {MAX_EXCERPT_CHARS} characters");
+        }
+        if f.claimed_by.as_ref().is_some_and(|c| c.trim().is_empty()) {
+            refuse!("claimed_by names who said it");
+        }
+        if f.claimant.is_some() && f.claimed_by.is_none() {
+            refuse!("claimant goes with claimed_by");
+        }
+        if let Some(c) = f.claimant
+            && world.get::<Record>(c)?.is_none()
+        {
+            refuse!("claimant #{c} is not a compendium entry");
+        }
+        // With no source and no `current`, the fact cites this turn's
+        // narration, still to come: checked when it is committed.
+        if let Some(seq) = f.source.or(current)
+            && let Err(why) = check_excerpt(world, seq, &f.excerpt)?
+        {
+            return Ok(Err(why));
+        }
+    }
+    Ok(Ok(target))
+}
+
+/// Remember `d`, citing narration event `current` for facts that give no
+/// source of their own. Every citation is checked first (the event exists,
+/// is narration the player saw, and contains the excerpt); a refusal
+/// writes nothing and leaves what was known as it was. Returns the entry's
+/// id, or `Err` with why nothing was written.
+///
+/// A matching excerpt proves the citation exists, not that the fact
+/// follows from it: callers state only what the narration says.
+pub(crate) fn learn(
+    world: &mut World,
+    d: &Discovery,
+    current: Option<i64>,
+) -> Result<Result<EntityId, String>, StoreError> {
+    if current.is_none() && d.facts.iter().any(|f| f.source.is_none()) {
+        return Ok(Err("a fact cites no narration".into()));
+    }
+    let target = match resolve(world, d, current, &[])? {
+        Ok(t) => t,
+        Err(why) => return Ok(Err(why)),
+    };
+    let facts = d.facts.iter().map(|f| Fact {
+        text: f.text.trim().to_owned(),
+        kind: if f.claimed_by.is_some() {
+            FactKind::Claimed
+        } else {
+            FactKind::Observed
+        },
+        claimed_by: f.claimed_by.as_ref().map(|c| c.trim().to_owned()),
+        claimant: f.claimant,
+        sources: vec![Source {
+            event: f.source.or(current).expect("checked above"),
+            excerpt: Some(f.excerpt.trim().to_owned()),
+        }],
+    });
+    let (op, existing) = match target {
+        Target::Existing(id, mut r) => {
+            for f in facts {
+                merge_fact(&mut r.facts, f);
+            }
+            if r.subject.is_none() {
+                r.subject = d.subject;
+            }
+            refresh(&mut r);
+            (world::set_op(id, &r), Some(id))
+        }
+        Target::New { name, category } => {
+            let mut r = Record {
+                category,
+                subject: d.subject,
+                summary: String::new(),
+                summary_source: 0,
+                first_seen: 0,
+                last_seen: 0,
+                encounters: 0,
+                facts: Vec::new(),
+            };
+            for f in facts {
+                merge_fact(&mut r.facts, f);
+            }
+            refresh(&mut r);
+            let op = Op::Create {
+                handle: None,
+                name,
+                kind: KNOWLEDGE_KIND.into(),
+                location: None,
+                props: [world::prop(&r)].into_iter().collect(),
+            };
+            (op, None)
+        }
+    };
+    match world.apply_engine_patch(&Patch::new(vec![op])) {
+        Ok(applied) => Ok(Ok(existing.unwrap_or_else(|| applied.created[0]))),
+        Err(ApplyError::Rejected(r)) => Ok(Err(format!("patch rejected: {r}"))),
+        Err(ApplyError::Storage(e)) => Err(StoreError::Sqlite(e)),
+    }
+}
+
+/// Bring a learned entry's span and summary up to date with its facts.
+/// An entry never encountered is summarised from its observations only
+/// (claims stay attributed, and nothing beyond the facts goes in); an
+/// encountered place keeps the description it was found with.
+fn refresh(r: &mut Record) {
+    // An encountered entry's first and last sightings stay its encounters.
+    if r.encounters == 0 {
+        let cited = || {
+            r.facts
+                .iter()
+                .flat_map(|f| f.sources.iter().map(|s| s.event))
+        };
+        r.first_seen = cited().min().unwrap_or(0);
+        r.last_seen = cited().max().unwrap_or(0);
+        let observed: Vec<&Fact> = r
+            .facts
+            .iter()
+            .filter(|f| f.kind == FactKind::Observed)
+            .collect();
+        r.summary = observed
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        r.summary_source = observed
+            .iter()
+            .flat_map(|f| f.sources.iter().map(|s| s.event))
+            .max()
+            .unwrap_or(r.first_seen);
     }
 }

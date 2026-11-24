@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::glossary::{self, GLOSSARY_KIND};
 use crate::inventory::{self, Inventory};
+use crate::knowledge;
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
 use crate::pressure;
 use crate::quest;
@@ -61,6 +62,7 @@ pub fn definitions(phase: Phase) -> Vec<ToolDefinition> {
         .chain(glossary::tools::tool_definitions())
         .chain(stats::tools::tool_definitions())
         .chain(pressure::tool_definitions())
+        .chain(knowledge::tools::tool_definitions())
         .collect(),
         Phase::Tick => vec![
             read_bible_def(),
@@ -112,6 +114,9 @@ pub fn dispatch(
         return output;
     }
     if let Some(output) = stats::tools::handle_tool(world, dice_seed, call) {
+        return output;
+    }
+    if let Some(output) = knowledge::tools::handle_tool(world, call) {
         return output;
     }
     macro_rules! input {

@@ -61,6 +61,8 @@ fn place(world: &World, name: &str) -> Entry {
     }
 }
 
+mod learned;
+
 #[test]
 fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sources() {
     let (game, _) = in_tower();
@@ -85,14 +87,20 @@ fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sourc
         [Fact {
             text: "Reached from Drowned Chapel.".into(),
             kind: FactKind::Observed,
-            sources: vec![tower.first_seen],
+            claimed_by: None,
+            claimant: None,
+            sources: vec![Source::event(tower.first_seen)],
         }]
     );
     // Every cited source is narration the player saw.
     for e in entries(world).unwrap() {
         let cited = [e.first_seen, e.last_seen, e.summary_source]
             .into_iter()
-            .chain(e.facts.iter().flat_map(|f| f.sources.clone()));
+            .chain(
+                e.facts
+                    .iter()
+                    .flat_map(|f| f.sources.iter().map(|s| s.event)),
+            );
         for seq in cited {
             assert_eq!(source(world, seq).kind, EventKind::Narration);
         }

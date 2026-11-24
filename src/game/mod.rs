@@ -69,7 +69,10 @@ free descriptive label (sword, heron, door); what it can do comes from marker pr
 acts: true for anything that moves, speaks or acts on its own (people, animals, spirits, a \
 talking sword; these are the NPCs), container: true for anything things can be put inside, \
 fixed: true for anything the player can't take. Only rooms, the player, acts beings and \
-containers can hold things. If a tool \
+containers can hold things. When the player learns something about a person, place, faction, \
+notable item, lore or a mechanic (seen, or told by someone), record it with learn, quoting \
+words your narration will repeat exactly; a rumour is a claim with claimed_by, and a subject \
+only mentioned needs no entity. If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
@@ -534,6 +537,16 @@ impl Game {
         // Last, so the turn's time, verdicts and rule changes follow its
         // narration directly (the X-ray reads them there).
         self.remember_encounters(&turn, narrated, &narration)?;
+        // What the director staged with `learn`, now that the narration it
+        // cites exists. Only a turn that ended normally and narrated
+        // something commits any.
+        let ended = response
+            .stop_reason
+            .as_ref()
+            .is_none_or(|r| *r == StopReason::EndTurn);
+        if ended && !narration.is_empty() {
+            knowledge::tools::commit_turn(&mut self.world, turn.start, narrated)?;
+        }
         Ok(TurnOutcome {
             narration,
             stop_reason: response

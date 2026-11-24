@@ -4,10 +4,10 @@
 
 use std::fmt::Write;
 
-use super::{Category, Entry, Found, entries, find, search};
+use super::{Category, Entry, FactKind, Found, entries, entry, find, search};
 use crate::world::{StoreError, World};
 
-const USAGE: &str = "Usage: :compendium [places | <name|#entry> | search <text>]";
+const USAGE: &str = "Usage: :compendium [people | places | factions | items | lore | mechanics | <name|#entry> | search <text>]";
 const HINT: &str = ":compendium <name> shows an entry; :compendium search <text> searches.";
 
 /// `:compendium [<category> | <name|#entry> | search <text>]`.
@@ -26,7 +26,7 @@ pub fn compendium(world: &World, arg: &str) -> Result<String, StoreError> {
         return section(world, category);
     }
     Ok(match find(world, arg)? {
-        Found::One(e) => detail(&e),
+        Found::One(e) => detail(world, &e)?,
         Found::None => format!("You know of nothing called {arg:?}.\n{USAGE}"),
         Found::Many(many) => {
             let mut out = format!("{arg:?} could be several entries; use an id:");
@@ -41,7 +41,11 @@ pub fn compendium(world: &World, arg: &str) -> Result<String, StoreError> {
 fn overview(world: &World) -> Result<String, StoreError> {
     let all = entries(world)?;
     if all.is_empty() {
-        return Ok("Your compendium is empty: places are remembered as you enter them.".into());
+        return Ok(
+            "Your compendium is empty: places are remembered as you enter them, and what you \
+             learn as it is narrated."
+                .into(),
+        );
     }
     let mut out = String::from("Compendium: what you have learned\n");
     for c in Category::ALL {
@@ -104,19 +108,55 @@ fn line(e: &Entry) -> String {
 }
 
 /// One entry in full, with the events that support it.
-fn detail(e: &Entry) -> String {
+fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
     let mut out = format!("{} · {} · entry #{}\n", e.name, e.category.label(), e.id);
-    if e.summary.is_empty() {
-        writeln!(out, "(nothing described) [#{}]", e.summary_source).unwrap();
+    if e.encounters > 0 {
+        if e.summary.is_empty() {
+            writeln!(out, "(nothing described) [#{}]", e.summary_source).unwrap();
+        } else {
+            writeln!(out, "{} [#{}]", e.summary, e.summary_source).unwrap();
+        }
+    } else if e.summary.is_empty() {
+        writeln!(out, "Known only from what others say.").unwrap();
     } else {
-        writeln!(out, "{} [#{}]", e.summary, e.summary_source).unwrap();
+        writeln!(out, "{}", e.summary).unwrap();
     }
     if !e.facts.is_empty() {
         out.push('\n');
         for f in &e.facts {
-            let sources: Vec<String> = f.sources.iter().map(|s| format!("#{s}")).collect();
-            writeln!(out, "- {} [{}]", f.text, sources.join(", ")).unwrap();
+            let sources: Vec<String> = f
+                .sources
+                .iter()
+                .map(|s| match &s.excerpt {
+                    Some(x) => format!("#{} {x:?}", s.event),
+                    None => format!("#{}", s.event),
+                })
+                .collect();
+            let text = match (&f.kind, &f.claimed_by) {
+                (FactKind::Claimed, Some(by)) => {
+                    // The claimant's entry, when known: an entry, never a
+                    // world entity, so nothing unlearned is named.
+                    let known = match f.claimant {
+                        Some(id) => entry(world, id)?.map(|c| format!(" (#{})", c.id)),
+                        None => None,
+                    };
+                    format!("{by}{} claims: {}", known.unwrap_or_default(), f.text)
+                }
+                (FactKind::Claimed, None) => format!("It is said: {}", f.text),
+                (FactKind::Observed, _) => f.text.clone(),
+            };
+            writeln!(out, "- {text} [{}]", sources.join("; ")).unwrap();
         }
+    }
+    if e.encounters == 0 {
+        write!(
+            out,
+            "\nKnown by mention: first #{}, latest #{}; not encountered. [#n] is the narration \
+             it comes from: :log #n shows it.",
+            e.first_seen, e.last_seen
+        )
+        .unwrap();
+        return Ok(out);
     }
     let times = if e.encounters == 1 {
         "once".to_owned()
@@ -130,5 +170,5 @@ fn detail(e: &Entry) -> String {
         e.first_seen, e.last_seen
     )
     .unwrap();
-    out
+    Ok(out)
 }
