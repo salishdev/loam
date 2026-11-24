@@ -47,7 +47,7 @@ pub const COMMANDS: &[&str] = &[
 /// The command list `:help` prints.
 pub const HELP: &str = "Commands: :compendium [<category> | <name|#entry> | search <text>] \
 (what you have learned), :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
-:quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
+:quests, :npcs (:compendium people), :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
 :log #<event>, :tick, :quit
 
 Workbench (see and steer the models): :xray [on|off] shows each turn's calls, cache use, \
@@ -90,7 +90,8 @@ pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, Stri
         ":glossary" => inspect::glossary(world),
         ":why" => inspect::why(world, arg),
         ":quests" => inspect::quests(world),
-        ":npcs" => inspect::npcs(world),
+        // A shortcut into the compendium's People section.
+        ":npcs" => crate::knowledge::compendium(world, "people"),
         ":inventory" | ":i" => inspect::inventory(world),
         ":relations" => inspect::relations(world, arg),
         ":stats" => inspect::stats(world),

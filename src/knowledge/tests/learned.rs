@@ -120,7 +120,7 @@ fn narrated_observations_and_named_claims_become_readable_entries() {
     );
     assert!(
         detail.contains(&format!(
-            "- Brother Ash claims: The eel-wives drowned the bell. [#{narration} \"the eel-wives drowned the bell\"]"
+            "1. Brother Ash claims: The eel-wives drowned the bell. [#{narration} \"the eel-wives drowned the bell\"]"
         )),
         "{detail}"
     );
@@ -128,7 +128,7 @@ fn narrated_observations_and_named_claims_become_readable_entries() {
     let detail = compendium(world, "Brother Ash");
     assert!(detail.starts_with(&format!("Brother Ash · person · entry #{}", ash.id)));
     assert!(detail.contains(&format!(
-        "- A gaunt monk who tends the bell rope. [#{narration} \"A gaunt monk ties off the bell rope\"]"
+        "1. A gaunt monk who tends the bell rope. [#{narration} \"A gaunt monk ties off the bell rope\"]"
     )));
 
     // Later the claim is repeated with its claimant linked to Ash's entry.

@@ -61,6 +61,7 @@ fn place(world: &World, name: &str) -> Entry {
     }
 }
 
+mod encounters;
 mod learned;
 
 #[test]
@@ -90,6 +91,7 @@ fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sourc
             claimed_by: None,
             claimant: None,
             sources: vec![Source::event(tower.first_seen)],
+            supersedes: Vec::new(),
         }]
     );
     // Every cited source is narration the player saw.
@@ -117,7 +119,7 @@ fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sourc
     assert!(detail.starts_with(&format!("Bell Tower · place · entry #{}", tower.id)));
     assert!(detail.contains(&format!("A leaning tower. [#{}]", tower.last_seen)));
     assert!(detail.contains(&format!(
-        "- Reached from Drowned Chapel. [#{}]",
+        "1. Reached from Drowned Chapel. [#{}]",
         tower.first_seen
     )));
     assert_eq!(compendium(world, &format!("#{}", tower.id)), detail);

@@ -1,5 +1,5 @@
 //! The REPL inspector: `:rules`, `:glossary`, `:why`, `:relations`,
-//! `:quests`, `:npcs`, `:inventory`, `:stats`, `:time`, `:pressures`, `:log`.
+//! `:quests`, `:inventory`, `:stats`, `:time`, `:pressures`, `:log`.
 //!
 //! Every report is read from the world store and its event log. Nothing
 //! here takes an LLM client, so inspecting never costs a call.
@@ -110,7 +110,8 @@ pub fn quests(world: &World) -> Result<String, StoreError> {
 }
 
 /// Every NPC entity with where it is and its props, then the bible's NPCs
-/// that have no entity yet. Bible NPCs match entities by name, ignoring
+/// that have no entity yet: world truth, not what the player knows, so no
+/// Player-mode command shows it (`:npcs` opens the compendium's People). Bible NPCs match entities by name, ignoring
 /// case.
 pub fn npcs(world: &World) -> Result<String, StoreError> {
     let sightings = game::npcs(world)?;

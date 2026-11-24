@@ -72,7 +72,9 @@ fixed: true for anything the player can't take. Only rooms, the player, acts bei
 containers can hold things. When the player learns something about a person, place, faction, \
 notable item, lore or a mechanic (seen, or told by someone), record it with learn, quoting \
 words your narration will repeat exactly; a rumour is a claim with claimed_by, and a subject \
-only mentioned needs no entity. If a tool \
+only mentioned needs no entity. When someone known only by mention turns up, link their \
+entry to the entity with learn (entry + subject); a later revelation that corrects an earlier \
+fact names it in supersedes (recall lists an entry's facts). If a tool \
 refuses, adapt; an impossible action is narrated as a non-change. What anyone carries \
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
@@ -558,9 +560,12 @@ impl Game {
         })
     }
 
-    /// Remember the place the player ended the turn in, when the turn
-    /// brought them there (the opening scene, or a move), citing the turn's
-    /// narration. Nothing is remembered without narration to cite.
+    /// Remember what the turn's narration showed, citing it: the place the
+    /// player ended the turn in, when the turn brought them there (the
+    /// opening scene, or a move), then the people and notable items it
+    /// named around them. Nothing is remembered without narration to cite.
+    /// Opening, director and fast-path turns all end here; world ticks
+    /// never do, so nothing off-screen becomes a discovery.
     fn remember_encounters(
         &mut self,
         turn: &Turn,
@@ -573,12 +578,12 @@ impl Game {
         let Some(room) = player_room(&self.world)? else {
             return Ok(());
         };
-        if Some(room) == turn.start_room {
-            return Ok(());
+        if Some(room) != turn.start_room {
+            // A refusal (no room, bad source) leaves the compendium as it
+            // was: the turn itself still stands.
+            let _ = knowledge::record_place(&mut self.world, room, turn.start_room, narrated)?;
         }
-        // A refusal (no room, bad source) leaves the compendium as it was:
-        // the turn itself still stands.
-        let _ = knowledge::record_place(&mut self.world, room, turn.start_room, narrated)?;
+        knowledge::record_encounters(&mut self.world, narrated)?;
         Ok(())
     }
 

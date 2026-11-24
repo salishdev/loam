@@ -110,20 +110,29 @@ fn line(e: &Entry) -> String {
 /// One entry in full, with the events that support it.
 fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
     let mut out = format!("{} · {} · entry #{}\n", e.name, e.category.label(), e.id);
-    if e.encounters > 0 {
+    let has_claims = e.facts.iter().any(|f| f.kind == FactKind::Claimed);
+    if e.category == Category::Place && e.encounters > 0 {
         if e.summary.is_empty() {
             writeln!(out, "(nothing described) [#{}]", e.summary_source).unwrap();
         } else {
             writeln!(out, "{} [#{}]", e.summary, e.summary_source).unwrap();
         }
-    } else if e.summary.is_empty() {
-        writeln!(out, "Known only from what others say.").unwrap();
-    } else {
+    } else if !e.summary.is_empty() {
         writeln!(out, "{}", e.summary).unwrap();
+    } else if has_claims {
+        writeln!(out, "Known only from what others say.").unwrap();
+    }
+    if let Some(place) = e.seen_at {
+        // The place as the player knows it: an entry, never the room.
+        if let Some(p) = entry(world, place)? {
+            writeln!(out, "Last seen at {} [#{}].", p.name, e.last_seen).unwrap();
+        }
     }
     if !e.facts.is_empty() {
         out.push('\n');
-        for f in &e.facts {
+        let superseded = e.superseded();
+        for (i, f) in e.facts.iter().enumerate() {
+            let n = i + 1;
             let sources: Vec<String> = f
                 .sources
                 .iter()
@@ -145,7 +154,27 @@ fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
                 (FactKind::Claimed, None) => format!("It is said: {}", f.text),
                 (FactKind::Observed, _) => f.text.clone(),
             };
-            writeln!(out, "- {text} [{}]", sources.join("; ")).unwrap();
+            let mut notes = Vec::new();
+            if !f.supersedes.is_empty() {
+                let list: Vec<String> = f.supersedes.iter().map(|k| k.to_string()).collect();
+                notes.push(format!("corrects {}", list.join(", ")));
+            }
+            if superseded.contains(&n) {
+                let by: Vec<String> = e
+                    .facts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.supersedes.contains(&n))
+                    .map(|(j, _)| (j + 1).to_string())
+                    .collect();
+                notes.push(format!("superseded by {}", by.join(", ")));
+            }
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes.join("; "))
+            };
+            writeln!(out, "{n}. {text}{notes} [{}]", sources.join("; ")).unwrap();
         }
     }
     if e.encounters == 0 {

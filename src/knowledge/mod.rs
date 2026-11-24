@@ -14,9 +14,13 @@
 //! at the world entity it was about, so later changes off-screen, or its
 //! destruction, leave the remembered account as it was.
 //!
-//! Two writers: [`record_place`] for rooms the player enters, and [`learn`]
-//! for discoveries (observations and attributed claims about any category,
-//! including subjects only mentioned, which need no world entity). The
+//! Three writers: [`record_place`] for rooms the player enters,
+//! [`record_encounters`] for the people and notable items a turn's
+//! narration names around the player, and [`learn`] for discoveries
+//! (observations and attributed claims about any category, including
+//! subjects only mentioned, which need no world entity; explicit links of
+//! such an entry to the entity it turned out to be; and corrections, which
+//! supersede earlier facts without erasing them). The
 //! director submits discoveries with the `learn` tool; they are staged
 //! until the turn's narration exists, then committed ([`tools`]). Every
 //! write cites player-visible source events (non-empty `narration`, and for
@@ -118,6 +122,11 @@ pub struct Fact {
     pub claimant: Option<EntityId>,
     /// Player-visible events supporting it, oldest first.
     pub sources: Vec<Source>,
+    /// Earlier facts of the same entry this one corrects, by number
+    /// (1-based, in the order learned). They stay, with their own sources
+    /// and attribution, but no longer shape the summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<usize>,
 }
 
 /// A narration event cited as evidence, and the words in it that support
@@ -194,6 +203,11 @@ struct Record {
     last_seen: i64,
     /// How many separate encounters the entry has had.
     encounters: u32,
+    /// The place entry where a person or item was last seen, as of
+    /// `last_seen`. Changed only by an encounter, so off-screen movement
+    /// never moves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen_at: Option<EntityId>,
     #[serde(default)]
     facts: Vec<Fact>,
 }
@@ -216,6 +230,11 @@ pub struct Entry {
     pub first_seen: i64,
     pub last_seen: i64,
     pub encounters: u32,
+    /// The place entry where it was last seen (people and items).
+    pub seen_at: Option<EntityId>,
+    /// Whether the entry is linked to a world entity. Which one is never
+    /// exposed: readers show only what was learned.
+    pub linked: bool,
     pub facts: Vec<Fact>,
 }
 
@@ -230,8 +249,15 @@ impl Entry {
             first_seen: r.first_seen,
             last_seen: r.last_seen,
             encounters: r.encounters,
+            seen_at: r.seen_at,
+            linked: r.subject.is_some(),
             facts: r.facts,
         }
+    }
+
+    /// Fact numbers (1-based) that a later fact corrects.
+    pub fn superseded(&self) -> Vec<usize> {
+        superseded(&self.facts)
     }
 
     /// Whether `needle` (lowercase) occurs in the entry's name, summary,
@@ -437,6 +463,7 @@ pub(crate) fn record_place(
                 first_seen: source,
                 last_seen: source,
                 encounters: 1,
+                seen_at: None,
                 facts,
             };
             let op = Op::Create {
@@ -456,6 +483,152 @@ pub(crate) fn record_place(
     }
 }
 
+/// Remember the people and notable items the turn's narration (event
+/// `source`) showed the player: entities directly in the player's room or
+/// carried by the player, that the narration names (whole words, any
+/// case). Being named in the scene is the encounter's whole justification,
+/// so nothing else about them is read or copied.
+///
+/// - An entity some entry is linked to gives that entry an encounter: one
+///   more sighting, last seen now, at the place the player is in.
+/// - An NPC (`acts`) no entry is linked to gets a new person entry linked
+///   to it, unless an unlinked person entry of the same name is known:
+///   whether that is the same subject only an explicit link can say, so
+///   the engine waits for one rather than merge or duplicate by name.
+/// - Items gain entries only through `learn` (with `subject`), which makes
+///   them notable; after that their encounters are recorded here.
+///
+/// Returns the entries encountered. Nothing is written when nothing was
+/// encountered, or the source isn't narration.
+pub(crate) fn record_encounters(
+    world: &mut World,
+    source: i64,
+) -> Result<Vec<EntityId>, StoreError> {
+    if check_source(world, source)?.is_err() {
+        return Ok(Vec::new());
+    }
+    let text = normalize(
+        world
+            .event(source)?
+            .and_then(|e| e.payload["text"].as_str().map(str::to_owned))
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    let Some(&player) = world.entities_of_kind(world::PLAYER_KIND)?.first() else {
+        return Ok(Vec::new());
+    };
+    let Some(room) = world.entity(player)?.and_then(|p| p.location).filter(|&r| {
+        world
+            .entity(r)
+            .ok()
+            .flatten()
+            .is_some_and(|e| e.kind == ROOM_KIND)
+    }) else {
+        return Ok(Vec::new());
+    };
+    let named = |name: &str| contains_words(&text, &normalize(name));
+    let records = world.query::<Record>()?;
+    let mut nearby = world.contents(Some(room))?;
+    nearby.extend(world.contents(Some(player))?);
+
+    let mut seen: Vec<(Option<EntityId>, Record)> = Vec::new();
+    let mut met: Vec<String> = Vec::new();
+    for id in nearby {
+        let Some(e) = world.entity(id)? else { continue };
+        if id == player || world::is_entry(&e) || world::RESERVED_KINDS.contains(&e.kind.as_str()) {
+            continue;
+        }
+        let linked: Vec<&(EntityId, Record)> = records
+            .iter()
+            .filter(|(_, r)| r.subject == Some(id))
+            .collect();
+        if !linked.is_empty() {
+            for (entry_id, r) in linked {
+                let entry_name = world.entity(*entry_id)?.map(|e| e.name).unwrap_or_default();
+                if named(&e.name) || named(&entry_name) {
+                    seen.push((Some(*entry_id), r.clone()));
+                }
+            }
+            continue;
+        }
+        let acts = e.props.get(world::ACTS) == Some(&serde_json::Value::Bool(true));
+        if !acts || !named(&e.name) {
+            continue;
+        }
+        let mut waiting = false;
+        for (entry_id, r) in &records {
+            if r.category == Category::Person
+                && r.subject.is_none()
+                && world
+                    .entity(*entry_id)?
+                    .is_some_and(|k| k.name.to_lowercase() == e.name.to_lowercase())
+            {
+                waiting = true;
+            }
+        }
+        if !waiting && !met.iter().any(|m| m.eq_ignore_ascii_case(&e.name)) {
+            met.push(e.name.clone());
+            seen.push((
+                None,
+                Record {
+                    category: Category::Person,
+                    subject: Some(id),
+                    summary: String::new(),
+                    summary_source: source,
+                    first_seen: source,
+                    last_seen: source,
+                    encounters: 0,
+                    seen_at: None,
+                    facts: Vec::new(),
+                },
+            ));
+        }
+    }
+    if seen.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Where they were seen, as the player knows the place.
+    let place = match about(world, Category::Place, room)? {
+        Some((id, _)) => Some(id),
+        None => record_place(world, room, None, source)?.ok(),
+    };
+    let mut ops = Vec::new();
+    let mut existing = Vec::new();
+    for (entry_id, mut r) in seen {
+        if r.encounters == 0 {
+            r.first_seen = source;
+        }
+        r.last_seen = source;
+        r.encounters += 1;
+        r.seen_at = place.or(r.seen_at);
+        refresh(&mut r);
+        let Some(entry_id) = entry_id else {
+            let name = world
+                .entity(r.subject.expect("a new encounter has its subject"))?
+                .map(|e| e.name)
+                .unwrap_or_default();
+            ops.push(Op::Create {
+                handle: None,
+                name,
+                kind: KNOWLEDGE_KIND.into(),
+                location: None,
+                props: [world::prop(&r)].into_iter().collect(),
+            });
+            continue;
+        };
+        existing.push(entry_id);
+        ops.push(world::set_op(entry_id, &r));
+    }
+    match world.apply_engine_patch(&Patch::new(ops)) {
+        Ok(applied) => {
+            existing.extend(applied.created);
+            Ok(existing)
+        }
+        Err(ApplyError::Rejected(_)) => Ok(Vec::new()),
+        Err(ApplyError::Storage(e)) => Err(StoreError::Sqlite(e)),
+    }
+}
+
 /// Add an observed fact, or cite `source` for it again if already known.
 fn add_fact(facts: &mut Vec<Fact>, text: String, source: i64) {
     merge_fact(
@@ -466,6 +639,7 @@ fn add_fact(facts: &mut Vec<Fact>, text: String, source: i64) {
             claimed_by: None,
             claimant: None,
             sources: vec![Source::event(source)],
+            supersedes: Vec::new(),
         },
     );
 }
@@ -485,6 +659,11 @@ fn merge_fact(facts: &mut Vec<Fact>, fact: Fact) {
             }
             if f.claimant.is_none() {
                 f.claimant = fact.claimant;
+            }
+            for n in fact.supersedes {
+                if !f.supersedes.contains(&n) {
+                    f.supersedes.push(n);
+                }
             }
         }
         None => facts.push(fact),
@@ -510,8 +689,12 @@ pub struct Discovery {
     #[serde(default, deserialize_with = "null_is_false")]
     pub distinct: bool,
     /// The world entity the entry is about, when it exists physically.
+    /// With `entry`, links an entry known until now only by mention to the
+    /// entity it turned out to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<EntityId>,
+    /// May be empty when `subject` is given: a link and nothing more.
+    #[serde(default)]
     pub facts: Vec<NewFact>,
 }
 
@@ -537,6 +720,9 @@ pub struct NewFact {
     /// The entry for whoever said it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimant: Option<EntityId>,
+    /// Earlier facts of the entry that this one corrects, by number.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<usize>,
 }
 
 /// Fewest words an excerpt may have, so it pins down a passage.
@@ -738,8 +924,18 @@ fn resolve(
     }
 
     if d.facts.is_empty() {
-        refuse!("a discovery needs at least one fact");
+        match (&target, d.subject) {
+            (_, None) => refuse!("a discovery needs at least one fact, or a subject to link"),
+            (Target::Existing(id, r), Some(s)) if r.subject == Some(s) => {
+                refuse!("entry #{id} is already linked to #{s}: nothing to learn")
+            }
+            _ => {}
+        }
     }
+    let known_facts = match &target {
+        Target::Existing(_, r) => r.facts.len(),
+        Target::New { .. } => 0,
+    };
     for f in &d.facts {
         if f.text.trim().is_empty() {
             refuse!("a fact needs text");
@@ -756,6 +952,12 @@ fn resolve(
         }
         if f.claimed_by.as_ref().is_some_and(|c| c.trim().is_empty()) {
             refuse!("claimed_by names who said it");
+        }
+        if let Some(&n) = f.supersedes.iter().find(|&&n| n == 0 || n > known_facts) {
+            refuse!(
+                "supersedes {n}: the entry has {known_facts} fact(s) learned before this \
+                 turn; name them by number (recall lists them)"
+            );
         }
         if f.claimant.is_some() && f.claimed_by.is_none() {
             refuse!("claimant goes with claimed_by");
@@ -784,6 +986,10 @@ pub(crate) fn supported(
     d: &Discovery,
     current: i64,
 ) -> Result<Option<Discovery>, StoreError> {
+    if d.facts.is_empty() {
+        // A link only: the turn narrated, which is all it needs.
+        return Ok(Some(d.clone()));
+    }
     let mut kept = d.clone();
     kept.facts.clear();
     for f in &d.facts {
@@ -827,6 +1033,7 @@ pub(crate) fn learn(
             event: f.source.or(current).expect("checked above"),
             excerpt: Some(f.excerpt.trim().to_owned()),
         }],
+        supersedes: f.supersedes.clone(),
     });
     let (op, existing) = match target {
         Target::Existing(id, mut r) => {
@@ -848,6 +1055,7 @@ pub(crate) fn learn(
                 first_seen: 0,
                 last_seen: 0,
                 encounters: 0,
+                seen_at: None,
                 facts: Vec::new(),
             };
             for f in facts {
@@ -871,34 +1079,46 @@ pub(crate) fn learn(
     }
 }
 
-/// Bring a learned entry's span and summary up to date with its facts.
-/// An entry never encountered is summarised from its observations only
-/// (claims stay attributed, and nothing beyond the facts goes in); an
-/// encountered place keeps the description it was found with.
+/// Fact numbers (1-based) that a later fact corrects.
+fn superseded(facts: &[Fact]) -> Vec<usize> {
+    let mut out: Vec<usize> = facts.iter().flat_map(|f| f.supersedes.clone()).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Bring an entry's span and summary up to date with its facts. The
+/// summary is the observed facts nothing has corrected (claims stay
+/// attributed, and nothing beyond the facts goes in); an encountered place
+/// keeps the description it was found with instead. An entry never
+/// encountered spans the narration its facts cite.
 fn refresh(r: &mut Record) {
-    // An encountered entry's first and last sightings stay its encounters.
-    if r.encounters == 0 {
-        let cited = || {
-            r.facts
-                .iter()
-                .flat_map(|f| f.sources.iter().map(|s| s.event))
-        };
-        r.first_seen = cited().min().unwrap_or(0);
-        r.last_seen = cited().max().unwrap_or(0);
-        let observed: Vec<&Fact> = r
-            .facts
-            .iter()
-            .filter(|f| f.kind == FactKind::Observed)
-            .collect();
-        r.summary = observed
-            .iter()
-            .map(|f| f.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        r.summary_source = observed
+    let cited = |facts: &[&Fact]| {
+        facts
             .iter()
             .flat_map(|f| f.sources.iter().map(|s| s.event))
-            .max()
-            .unwrap_or(r.first_seen);
+            .collect::<Vec<_>>()
+    };
+    if r.encounters == 0 {
+        let all = cited(&r.facts.iter().collect::<Vec<_>>());
+        r.first_seen = all.iter().copied().min().unwrap_or(0);
+        r.last_seen = all.iter().copied().max().unwrap_or(0);
     }
+    if r.category == Category::Place && r.encounters > 0 {
+        return;
+    }
+    let gone = superseded(&r.facts);
+    let observed: Vec<&Fact> = r
+        .facts
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.kind == FactKind::Observed && !gone.contains(&(i + 1)))
+        .map(|(_, f)| f)
+        .collect();
+    r.summary = observed
+        .iter()
+        .map(|f| f.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    r.summary_source = cited(&observed).into_iter().max().unwrap_or(r.first_seen);
 }
