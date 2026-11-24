@@ -7,6 +7,7 @@ pub mod game;
 pub mod glossary;
 pub mod inspect;
 pub mod inventory;
+pub mod knowledge;
 pub mod llm;
 pub mod pressure;
 pub mod quest;

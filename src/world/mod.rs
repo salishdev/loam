@@ -182,7 +182,7 @@ pub const PLAYER_KIND: &str = "player";
 /// Kinds the engine gives meaning to. The director can't create entities of
 /// these kinds (rooms come only from `create_room`); every other kind is a
 /// free descriptive label.
-pub const RESERVED_KINDS: [&str; 7] = [
+pub const RESERVED_KINDS: [&str; 8] = [
     ROOM_KIND,
     PLAYER_KIND,
     "bible",
@@ -190,7 +190,13 @@ pub const RESERVED_KINDS: [&str; 7] = [
     "quest",
     "glossary",
     "pressure",
+    KNOWLEDGE_KIND,
 ];
+
+/// Kind of compendium entries: what the player has learned
+/// ([`crate::knowledge`]). Sealed: the director can't create, change,
+/// relate, move into or destroy one; only engine patches touch them.
+pub const KNOWLEDGE_KIND: &str = "knowledge";
 
 /// Marker prop: `acts: true` moves, speaks or acts on its own. NPCs are
 /// the entities carrying it, and it may hold things.
@@ -851,7 +857,12 @@ fn apply_ops(tx: &Transaction, patch: &Patch, by: Authority) -> rusqlite::Result
         macro_rules! resolve {
             ($r:expr) => {
                 match resolve(tx, &handles, $r)? {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        if guarded && is_sealed(tx, id)? {
+                            return reject(sealed_reason($r));
+                        }
+                        id
+                    }
                     Err(reason) => return reject(reason),
                 }
             };
@@ -1120,6 +1131,21 @@ fn bad_rel_name(rel: &str, guarded: bool) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Whether `id` is engine-sealed: director ops can't touch it at all.
+fn is_sealed(tx: &Transaction, id: EntityId) -> rusqlite::Result<bool> {
+    let kind: String = tx.query_row("SELECT kind FROM entities WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })?;
+    Ok(kind == KNOWLEDGE_KIND)
+}
+
+fn sealed_reason(r: &EntityRef) -> String {
+    format!(
+        "{r} is a compendium entry (what the player has learned); only the engine changes \
+         those"
+    )
 }
 
 fn reserved_kind_reason(kind: &str) -> String {

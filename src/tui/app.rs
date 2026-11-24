@@ -2192,6 +2192,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_compendium_opens_in_the_panel_as_plain_mode_prints_it() {
+        let mut app = app();
+        let plain = |arg: &str| {
+            crate::commands::report(&app.view, ":compendium", arg)
+                .unwrap()
+                .unwrap()
+        };
+        let (overview, chapel) = (plain(""), plain("drowned"));
+        assert!(overview.contains("Drowned Chapel (place)"), "{overview}");
+        typed(&mut app, ":compendium");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().text, overview);
+        typed(&mut app, ":compendium drowned");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.panel.last().unwrap().text, chapel);
+        assert!(app.outbox.is_empty(), "reading it sends nothing to the game");
+    }
+
+    #[test]
     fn ctrl_l_opens_the_log_and_reserved_keys_explain_themselves() {
         let mut app = app();
         app.on_key(ctrl('l'));

@@ -36,9 +36,9 @@ loam x.db                     # resume (or pick a seed if the save is new)
 On a terminal loam opens a full-screen interface: the story, a status bar
 (game time, room, model, what this session has cost), the input line and a
 hint bar listing the keys that work right now. `:help` lists the inspector
-commands (`:rules`, `:quests`, `:stats`, `:why`, `:log`, …); they open in a
-side panel (Ctrl-P toggles it), so you can browse while a turn is still
-being written. Tab moves between the input, the story and the panel, Esc goes
+commands (`:compendium`, `:rules`, `:quests`, `:stats`, `:why`, `:log`, …);
+they open in a side panel (Ctrl-P toggles it), so you can browse while a turn
+is still being written. Tab moves between the input, the story and the panel, Esc goes
 back, and `?` shows every key. The mouse wheel scrolls and a click focuses;
 `:mouse off` or `LOAM_MOUSE=0` gives you back the terminal's own text
 selection.

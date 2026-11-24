@@ -216,9 +216,21 @@ fn opening_generates_the_first_room_and_narrates() {
     assert_eq!(room.kind, ROOM_KIND);
     assert_eq!(room.props["region"], json!("Saltmarsh"));
     let events = game.world().events().unwrap();
-    let last = events.last().unwrap();
-    assert_eq!(last.kind, EventKind::Narration);
-    assert_eq!(last.payload["text"], json!("You wake in a flooded chapel."));
+    let [.., narration, last] = events.as_slice() else {
+        panic!("too few events")
+    };
+    assert_eq!(narration.kind, EventKind::Narration);
+    assert_eq!(
+        narration.payload["text"],
+        json!("You wake in a flooded chapel.")
+    );
+    // Then the engine remembers the place the narration showed.
+    assert_eq!(last.kind, EventKind::Patch);
+    assert_eq!(last.payload["by"], json!("engine"));
+    assert_eq!(
+        crate::knowledge::entries(game.world()).unwrap()[0].first_seen,
+        narration.seq
+    );
     // Tool calls are logged.
     assert!(events.iter().any(|e| e.kind == EventKind::ToolCall
         && e.payload["name"] == json!("create_room")

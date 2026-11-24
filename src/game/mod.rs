@@ -23,6 +23,7 @@ pub use tools::Phase;
 use serde_json::{Value, json};
 
 use crate::inventory::{DEFAULT_SLOTS, Inventory};
+use crate::knowledge;
 use crate::llm::ToolUse;
 use crate::llm::{
     BrainClient, Brains, LlmClient, LlmError, Message, RecordingClient, Request, StopReason,
@@ -137,6 +138,9 @@ struct Turn<'a> {
     estimate: Option<Bucket>,
     /// The minutes of the rule the fast path applied.
     rule_minutes: Option<u32>,
+    /// Where the player was when the turn began (nowhere before the
+    /// opening).
+    start_room: Option<EntityId>,
 }
 
 /// A game session over a world store.
@@ -317,6 +321,7 @@ impl Game {
             input: None,
             estimate: None,
             rule_minutes: None,
+            start_room: player_room(&self.world)?,
         };
         self.director_turn(client, &slice, OPENING, turn, on_text)
     }
@@ -362,6 +367,7 @@ impl Game {
             input: Some(input),
             estimate: None,
             rule_minutes: None,
+            start_room: player_room(&self.world)?,
         };
 
         let mut note = String::new();
@@ -458,6 +464,7 @@ impl Game {
                 input: Some(input),
                 estimate: None,
                 rule_minutes: None,
+                start_room: player_room(&game.world)?,
             };
             game.run_director(client, &prompt.system, &prompt.message, turn, on_text)
         })
@@ -510,8 +517,10 @@ impl Game {
         turn: Turn,
     ) -> Result<TurnOutcome, GameError> {
         let narration = response.text().trim().to_owned();
-        self.world
+        let narrated = self
+            .world
             .log_event(EventKind::Narration, &json!({"text": narration}))?;
+        self.remember_encounters(&turn, narrated, &narration)?;
         // Every turn spends world time; the opening scene doesn't.
         if turn.input.is_some() {
             let calls = self.tool_calls_since(turn.start)?;
@@ -533,6 +542,30 @@ impl Game {
             judgments,
             fast_path: None,
         })
+    }
+
+    /// Remember the place the player ended the turn in, when the turn
+    /// brought them there (the opening scene, or a move), citing the turn's
+    /// narration. Nothing is remembered without narration to cite.
+    fn remember_encounters(
+        &mut self,
+        turn: &Turn,
+        narrated: i64,
+        narration: &str,
+    ) -> Result<(), StoreError> {
+        if narration.is_empty() {
+            return Ok(());
+        }
+        let Some(room) = player_room(&self.world)? else {
+            return Ok(());
+        };
+        if Some(room) == turn.start_room {
+            return Ok(());
+        }
+        // A refusal (no room, bad source) leaves the compendium as it was:
+        // the turn itself still stands.
+        let _ = knowledge::record_place(&mut self.world, room, turn.start_room, narrated)?;
+        Ok(())
     }
 
     /// Tool calls the director made that succeeded, since `after`, as
@@ -757,6 +790,11 @@ pub(crate) fn scope(world: &World) -> Result<Option<Scope>, StoreError> {
         .entity(player)?
         .and_then(|p| p.location)
         .map(|room| Scope { player, room }))
+}
+
+/// The room the player is in, once they are somewhere.
+fn player_room(world: &World) -> Result<Option<EntityId>, StoreError> {
+    Ok(scope(world)?.map(|s| s.room))
 }
 
 /// The player entity, if created.

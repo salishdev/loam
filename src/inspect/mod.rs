@@ -481,7 +481,14 @@ fn find(world: &World, query: &str) -> Result<Found, StoreError> {
         return Ok(Found::One(id));
     }
     let q = query.to_lowercase();
-    let entities = world.state()?.entities;
+    // Compendium entries carry the names of what they describe; they are
+    // read through :compendium, not matched here.
+    let entities: Vec<Entity> = world
+        .state()?
+        .entities
+        .into_iter()
+        .filter(|e| e.kind != crate::world::KNOWLEDGE_KIND)
+        .collect();
     let pick = |matches: Vec<&Entity>| match matches.len() {
         0 => None,
         1 => Some(Found::One(matches[0].id)),

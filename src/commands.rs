@@ -16,6 +16,7 @@ pub const COMMANDS: &[&str] = &[
     ":adopt",
     ":brain",
     ":branches",
+    ":compendium",
     ":context",
     ":explain",
     ":fork",
@@ -44,7 +45,8 @@ pub const COMMANDS: &[&str] = &[
 ];
 
 /// The command list `:help` prints.
-pub const HELP: &str = "Commands: :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
+pub const HELP: &str = "Commands: :compendium [places | <name> | search <text>] (what \
+you have learned), :rules, :glossary, :why <#id|name>, :relations <#id|name>, \
 :quests, :npcs, :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
 :log #<event>, :tick, :quit
 
@@ -83,6 +85,7 @@ pub fn split(input: &str) -> (&str, &str) {
 /// save is still usable.
 pub fn report(world: &World, cmd: &str, arg: &str) -> Option<Result<String, String>> {
     let result = match cmd {
+        ":compendium" => crate::knowledge::compendium(world, arg),
         ":rules" => inspect::rules(world),
         ":glossary" => inspect::glossary(world),
         ":why" => inspect::why(world, arg),
