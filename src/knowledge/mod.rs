@@ -234,15 +234,17 @@ impl Entry {
         }
     }
 
-    /// Whether `needle` (lowercase) occurs in the entry's name, summary or
-    /// facts.
+    /// Whether `needle` (lowercase) occurs in the entry's name, summary,
+    /// facts or who claimed them.
     fn mentions(&self, needle: &str) -> bool {
         self.name.to_lowercase().contains(needle)
             || self.summary.to_lowercase().contains(needle)
-            || self
-                .facts
-                .iter()
-                .any(|f| f.text.to_lowercase().contains(needle))
+            || self.facts.iter().any(|f| {
+                f.text.to_lowercase().contains(needle)
+                    || f.claimed_by
+                        .as_ref()
+                        .is_some_and(|c| c.to_lowercase().contains(needle))
+            })
     }
 }
 
@@ -402,6 +404,10 @@ pub(crate) fn record_place(
 
     let (ops, created) = match about(world, Category::Place, room)? {
         Some((id, mut r)) => {
+            if r.encounters == 0 {
+                // Known by mention until now: this is its first sighting.
+                r.first_seen = source;
+            }
             r.summary = description;
             r.summary_source = source;
             r.last_seen = source;
@@ -534,10 +540,11 @@ const MIN_EXCERPT_WORDS: usize = 3;
 const MAX_EXCERPT_CHARS: usize = 400;
 
 /// Text compared for an excerpt: lowercase, straight quotes and dashes,
-/// single spaces.
+/// no emphasis markers, single spaces.
 fn normalize(s: &str) -> String {
     let s: String = s
         .chars()
+        .filter(|&c| c != '*' && c != '_')
         .map(|c| match c {
             '‘' | '’' => '\'',
             '“' | '”' => '"',
@@ -568,7 +575,7 @@ fn check_excerpt(world: &World, seq: i64, excerpt: &str) -> Result<Result<(), St
     }
     let event = world.event(seq)?.expect("checked above");
     let text = normalize(event.payload["text"].as_str().unwrap_or_default());
-    if text.contains(&normalize_excerpt(excerpt)) {
+    if contains_words(&text, &normalize_excerpt(excerpt)) {
         Ok(Ok(()))
     } else {
         Ok(Err(format!(
@@ -577,13 +584,20 @@ fn check_excerpt(world: &World, seq: i64, excerpt: &str) -> Result<Result<(), St
     }
 }
 
-/// `s` cut to at most `n` characters, with an ellipsis when cut.
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_owned()
-    } else {
-        format!("{}…", s.chars().take(n).collect::<String>())
+/// Whether `needle` occurs in `text` starting and ending on word
+/// boundaries (so "nk ties" doesn't match inside "monk ties").
+fn contains_words(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
     }
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    text.match_indices(needle).any(|(i, m)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + m.len()..].chars().next();
+        let first = m.chars().next();
+        let last = m.chars().next_back();
+        !(word(before) && word(first)) && !(word(after) && word(last))
+    })
 }
 
 /// What a discovery adds to.
@@ -595,12 +609,12 @@ enum Target {
 /// Check a discovery against the store, citing `current` for facts with no
 /// source of their own. With `current` `None` (staging, before the turn's
 /// narration exists), those facts' excerpts are left unchecked. `pending`
-/// are new entries already staged this turn, as (category, name).
+/// are the discoveries already staged this turn.
 pub(crate) fn check(
     world: &World,
     d: &Discovery,
     current: Option<i64>,
-    pending: &[(Category, String)],
+    pending: &[Discovery],
 ) -> Result<Result<(), String>, StoreError> {
     Ok(resolve(world, d, current, pending)?.map(|_| ()))
 }
@@ -609,7 +623,7 @@ fn resolve(
     world: &World,
     d: &Discovery,
     current: Option<i64>,
-    pending: &[(Category, String)],
+    pending: &[Discovery],
 ) -> Result<Result<Target, String>, StoreError> {
     macro_rules! refuse {
         ($($t:tt)*) => { return Ok(Err(format!($($t)*))) };
@@ -638,12 +652,16 @@ fn resolve(
                         .facts
                         .first()
                         .map_or(e.summary.as_str(), |f| f.text.as_str());
-                    format!("#{} ({})", e.id, clip(gist, 80))
+                    format!("#{} ({})", e.id, crate::xray::clip(gist, 80))
                 })
                 .collect();
-            let staged = pending
-                .iter()
-                .any(|(c, n)| *c == category && n.eq_ignore_ascii_case(name));
+            let staged = pending.iter().any(|p| {
+                p.entry.is_none()
+                    && p.category == Some(category)
+                    && p.name
+                        .as_deref()
+                        .is_some_and(|n| n.trim().eq_ignore_ascii_case(name))
+            });
             if !d.distinct && (!same.is_empty() || staged) {
                 let known = if same.is_empty() {
                     "already being recorded this turn".to_owned()
@@ -691,6 +709,21 @@ fn resolve(
         {
             refuse!("entry #{other} is already about #{s}: add to it with entry");
         }
+        // Another call this turn already records this entity elsewhere:
+        // only one of them could be kept.
+        for p in pending.iter().filter(|p| p.subject == Some(s)) {
+            let same_entry = own.is_some() && p.entry == own;
+            let p_category = match p.entry {
+                Some(id) => world.get::<Record>(id)?.map(|r| r.category),
+                None => p.category,
+            };
+            if !same_entry && p_category == Some(category) {
+                refuse!(
+                    "another learn call this turn already records #{s}; give all its facts \
+                     in that one call"
+                );
+            }
+        }
     }
 
     if d.facts.is_empty() {
@@ -730,6 +763,24 @@ fn resolve(
         }
     }
     Ok(Ok(target))
+}
+
+/// `d` with only the facts whose excerpts their narration contains
+/// (citing `current` where they give no source), or `None` when no fact
+/// is left.
+pub(crate) fn supported(
+    world: &World,
+    d: &Discovery,
+    current: i64,
+) -> Result<Option<Discovery>, StoreError> {
+    let mut kept = d.clone();
+    kept.facts.clear();
+    for f in &d.facts {
+        if check_excerpt(world, f.source.unwrap_or(current), &f.excerpt)?.is_ok() {
+            kept.facts.push(f.clone());
+        }
+    }
+    Ok((!kept.facts.is_empty()).then_some(kept))
 }
 
 /// Remember `d`, citing narration event `current` for facts that give no

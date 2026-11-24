@@ -534,19 +534,17 @@ impl Game {
         }
         let judgments =
             quest::judge_turn(&mut self.world, client, turn.start, turn.input, &narration)?;
-        // Last, so the turn's time, verdicts and rule changes follow its
-        // narration directly (the X-ray reads them there).
-        self.remember_encounters(&turn, narrated, &narration)?;
+        // Knowledge last, so the turn's time, verdicts and rule changes
+        // follow its narration directly (the X-ray reads them there).
         // What the director staged with `learn`, now that the narration it
         // cites exists. Only a turn that ended normally and narrated
-        // something commits any.
-        let ended = response
-            .stop_reason
-            .as_ref()
-            .is_none_or(|r| *r == StopReason::EndTurn);
+        // something commits any. Before the encounter, so a place learned
+        // about this turn is the entry the encounter then updates.
+        let ended = response.stop_reason == Some(StopReason::EndTurn);
         if ended && !narration.is_empty() {
             knowledge::tools::commit_turn(&mut self.world, turn.start, narrated)?;
         }
+        self.remember_encounters(&turn, narrated, &narration)?;
         Ok(TurnOutcome {
             narration,
             stop_reason: response

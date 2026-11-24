@@ -9,13 +9,14 @@
 
 use serde_json::{Value, json};
 
-use super::{Category, Discovery, check, learn};
+use super::{Category, Discovery, check, learn, supported};
 use crate::llm::{ToolDefinition, ToolOutput, ToolUse};
-use crate::world::{EntityId, EventKind, StoreError, World};
+use crate::world::{EventKind, StoreError, World};
 
 /// The tool's name.
 pub const LEARN: &str = "learn";
 
+/// The `learn` tool, offered on director turns (never in ticks).
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     let category = json!({
         "type": "string",
@@ -29,7 +30,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
          claimed_by; a rumour stays a claim, never fact). Add nothing the narration doesn't \
          say. Each fact quotes an excerpt: words your final narration will include word for \
          word (or, with source, words of an earlier narration event). A fact whose excerpt \
-         isn't narrated is dropped. Places the player enters are remembered without this. A \
+         isn't narrated is dropped. Places the player enters are remembered without this; to add \
+         to one, give its room as subject. A \
          subject merely mentioned needs no world entity: don't create one to learn about it. \
          Name and category start an entry; if one of that name is already known, the tool \
          refuses and lists it with its id: then add to it with entry, or pass distinct: true \
@@ -76,7 +78,7 @@ fn stage(world: &World, input: &Value) -> Result<ToolOutput, StoreError> {
         Ok(d) => d,
         Err(e) => return Ok(ToolOutput::Err(format!("bad input for {LEARN}: {e}"))),
     };
-    let pending = staged_names(world)?;
+    let pending = staged_this_turn(world)?;
     if let Err(why) = check(world, &d, None, &pending)? {
         return Ok(ToolOutput::Err(why));
     }
@@ -105,31 +107,25 @@ fn staged_since(world: &World, after: i64) -> Result<Vec<Discovery>, StoreError>
         .collect())
 }
 
-/// New entries already staged this turn (since the last narration), as
-/// (category, name).
-fn staged_names(world: &World) -> Result<Vec<(Category, String)>, StoreError> {
-    let after = world.last_event(EventKind::Narration)?.map_or(0, |e| e.seq);
-    Ok(staged_since(world, after)?
-        .into_iter()
-        .filter(|d| d.entry.is_none())
-        .filter_map(|d| Some((d.category?, d.name?)))
-        .collect())
+/// The discoveries already staged this turn: since its input (or, for the
+/// opening scene, since the last narration), so a failed turn's calls
+/// don't count.
+fn staged_this_turn(world: &World) -> Result<Vec<Discovery>, StoreError> {
+    let input = world.last_event(EventKind::Input)?.map_or(0, |e| e.seq);
+    let narration = world.last_event(EventKind::Narration)?.map_or(0, |e| e.seq);
+    staged_since(world, input.max(narration))
 }
 
 /// Write the discoveries staged since event `after`, citing `narration`
-/// (the turn's narration event) where they cite this turn. Each is written
-/// on its own, so a refused one leaves the others, and everything known
-/// before, as it was. Returns the entries written.
-pub(crate) fn commit_turn(
-    world: &mut World,
-    after: i64,
-    narration: i64,
-) -> Result<Vec<EntityId>, StoreError> {
-    let mut written = Vec::new();
+/// (the turn's narration event) where they cite this turn. A fact whose
+/// excerpt isn't narrated is dropped; each discovery is written on its own,
+/// so a refused one leaves the others, and everything known before, as it
+/// was.
+pub(crate) fn commit_turn(world: &mut World, after: i64, narration: i64) -> Result<(), StoreError> {
     for d in staged_since(world, after)? {
-        if let Ok(id) = learn(world, &d, Some(narration))? {
-            written.push(id);
+        if let Some(d) = supported(world, &d, narration)? {
+            let _ = learn(world, &d, Some(narration))?;
         }
     }
-    Ok(written)
+    Ok(())
 }

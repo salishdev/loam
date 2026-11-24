@@ -560,3 +560,120 @@ fn director_patches_and_ticks_cannot_write_knowledge() {
     }
     assert_eq!(entries(game.world()).unwrap(), known);
 }
+
+#[test]
+fn only_the_unnarrated_fact_is_dropped() {
+    let (mut game, client) = begun();
+    learning_turn(
+        &mut game,
+        &client,
+        &[
+            json!({"name": "Brother Ash", "category": "person", "facts": [
+                {"text": "A gaunt monk.", "excerpt": "A gaunt monk ties off"},
+                {"text": "Limps.", "excerpt": "Ash limps toward the door"}
+            ]}),
+        ],
+        ASH_NARRATION,
+    );
+    let ash = one(game.world(), "Brother Ash");
+    assert_eq!(ash.facts.len(), 1);
+    assert_eq!(ash.facts[0].text, "A gaunt monk.");
+}
+
+#[test]
+fn a_failed_turns_staged_calls_do_not_block_the_next_turn() {
+    let (mut game, client) = begun();
+    client.push(learn_call(ash_and_the_bell()[0].clone()));
+    assert!(game.turn(&client, "listen", &mut |_| {}).is_err());
+    let calls = client.requests().len();
+    learning_turn(&mut game, &client, &ash_and_the_bell()[..1], ASH_NARRATION);
+    let results = tool_results(&client, client.requests().len() - calls);
+    assert!(!results[0].1, "{results:?}");
+    assert_eq!(names(game.world()), ["Drowned Chapel", "Brother Ash"]);
+}
+
+#[test]
+fn two_calls_about_one_entity_in_a_turn_are_refused_when_staged() {
+    let (mut game, client) = begun();
+    let altar = game
+        .world()
+        .contents(Some(super::player_room(&game)))
+        .unwrap()
+        .into_iter()
+        .find(|&id| game.world().entity(id).unwrap().unwrap().name == "altar")
+        .unwrap();
+    let calls = client.requests().len();
+    learning_turn(
+        &mut game,
+        &client,
+        &[
+            json!({"name": "Old altar", "category": "item", "subject": altar, "facts": [
+                {"text": "Dark stone.", "excerpt": "the altar is dark stone"}]}),
+            json!({"name": "Stone table", "category": "item", "subject": altar, "facts": [
+                {"text": "Wet.", "excerpt": "the altar is dark stone"}]}),
+        ],
+        "You see the altar is dark stone.",
+    );
+    let results = tool_results(&client, client.requests().len() - calls);
+    assert!(!results[0].1, "{results:?}");
+    assert!(
+        results[1].1 && results[1].0.contains("already records"),
+        "{results:?}"
+    );
+    assert_eq!(names(game.world()), ["Drowned Chapel", "Old altar"]);
+}
+
+#[test]
+fn learning_about_the_room_entered_this_turn_joins_its_encounter() {
+    let (mut game, client) = begun();
+    let chapel = super::player_room(&game);
+    // The tower is the stub room behind the chapel's north exit.
+    let tower = game
+        .world()
+        .relations_from(chapel, Some(crate::world::EXIT_REL))
+        .unwrap()[0]
+        .object;
+    client.push(learn_call(
+        json!({"name": "Bell Tower", "category": "place", "subject": tower,
+        "facts": [{"text": "Its bell is gone.", "excerpt": "the bell is gone"}]}),
+    ));
+    client.push(tower_room());
+    client.push(Response::canned_text("You climb in; the bell is gone."));
+    game.turn(&client, "go north", &mut |_| {}).unwrap();
+    let world = game.world();
+    assert_eq!(names(world), ["Drowned Chapel", "Bell Tower"]);
+    let entry = one(world, "Bell Tower");
+    let narration = world.last_event(EventKind::Narration).unwrap().unwrap().seq;
+    assert_eq!(entry.encounters, 1);
+    assert_eq!(entry.first_seen, narration);
+    assert_eq!(entry.summary, "A leaning tower.");
+    assert!(entry.facts.iter().any(|f| f.text == "Its bell is gone."));
+}
+
+#[test]
+fn an_excerpt_must_match_whole_words_and_ignores_emphasis() {
+    let (mut game, _client) = begun();
+    let world = game.world_mut();
+    let seq = world
+        .log_event(
+            EventKind::Narration,
+            &json!({"text": "The monk *whispers* the old name."}),
+        )
+        .unwrap();
+    let ash: Discovery = serde_json::from_value(json!({"name": "Ash", "category": "person",
+        "facts": [{"text": "Whispers.", "excerpt": "whispers the old name", "source": seq}]}))
+    .unwrap();
+    assert!(learn(world, &ash, None).unwrap().is_ok());
+    let partial: Discovery = serde_json::from_value(json!({"name": "Mon", "category": "person",
+        "facts": [{"text": "x", "excerpt": "nk whispers the", "source": seq}]}))
+    .unwrap();
+    assert!(learn(world, &partial, None).unwrap().is_err());
+}
+
+#[test]
+fn search_finds_who_made_a_claim() {
+    let (mut game, client) = begun();
+    learning_turn(&mut game, &client, &ash_and_the_bell(), ASH_NARRATION);
+    let hits = compendium(game.world(), "search ash");
+    assert!(hits.contains("The drowned bell (lore)"), "{hits}");
+}
