@@ -8,7 +8,9 @@ use crate::world::{StoreError, World};
 pub struct Link {
     /// Unwrapped text line to highlight.
     pub line: usize,
-    /// An exact compendium argument, interpreted in this view's mode.
+    /// Report command to open for this target.
+    pub cmd: &'static str,
+    /// An exact report argument, interpreted in this view's mode.
     pub arg: String,
 }
 
@@ -22,8 +24,13 @@ pub struct Page {
 
 impl Page {
     fn link(&mut self, label: &str, arg: String) {
+        self.link_to(label, ":compendium", arg);
+    }
+
+    pub(crate) fn link_to(&mut self, label: &str, cmd: &'static str, arg: String) {
         self.links.push(Link {
             line: self.text.lines().count(),
+            cmd,
             arg,
         });
         self.text.push_str(label);
@@ -155,6 +162,7 @@ fn player_detail(world: &World, e: &Entry) -> Result<Page, StoreError> {
     };
     page.text.push_str("\n\nRelated entries\n");
     let mut related: Vec<_> = e.facts.iter().filter_map(|f| f.claimant).collect();
+    related.extend(e.facts.iter().flat_map(|f| f.related.iter().copied()));
     related.extend(e.seen_at);
     related.sort_unstable();
     related.dedup();

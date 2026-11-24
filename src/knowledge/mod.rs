@@ -36,13 +36,14 @@
 //! supersedes it.
 
 pub mod browser;
+pub mod quests;
 pub mod reconstruct;
 mod report;
 pub(crate) mod tools;
 mod truth;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use report::{compendium, compendium_in, learned_rules, learned_terms, resolve_mode};
 pub use truth::{
@@ -135,6 +136,9 @@ pub struct Fact {
     /// The entry for whoever made the claim, when one was named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimant: Option<EntityId>,
+    /// Known entries explicitly related by this narrated fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<EntityId>,
     /// Player-visible events supporting it, oldest first.
     pub sources: Vec<Source>,
     /// Earlier facts of the same entry this one corrects, by number
@@ -735,6 +739,7 @@ fn add_fact(facts: &mut Vec<Fact>, text: String, source: i64) {
             kind: FactKind::Observed,
             claimed_by: None,
             claimant: None,
+            related: Vec::new(),
             sources: vec![Source::event(source)],
             supersedes: Vec::new(),
             rule_version: None,
@@ -757,6 +762,11 @@ fn merge_fact(facts: &mut Vec<Fact>, fact: Fact) {
             }
             if f.claimant.is_none() {
                 f.claimant = fact.claimant;
+            }
+            for id in fact.related {
+                if !f.related.contains(&id) {
+                    f.related.push(id);
+                }
             }
             for n in fact.supersedes {
                 if !f.supersedes.contains(&n) {
@@ -840,6 +850,9 @@ pub struct NewFact {
     /// The entry for whoever said it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimant: Option<EntityId>,
+    /// Known entries explicitly related by this narrated fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<EntityId>,
     /// Earlier facts of the entry that this one corrects, by number.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<usize>,
@@ -1002,11 +1015,16 @@ fn resolve(
     };
 
     if let Some(s) = d.subject {
+        let category = match &target {
+            Target::Existing(_, r) => r.category,
+            Target::New { category, .. } => *category,
+        };
         match world.entity(s)? {
             None => refuse!("subject #{s} does not exist"),
             Some(e) if world::is_entry(&e) => {
                 refuse!("subject #{s} is a compendium entry, not a world entity")
             }
+            Some(e) if e.kind == crate::quest::QUEST_KIND && category == Category::Lore => {}
             Some(e) if e.kind != ROOM_KIND && world::RESERVED_KINDS.contains(&e.kind.as_str()) => {
                 refuse!("subject #{s} is engine state, not something to learn about")
             }
@@ -1101,6 +1119,11 @@ fn resolve(
             && world.get::<Record>(c)?.is_none()
         {
             refuse!("claimant #{c} is not a compendium entry");
+        }
+        for &id in &f.related {
+            if world.get::<Record>(id)?.is_none() {
+                refuse!("related #{id} is not a compendium entry");
+            }
         }
         // With no source and no `current`, the fact cites this turn's
         // narration, still to come: checked when it is committed.
@@ -1283,6 +1306,7 @@ fn write_discovery(
                 },
                 claimed_by: f.claimed_by.as_ref().map(|c| c.trim().to_owned()),
                 claimant: f.claimant,
+                related: f.related.clone(),
                 sources: vec![Source {
                     event: f.source.or(current).expect("checked above"),
                     excerpt: Some(f.excerpt.trim().to_owned()),

@@ -47,7 +47,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
          or term (a glossary term) when one does, and state only what the narration shows, \
          never the rule's hidden conditions or effects; when a known mechanic turns out to \
          work differently, supersede the old fact (amend_rule and retire_rule list what the \
-         player learned about a rule).",
+         player learned about a rule). For a quest, use category lore and subject equal to \
+         the quest id. Give it a player-known name and record its narrated hook or goal, \
+         developments, stakes, urgency, deadlines and outcome as facts. Never copy private \
+         judge reasons or undisclosed pressure timing/consequences. Record an exact deadline \
+         only if the narration establishes it. facts.related lists known entry ids whose \
+         relationship this fact reveals; never infer links from engine concerns.",
             json!({
                 "type": "object",
                 "properties": {
@@ -68,6 +73,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                                 "source": {"type": "integer", "description": "An earlier narration event the excerpt is from; omit for this turn's narration."},
                                 "claimed_by": {"type": "string", "description": "Who said it, for a claim or rumour."},
                                 "claimant": {"type": "integer", "description": "The entry for whoever said it, when known."},
+                                "related": {"type": "array", "items": {"type": "integer"}, "description": "Known compendium entry ids whose relationship is stated in this fact, not raw world ids."},
                                 "supersedes": {"type": "array", "items": {"type": "integer"}, "description": "Numbers of the entry's earlier facts this one corrects (see recall)."}
                             },
                             "required": ["text", "excerpt"]

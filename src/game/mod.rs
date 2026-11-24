@@ -82,7 +82,10 @@ refuses, adapt; an impossible action is narrated as a non-change. What anyone ca
 changes only through the inventory tools (take, drop, give, equip, unequip, transfer). \
 You are also the drama manager: when play suggests a quest, spawn_quest; once its goal is \
 clear to the player, reveal_goal with the entities it concerns; escalate_quest to raise the \
-stakes. A judge decides when a quest is done. Give the world momentum with pressures: \
+stakes. Also learn a lore entry with subject equal to the quest id, recording only the \
+player-visible hook/goal, developments, disclosed stakes/deadlines and outcome with narrated \
+evidence; facts.related names known compendium entries whose relationship is revealed. \
+Never copy private quest or pressure fields into knowledge. A judge decides when a quest is done. Give the world momentum with pressures: \
 start_pressure for something that will happen unless someone acts, adjust_pressure when the \
 player (or the world) delays or hastens it, resolve_pressure once it happens or is defused. \
 When one is overdue, advance it in the story or resolve it; never use one to refuse an action. The engine remembers rulings as rules and replays them without you: when you rule on an \

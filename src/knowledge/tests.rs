@@ -66,6 +66,7 @@ mod encounters;
 mod learned;
 mod mechanics;
 mod modes;
+pub(crate) mod quests;
 
 #[test]
 fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sources() {
@@ -93,6 +94,7 @@ fn the_opening_and_a_room_entry_make_readable_place_entries_with_narration_sourc
             kind: FactKind::Observed,
             claimed_by: None,
             claimant: None,
+            related: Vec::new(),
             sources: vec![Source::event(tower.first_seen)],
             supersedes: Vec::new(),
             rule_version: None,

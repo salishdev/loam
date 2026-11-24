@@ -175,6 +175,7 @@ fn switching_saves_discards_player_history_and_in_progress_search_too() {
     drop(world);
     let mut app = App::new(World::open_read_only(&main).unwrap(), true);
     command(&mut app, ":compendium drowned");
+    command(&mut app, ":quests world history");
     app.on_key(key(KeyCode::Char('/')));
     typed(&mut app, "Drowned Chapel");
     app.switch_to(other);
@@ -319,4 +320,146 @@ fn switching_saves_clears_world_search_without_any_world_view_to_drop() {
     assert_eq!(app.outbox, [Command::Switch(other)]);
     drop(app);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn quest_lists_details_links_search_and_toggle_use_the_browser() {
+    let mut app = app();
+    let ids = crate::knowledge::tests::quests::populate(&mut app.view);
+    command(&mut app, ":quests");
+    assert_eq!(selected(&app), Some(format!("#{}", ids[0])));
+    app.on_key(key(KeyCode::Down));
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.panel.last().unwrap().cmd, ":quests");
+    assert!(
+        app.panel
+            .last()
+            .unwrap()
+            .text
+            .contains("Goal: Bring the bell home.")
+    );
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(selected(&app), Some(format!("#{}", ids[1])));
+    app.on_key(key(KeyCode::Char('/')));
+    typed(&mut app, "nightfall");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.panel.last().unwrap().cmd, ":quests");
+    assert!(
+        app.panel
+            .last()
+            .unwrap()
+            .text
+            .contains("Bring the bell home 3")
+    );
+    command(&mut app, &format!(":quests world #{}", ids[1]));
+    assert!(
+        app.panel
+            .last()
+            .unwrap()
+            .text
+            .contains("Hidden village destruction")
+    );
+    app.on_key(key(KeyCode::Char('m')));
+    assert_eq!(app.mode, Mode::Player);
+    assert_eq!(app.panel.last().unwrap().cmd, ":quests");
+    assert!(!format!("{:?}", app.panel).contains("Hidden"));
+    assert!(app.search.is_none() && app.last_search.is_none());
+    app.on_key(key(KeyCode::Esc));
+    assert!(!app.panel_open, "hidden history cannot be restored");
+    assert!(app.outbox.is_empty());
+}
+
+#[test]
+fn quests_refresh_after_ticks_and_render_in_panel_and_overlay() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for (width, height) in [(140, 40), (80, 24)] {
+        let mut app = app();
+        let ids = crate::knowledge::tests::quests::populate(&mut app.view);
+        for arg in [
+            "ongoing".to_string(),
+            "history".to_string(),
+            format!("#{}", ids[1]),
+        ] {
+            command(&mut app, &format!(":quests {arg}"));
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| crate::tui::view::draw(f, &mut app)).unwrap();
+            let text = format!("{}", term.backend());
+            assert_eq!(app.areas.story.is_none(), width == 80);
+            assert!(text.contains("Player"));
+            assert!(text.contains("Bring the bell home"));
+            assert!(!text.contains("Hidden") && !text.contains("Private"));
+            if arg.starts_with('#') {
+                assert!(text.contains("before nightfall"));
+            }
+        }
+        command(&mut app, ":quests");
+        let id = ids[0];
+        let mut state = app.view.entity(id).unwrap().unwrap().props["_quest"].clone();
+        state["status"] = serde_json::json!("complete");
+        app.view
+            .apply_engine_patch(&crate::world::Patch::new(vec![crate::world::Op::SetProp {
+                entity: id.into(),
+                key: "_quest".into(),
+                value: state,
+            }]))
+            .unwrap();
+        app.on_event(Event::TickDone {
+            forced: false,
+            outcome: Ok(crate::game::TickOutcome {
+                summary: String::new(),
+                changes: vec![],
+                calls: 0,
+            }),
+        });
+        assert!(
+            !app.panel
+                .last()
+                .unwrap()
+                .text
+                .contains("Bring the bell home 0")
+        );
+        assert_eq!(selected(&app), Some(format!("#{}", ids[1])));
+        command(&mut app, ":quests history");
+        assert!(
+            app.panel
+                .last()
+                .unwrap()
+                .text
+                .contains("Bring the bell home 0")
+        );
+    }
+}
+
+#[test]
+fn a_quest_related_entry_opens_the_compendium_and_back_returns_to_the_quest() {
+    use crate::knowledge::{Discovery, Found};
+    use serde_json::json;
+    let mut app = app();
+    let ids = crate::knowledge::tests::quests::populate(&mut app.view);
+    let Found::One(chapel) = crate::knowledge::find(&app.view, "Drowned Chapel").unwrap() else {
+        panic!()
+    };
+    let Found::One(account) = crate::knowledge::find(&app.view, "Bring the bell home 1").unwrap()
+    else {
+        panic!()
+    };
+    let source = app
+        .view
+        .log_event(
+            crate::world::EventKind::Narration,
+            &json!({"text": "The chapel shelters the bell."}),
+        )
+        .unwrap();
+    let d: Discovery = serde_json::from_value(json!({"entry": account.id, "facts": [{"text": "The chapel shelters the bell.", "excerpt": "The chapel shelters the bell", "source": source, "related": [chapel.id]}]})).unwrap();
+    crate::knowledge::learn(&mut app.view, &d, None)
+        .unwrap()
+        .unwrap();
+    command(&mut app, &format!(":quests #{}", ids[1]));
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.panel.last().unwrap().cmd, ":compendium");
+    assert_eq!(app.panel.last().unwrap().arg, format!("#{}", chapel.id));
+    app.on_key(key(KeyCode::Esc));
+    assert_eq!(app.panel.last().unwrap().cmd, ":quests");
+    assert_eq!(app.panel.last().unwrap().arg, format!("#{}", ids[1]));
+    assert!(app.outbox.is_empty());
 }

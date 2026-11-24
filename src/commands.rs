@@ -49,9 +49,9 @@ pub const COMMANDS: &[&str] = &[
 /// The command list `:help` prints.
 pub const HELP: &str = "Commands: :compendium [player|world] [<category> | <name|#entry> | \
 search <text>] (Player mode: what you have learned; World mode: the world as it is and the \
-hidden bible), :mode [player|world] (the compendium's mode; no argument toggles), :rules and \
+hidden bible), :mode [player|world] (the compendium and tracker's mode; no argument toggles), :rules and \
 :glossary (Mechanics: what you have learned, or in World mode the engine's), :why <#id|name>, \
-:relations <#id|name>, :quests, :npcs (:compendium people, in the compendium's mode), \
+:relations <#id|name>, :quests [player|world] [ongoing|history|<name|#quest>|search <text>], :npcs (:compendium people, in the compendium's mode), \
 :inventory (:i), :stats, :time, :pressures, :log [count|all] [kind…] | \
 :log #<event>, :tick, :quit
 
@@ -132,7 +132,7 @@ pub fn report_in(
         ":rules" => crate::knowledge::learned_rules(world),
         ":glossary" => crate::knowledge::learned_terms(world),
         ":why" => inspect::why(world, arg),
-        ":quests" => inspect::quests(world),
+        ":quests" => crate::knowledge::quests::query(world, mode, arg).map(|p| p.text),
         // A shortcut into the compendium's People section.
         ":npcs" => crate::knowledge::compendium_in(world, mode, "people"),
         ":inventory" | ":i" => inspect::inventory(world),
@@ -152,7 +152,28 @@ pub fn report_in(
 
 /// Whether `cmd`'s report follows the session's Player/World mode.
 pub fn is_moded(cmd: &str) -> bool {
-    matches!(cmd, ":compendium" | ":npcs" | ":rules" | ":glossary")
+    matches!(
+        cmd,
+        ":compendium" | ":npcs" | ":rules" | ":glossary" | ":quests"
+    )
+}
+
+/// Shared selectable pages for reference commands, in the resolved mode.
+pub fn browser_query(
+    world: &World,
+    mode: Mode,
+    cmd: &str,
+    arg: &str,
+) -> Result<crate::knowledge::browser::Page, StoreError> {
+    if cmd == ":quests" {
+        return crate::knowledge::quests::query(world, mode, arg);
+    }
+    let arg = match cmd {
+        ":npcs" => "people",
+        ":rules" | ":glossary" => "mechanics",
+        _ => arg,
+    };
+    crate::knowledge::browser::query(world, mode, arg)
 }
 
 /// `:mode [player|world]`: the mode it asks for, from `current` (no

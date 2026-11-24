@@ -566,7 +566,7 @@ impl App {
                 .as_ref()
                 .and_then(|p| p.links.iter().find(|l| Some(l.line) == top.selected))
                 .map(|l| l.arg.clone());
-            let result = browser::query(&self.view, top.mode, browser_arg(&top.cmd, &top.arg));
+            let result = commands::browser_query(&self.view, top.mode, &top.cmd, &top.arg);
             if let Some(top) = self.panel.last_mut() {
                 match result {
                     Ok(page) => {
@@ -602,7 +602,7 @@ impl App {
     /// Push a view onto the panel and show it.
     pub fn open_view(&mut self, cmd: &str, arg: &str, text: String) {
         let browser = commands::is_moded(cmd)
-            .then(|| browser::query(&self.view, self.mode, browser_arg(cmd, arg)))
+            .then(|| commands::browser_query(&self.view, self.mode, cmd, arg))
             .transpose();
         let browser = match browser {
             Ok(page) => page,
@@ -1269,6 +1269,11 @@ impl App {
     /// projections, so reset browser history before any row can be activated.
     /// Unrelated workbench views keep their place in the back stack.
     fn set_mode(&mut self, mode: Mode, reopen: bool) {
+        let reopen_cmd = if self.panel.last().is_some_and(|v| v.cmd == ":quests") {
+            ":quests"
+        } else {
+            ":compendium"
+        };
         let moded_on_top = self.panel_open
             && self
                 .panel
@@ -1279,8 +1284,8 @@ impl App {
         }
         self.mode = mode;
         if reopen && moded_on_top {
-            if let Some(Ok(text)) = commands::report_in(&self.view, mode, ":compendium", "") {
-                self.open_view(":compendium", "", text);
+            if let Some(Ok(text)) = commands::report_in(&self.view, mode, reopen_cmd, "") {
+                self.open_view(reopen_cmd, "", text);
             }
             return;
         }
@@ -1753,7 +1758,8 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(link) = page.links.get(at) {
                     let arg = link.arg.clone();
-                    self.open_view(":compendium", &arg, String::new());
+                    let cmd = link.cmd;
+                    self.open_view(cmd, &arg, String::new());
                 }
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j')
@@ -1853,7 +1859,12 @@ impl App {
                     if pane == Focus::Panel
                         && self.panel.last().is_some_and(|v| v.browser.is_some())
                     {
-                        self.open_view(":compendium", &format!("search {query}"), String::new());
+                        let cmd = if self.panel.last().is_some_and(|v| v.cmd == ":quests") {
+                            ":quests"
+                        } else {
+                            ":compendium"
+                        };
+                        self.open_view(cmd, &format!("search {query}"), String::new());
                         return;
                     }
                     self.last_search = Some((pane, query));
@@ -2107,15 +2118,6 @@ impl App {
                              Tab focus · ? help"
                 .into(),
         }
-    }
-}
-
-/// Reference shortcuts enter the corresponding shared compendium section.
-fn browser_arg<'a>(cmd: &str, arg: &'a str) -> &'a str {
-    match cmd {
-        ":npcs" => "people",
-        ":rules" | ":glossary" => "mechanics",
-        _ => arg,
     }
 }
 

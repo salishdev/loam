@@ -10,7 +10,12 @@ fn learn_call(input: Value) -> Response {
 use serde_json::Value;
 
 /// Play a turn: each `learn` input in turn, then `narration`.
-fn learning_turn(game: &mut Game, client: &ScriptedClient, learns: &[Value], narration: &str) {
+pub(super) fn learning_turn(
+    game: &mut Game,
+    client: &ScriptedClient,
+    learns: &[Value],
+    narration: &str,
+) {
     for l in learns {
         client.push(learn_call(l.clone()));
     }
