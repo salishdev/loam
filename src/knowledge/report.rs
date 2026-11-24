@@ -11,7 +11,7 @@ use super::truth::{Mode, WorldFound, split_mode, world_find, world_report};
 use super::{Category, Entry, FactKind, Found, entries, entry, find, mechanics, search};
 use crate::world::{StoreError, World};
 
-pub(super) const USAGE: &str = "Usage: :compendium [player | world] [people | places | factions | items | lore | mechanics | <name|#entry> | search <text>]";
+pub(super) const USAGE: &str = "Usage: :compendium [player | world] [people | places | factions | items | lore | mechanics | <name|#entry> | search <text> | source #event]";
 const HINT: &str = ":compendium <name> shows an entry; :compendium search <text> searches.";
 
 /// `:compendium [player | world] [<category> | <name|#entry> | search
@@ -56,6 +56,9 @@ pub fn resolve_mode<'a>(
 /// `:compendium` in `mode`, with the argument taken as it is (no mode
 /// word: see [`resolve_mode`]).
 pub fn compendium_in(world: &World, mode: Mode, arg: &str) -> Result<String, StoreError> {
+    if let Some(source) = arg.trim().strip_prefix("source ") {
+        return browser_source(world, source);
+    }
     match mode {
         Mode::Player => player(world, arg),
         Mode::World => world_report(world, arg),
@@ -225,7 +228,7 @@ fn line(e: &Entry) -> String {
 }
 
 /// One entry in full, with the events that support it.
-fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
+pub(super) fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
     let mut out = format!("{} · {} · entry #{}\n", e.name, e.category.label(), e.id);
     let has_claims = e.facts.iter().any(|f| f.kind == FactKind::Claimed);
     if e.category == Category::Place && e.encounters > 0 {
@@ -325,4 +328,24 @@ fn detail(world: &World, e: &Entry) -> Result<String, StoreError> {
     )
     .unwrap();
     Ok(out)
+}
+
+fn browser_source(world: &World, source: &str) -> Result<String, StoreError> {
+    let id = source.trim().trim_start_matches('#').parse::<i64>().ok();
+    let cited = entries(world)?.iter().any(|e| {
+        super::browser::sources(e)
+            .into_iter()
+            .any(|n| Some(n) == id)
+    });
+    if cited
+        && let Some(id) = id
+        && let Some(event) = world.event(id)?
+        && event.kind == crate::world::EventKind::Narration
+    {
+        return Ok(format!(
+            "Narration #{id}\n\n{}",
+            event.payload["text"].as_str().unwrap_or_default()
+        ));
+    }
+    Ok("No learned entry cites that narration.".into())
 }

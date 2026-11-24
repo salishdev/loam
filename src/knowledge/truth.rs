@@ -610,7 +610,7 @@ fn world_line(e: &WorldEntry) -> String {
     )
 }
 
-fn world_detail(e: &WorldEntry) -> String {
+pub(super) fn world_detail(e: &WorldEntry) -> String {
     let mut out = format!(
         "{} · {} · {} · {} · World mode\n",
         e.name,

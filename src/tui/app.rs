@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use crate::branches::Branch;
 use crate::commands::{self, ContextReport, Notice, Recent, Status};
 use crate::explain::{self, Notes, Topic};
-use crate::knowledge::Mode;
+use crate::knowledge::{Mode, browser};
 use crate::llm::{Brains, TABLE_HEADER_LINES};
 use crate::reroll::{self, Head, VariantView, surgery};
 use crate::worker::{Command, Event};
@@ -63,6 +63,8 @@ pub struct PanelView {
     /// The compendium mode it was made in (what mode-aware reports, see
     /// [`commands::is_moded`], are read in).
     pub mode: Mode,
+    /// Selectable targets from the shared compendium projection.
+    pub browser: Option<browser::Page>,
 }
 
 /// The X-ray panel's state.
@@ -558,6 +560,38 @@ impl App {
             self.show_turn(seq);
             return;
         }
+        if top.browser.is_some() {
+            let target = top
+                .browser
+                .as_ref()
+                .and_then(|p| p.links.iter().find(|l| Some(l.line) == top.selected))
+                .map(|l| l.arg.clone());
+            let result = browser::query(&self.view, top.mode, browser_arg(&top.cmd, &top.arg));
+            if let Some(top) = self.panel.last_mut() {
+                match result {
+                    Ok(page) => {
+                        top.selected = target
+                            .and_then(|arg| page.links.iter().find(|l| l.arg == arg))
+                            .or(page.links.first())
+                            .map(|l| l.line);
+                        top.text = page.text.clone();
+                        top.browser = Some(page);
+                    }
+                    Err(e) => {
+                        top.text = format!("[compendium unavailable: {e}]");
+                        top.selected = None;
+                        top.browser = Some(browser::Page::default());
+                    }
+                }
+                top.scroll = top.scroll.min(
+                    crate::wrap::wrap(&top.text, self.panel_width.max(1))
+                        .lines()
+                        .count()
+                        .saturating_sub(1),
+                );
+            }
+            return;
+        }
         if let Some(Ok(text)) = commands::report_in(&self.view, top.mode, &top.cmd, &top.arg)
             && let Some(top) = self.panel.last_mut()
         {
@@ -567,12 +601,26 @@ impl App {
 
     /// Push a view onto the panel and show it.
     pub fn open_view(&mut self, cmd: &str, arg: &str, text: String) {
+        let browser = commands::is_moded(cmd)
+            .then(|| browser::query(&self.view, self.mode, browser_arg(cmd, arg)))
+            .transpose();
+        let browser = match browser {
+            Ok(page) => page,
+            Err(e) => {
+                self.flash = Some(format!("[compendium unavailable: {e}]"));
+                return;
+            }
+        };
         let view = PanelView {
             cmd: cmd.to_string(),
             arg: arg.to_string(),
-            text,
+            text: browser.as_ref().map_or(text, |p| p.text.clone()),
             scroll: 0,
-            selected: None,
+            selected: browser
+                .as_ref()
+                .and_then(|p| p.links.first())
+                .map(|l| l.line),
+            browser,
             xray: None,
             mode: self.mode,
         };
@@ -1161,7 +1209,11 @@ impl App {
         self.view = view;
         // Another save starts over in Player mode.
         self.mode = Mode::Player;
+        // Even Player entries can mean something different in another save.
+        self.panel.retain(|v| !commands::is_moded(&v.cmd));
+        self.clear_panel_search();
         self.drop_world_views();
+        self.refresh_panel();
         self.send(Command::Switch(path));
     }
 
@@ -1695,11 +1747,67 @@ impl App {
         }
     }
 
+    /// The compendium keeps the panel's focus/back/scroll conventions.
+    fn browser_key(&mut self, key: KeyEvent) -> bool {
+        let Some(top) = self.panel.last().filter(|v| v.browser.is_some()) else {
+            return false;
+        };
+        let page = top.browser.as_ref().unwrap();
+        let at = page
+            .links
+            .iter()
+            .position(|l| Some(l.line) == top.selected)
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Char('m') => {
+                self.set_mode(self.mode.toggled(), true);
+                self.focus = Focus::Panel;
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(link) = page.links.get(at) {
+                    let arg = link.arg.clone();
+                    self.open_view(":compendium", &arg, String::new());
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j')
+                if !page.links.is_empty() =>
+            {
+                let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                    at.saturating_sub(1)
+                } else {
+                    (at + 1).min(page.links.len() - 1)
+                };
+                let line = page.links[next].line;
+                self.panel.last_mut().unwrap().selected = Some(line);
+                let rows = self.panel_rows(self.panel_width);
+                if let Some(first) = rows.iter().position(|(_, selected)| *selected) {
+                    let last = rows
+                        .iter()
+                        .rposition(|(_, selected)| *selected)
+                        .unwrap_or(first);
+                    let height = self.panel_height.max(1);
+                    let top = self.panel.last_mut().unwrap();
+                    if first < top.scroll {
+                        top.scroll = first;
+                    } else if last >= top.scroll + height {
+                        top.scroll = (last + 1).saturating_sub(height).min(first);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn panel_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('x') && self.dismiss_note() {
             return;
         }
-        if self.brain_key(key) || self.xray_key(key) || self.branch_key(key) {
+        if self.brain_key(key)
+            || self.xray_key(key)
+            || self.branch_key(key)
+            || self.browser_key(key)
+        {
             return;
         }
         let height = self.panel_height.max(1);
@@ -1755,6 +1863,12 @@ impl App {
             KeyCode::Enter => {
                 let Search { pane, query } = self.search.take().unwrap();
                 if !query.is_empty() {
+                    if pane == Focus::Panel
+                        && self.panel.last().is_some_and(|v| v.browser.is_some())
+                    {
+                        self.open_view(":compendium", &format!("search {query}"), String::new());
+                        return;
+                    }
                     self.last_search = Some((pane, query));
                     // The story searches back from the bottom, a panel down
                     // from its top.
@@ -1953,8 +2067,8 @@ impl App {
     }
 
     fn focus_hints(&self) -> String {
-        if self.search.is_some() {
-            return "type to search · Enter find · Esc cancel".into();
+        if let Some(search) = &self.search {
+            return format!("/{} · Enter find · Esc cancel", search.query);
         }
         if self.help_open {
             return "j/k scroll · Space page · g/G top/bottom · Esc close help".into();
@@ -1993,6 +2107,9 @@ impl App {
             Focus::Story => "j/k scroll · g/G top/bottom · / search · n/N next · Tab focus · \
                              Esc input · ? help"
                 .into(),
+            Focus::Panel if self.panel.last().is_some_and(|v| v.browser.is_some()) => {
+                "↑↓ select · Enter open · / search · m Player/World · Space scroll · Esc/h back · Tab focus".into()
+            }
             Focus::Panel if self.brain_row().is_some() => {
                 "↑↓ role · Enter model · e effort · Esc/h back · Tab focus · ? help".into()
             }
@@ -2003,6 +2120,15 @@ impl App {
                              Tab focus · ? help"
                 .into(),
         }
+    }
+}
+
+/// Reference shortcuts enter the corresponding shared compendium section.
+fn browser_arg<'a>(cmd: &str, arg: &'a str) -> &'a str {
+    match cmd {
+        ":npcs" => "people",
+        ":rules" | ":glossary" => "mechanics",
+        _ => arg,
     }
 }
 
@@ -2067,6 +2193,14 @@ Story and panel
   /  n N            search, next, previous
   Esc h             back (the panel pops one view)
   ?                 this help
+
+:compendium panel
+  ↑ ↓  j k          select category, entry, related entry or source
+  Enter → l         open selection
+  /                 search the compendium
+  m                 toggle Player / World (resets to categories)
+  Space  g G        page, top, bottom of the account
+  Esc h ←           back
 
 :brain panel
   ↑ ↓  j k          pick a role
@@ -2317,9 +2451,7 @@ pub(crate) mod tests {
         assert!(app.flash.as_deref().unwrap().contains("World"));
         let top = app.panel.last().unwrap();
         assert_eq!(top.title(), ":compendium · World");
-        let world = commands::report_in(&app.view, Mode::World, ":compendium", "")
-            .unwrap()
-            .unwrap();
+        let world = browser::query(&app.view, Mode::World, "").unwrap().text;
         assert_eq!(top.text, world);
 
         typed(&mut app, ":compendium people");
@@ -2412,11 +2544,7 @@ pub(crate) mod tests {
         app.on_key(key(KeyCode::Enter));
         let top = app.panel.last().unwrap();
         assert_eq!(top.mode, Mode::Player);
-        assert!(
-            top.text.starts_with("You know of nothing called"),
-            "{}",
-            top.text
-        );
+        assert!(top.text.contains("No entries found"), "{}", top.text);
         for text in panel_texts(&app) {
             for hidden in WORLD_ONLY {
                 assert!(!text.contains(hidden), "{hidden} in the panel:\n{text}");
@@ -2471,7 +2599,8 @@ pub(crate) mod tests {
             assert!(plain.contains("known yet"), "{plain}");
             typed(&mut app, cmd);
             app.on_key(key(KeyCode::Enter));
-            assert_eq!(app.panel.last().unwrap().text, plain);
+            assert!(app.panel.last().unwrap().text.contains("Mechanics"));
+            assert!(app.panel.last().unwrap().text.contains("No entries found"));
         }
         assert!(
             app.outbox.is_empty(),
@@ -2491,10 +2620,20 @@ pub(crate) mod tests {
         assert!(overview.contains("Drowned Chapel (place)"), "{overview}");
         typed(&mut app, ":compendium");
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.panel.last().unwrap().text, overview);
+        assert_eq!(
+            app.panel
+                .last()
+                .unwrap()
+                .browser
+                .as_ref()
+                .unwrap()
+                .links
+                .len(),
+            6
+        );
         typed(&mut app, ":compendium drowned");
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.panel.last().unwrap().text, chapel);
+        assert!(app.panel.last().unwrap().text.starts_with(&chapel));
         assert!(
             app.outbox.is_empty(),
             "reading it sends nothing to the game"
@@ -3261,3 +3400,7 @@ pub(crate) mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "browser_tests.rs"]
+mod browser_tests;

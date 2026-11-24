@@ -35,6 +35,7 @@
 //! leaves what was learned as it was, until a later narrated fact
 //! supersedes it.
 
+pub mod browser;
 mod report;
 pub(crate) mod tools;
 mod truth;

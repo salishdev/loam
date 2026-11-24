@@ -61,6 +61,7 @@ fn place(world: &World, name: &str) -> Entry {
     }
 }
 
+mod browser;
 mod encounters;
 mod learned;
 mod mechanics;
